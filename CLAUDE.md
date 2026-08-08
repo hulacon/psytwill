@@ -121,7 +121,39 @@ Commit/push only when asked.
 ### Explicitly deferred (do not build without discussion)
 
 - **Event segmentation / change-point chunking** (HMM/GSBS-style).
+  Human standard for validation: narRaters Step 2 (below).
 - **Entity/coreference overlap matrices** — needs NER+coref, new heavy deps.
 - **LLM-judged narrative-dependence / suspense matrices** — research-grade,
-  validation strategy unresolved.
+  validation strategy unresolved. Human standard: narRaters Step 6 causal
+  matrices (below) are the natural ground truth for a narrative-dependence
+  matrix — compare model matrix to human matrix exactly as RSA compares RDMs.
 - **Raw-stimulus ingestion** — revisit only if the CSV route proves limiting.
+
+### Reference: narRaters — the human-generated standard
+
+[narRaters](https://github.com/xianNeuro/narRaters) (Xian Li, v0.3.x,
+research/non-commercial license) is a human-in-the-loop platform whose
+raters produce, for a narrative, exactly the structures psyquilt's
+aspirational matrix types would generate computationally:
+
+- **Step 2, event segmentation**: raters place event boundaries in a story
+  transcript (optional 1–5 boundary-strength ratings) → numbered event list
+  (`{story}_events.xlsx`, columns `event`, `story_texts`). Human standard for
+  the deferred event-segmentation chunking (and a source of human-defined
+  chunk boundaries that word2psy could score per event).
+- **Step 6, causal rating**: raters score **all event pairs** on causal
+  strength (0–3) through a grid interface → a completed event × event matrix
+  (`{story}_causal-{method}.xlsx`). This is a human-generated relational
+  matrix in psyquilt's exact output shape: an aspirational
+  narrative-dependence matrix should be validated by correlating against
+  these (upper-triangle Spearman, standard RSA practice).
+- Also relevant: Steps 4–5 parse subject recalls into clauses matched to
+  story events — a route to memory-weighted matrices later.
+- Ships sample narratives ("pieman_edited" — the classic Pieman stimulus,
+  "the_siren", demo "lighthouse") with transcripts, event lists, and example
+  recalls, but no participant rating datasets.
+
+Integration idea (when the deferred items come up): a small reader that
+ingests narRaters event lists / causal matrices into psyquilt's conventions
+(events as chunks; causal xlsx → labeled matrix CSV) so human and model
+matrices are directly comparable in one pipeline.
