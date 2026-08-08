@@ -119,6 +119,12 @@ class TestMatchSpaces:
         pairs = match_spaces(a, b)
         assert [(pa.name, pb.name) for pa, pb in pairs] == [("minilm", "minilm")]
 
+    def test_clap_text_x_clap_compatible(self):
+        a = detect_spaces(_cols(("clap_text", 4)))
+        b = detect_spaces(_cols(("clap", 4)))
+        pairs = match_spaces(a, b)
+        assert [(pa.name, pb.name) for pa, pb in pairs] == [("clap_text", "clap")]
+
     def test_clip_text_x_clip_compatible(self):
         a = detect_spaces(_cols(("clip_text", 4)))
         b = detect_spaces(_cols(("clip", 4)))

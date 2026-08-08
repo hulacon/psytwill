@@ -47,8 +47,12 @@ INDEX_COLUMNS = {
 
 # Cross-modal space pairs that live in one shared representational space
 # (word2psy clip_text and viz2psy clip share an OpenCLIP ViT-B-32
+# checkpoint; word2psy clap_text and aud2psy clap share a LAION-CLAP
 # checkpoint). Checked by equal dimensionality at compute time.
-COMPATIBLE_SPACES = [("clip_text", "clip"), ("clip", "clip_text")]
+COMPATIBLE_SPACES = [
+    ("clip_text", "clip"), ("clip", "clip_text"),
+    ("clap_text", "clap"), ("clap", "clap_text"),
+]
 
 
 @dataclass
