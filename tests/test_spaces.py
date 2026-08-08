@@ -82,13 +82,19 @@ class TestProfileDetection:
             "spectral_centroid", "spectral_bandwidth", "spectral_rolloff",
             "spectral_flux", "spectral_zcr",
             "onsets_strength", "onsets_rate", "onsets_tempo",
+            "tonal_key_clarity", "tonal_majorness", "tonal_chroma_entropy",
+            "rhythm_pulse_clarity", "rhythm_beat_strength", "rhythm_novelty",
             "speech_prob",
         ]
         spaces = detect_profile_spaces(cols)
-        assert set(spaces) == {"loudness", "pitch", "spectral", "onsets", "acoustic"}
-        assert spaces["acoustic"].n_dims == 13  # every feature, not "time"
+        assert set(spaces) == {
+            "loudness", "pitch", "spectral", "onsets", "tonal", "rhythm", "acoustic"
+        }
+        assert spaces["acoustic"].n_dims == 19  # every feature, not "time"
         assert "speech_prob" in spaces["acoustic"].columns
         assert spaces["spectral"].n_dims == 5
+        assert spaces["tonal"].n_dims == 3
+        assert spaces["rhythm"].n_dims == 3
 
     def test_speech_prob_alone_is_not_a_profile(self):
         # single column: only reachable through the combined acoustic profile

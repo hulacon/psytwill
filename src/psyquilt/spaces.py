@@ -98,7 +98,10 @@ _NORM_FEATURES = [
 _WORDFORM_FEATURES = ["length", "n_syllables", "n_phonemes", "old20"]
 
 # aud2psy frame-level features (model-prefixed, one value per timepoint).
-_ACOUSTIC_PATTERNS = ["loudness_*", "pitch_*", "spectral_*", "onsets_*", "speech_prob"]
+_ACOUSTIC_PATTERNS = [
+    "loudness_*", "pitch_*", "spectral_*", "onsets_*",
+    "tonal_*", "rhythm_*", "speech_prob",
+]
 
 # name -> (column patterns, description). Patterns are fnmatch-style.
 PROFILE_REGISTRY: dict[str, tuple[list[str], str]] = {
@@ -111,6 +114,8 @@ PROFILE_REGISTRY: dict[str, tuple[list[str], str]] = {
     "pitch": (["pitch_*"], "pYIN f0 and voicing probability (aud2psy)"),
     "spectral": (["spectral_*"], "Spectral shape features (aud2psy)"),
     "onsets": (["onsets_*"], "Onset strength/rate and local tempo (aud2psy)"),
+    "tonal": (["tonal_*"], "Key clarity, majorness, chroma entropy (aud2psy)"),
+    "rhythm": (["rhythm_*"], "Pulse clarity, beat strength, novelty (aud2psy)"),
     "acoustic": (_ACOUSTIC_PATTERNS, "All aud2psy frame-level acoustic features"),
     # Per-chunk means of word-level features (word2psy aggregates).
     # Mean only: mixing mean/sd/min/max in one profile would mix scales.
