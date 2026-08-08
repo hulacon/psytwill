@@ -118,6 +118,58 @@ Commit/push only when asked.
    - Note: `word2psy -o dir/file.csv` does not create `dir/` — pre-create
      output directories when scripting it.
 
+### Long-term ambition: full movie input (visual + dialogue + audio)
+
+Goal: quilt a whole film — viz2psy covers the visual stream; the gap is
+dialogue and the non-verbal audio channel. Staged plan (revised Aug 2026
+after reviewing the target stimulus set):
+
+**Target stimuli**: Ben's likely movie list ([Google Doc](https://docs.google.com/document/d/1SHtS5yGZ5WcZQJSHVMX_3LlHW6BRugDopnEUBFm7z5U/edit)) —
+~60 clips of 3–6 min across 10 sessions plus backups: creator-posted
+indie/student animated & live-action shorts, official-channel commercial
+film excerpts (Movieclips/JoBlo/Focus/Universal), and three figshare clips
+from the event-schema study distribution (check whether that dataset ships
+transcripts before doing any work on those). This composition killed the
+original SRT-subtitle plan: creator shorts have no distributed SRTs;
+commercial *excerpts* would need per-clip retiming of full-film SRTs
+(unknown offsets + Ben's own cuts); and a large fraction of the animated
+shorts are dialogue-free — music and sound design carry the narrative.
+Whisper on the actual clip audio beats subtitle-hunting: verbatim to the
+exact presented file, timestamps natively on the clip timeline, uniform
+across all clips, and cleanly flags "no speech".
+
+2. **aud2psy v0.1** (next up — design checkpoint opened Aug 2026, repo at
+   `../aud2psy`): the Whisper front-end and the cheap acoustic tier
+   together. Since Whisper is needed regardless and the wordless shorts
+   make acoustic features the *only* auditory signal for a third of the
+   stimuli, the marginal cost of the registry skeleton around the
+   transcription script is small. Scope: `transcribe` (faster-whisper,
+   word-level timestamps) as an *export* emitting word2psy-ready
+   `text`/`onset`/`offset` CSVs, plus librosa-cheap frame-level features
+   (loudness/RMS envelope — workhorse naturalistic-fMRI regressor —
+   pitch, spectral, onset/tempo, speech-presence). Output mirrors
+   viz2psy's video mode (row per timepoint, `time` column) so psyquilt
+   consumes it with zero changes. SRT ingestion is demoted to an alternate
+   input format inside the transcription path (useful for full-length
+   commercial films). Prior art to study: `pliers` (Yarkoni lab),
+   studyforrest annotations.
+3. **Time-aware cross mode in psyquilt** (the real integration enabler,
+   needed for any time-stamped input pair): dialogue chunks and video
+   frames sample time on different irregular grids. Full cross matrices
+   don't care, but same-moment comparisons, aligned coherence curves, and
+   common-time-base movie RDMs need a temporal join — map chunks to frames
+   by overlap, or resample both streams onto a shared grid (e.g. TR-locked,
+   which fMRI wants anyway). Modality-agnostic, lives in psyquilt.
+4. **aud2psy v0.2 — CLAP embeddings** (the flagship, deferred until the
+   skeleton is validated): **CLAP is to audio what CLIP is to images** — a
+   shared audio–text space, so `clap`/`clap_text` reproduces the
+   `clip`/`clip_text` cross-modal precedent and psyquilt absorbs it as one
+   `COMPATIBLE_SPACES` line. Also deferred to v0.2+: speaker diarization,
+   prosodic-emotion models (how a line is said vs. its content — a
+   different affective signal than text emotion). Division of labor stands:
+   aud2psy owns acoustic/paralinguistic features + transcription export;
+   verbal content stays word2psy's job — no duplication.
+
 ### Explicitly deferred (do not build without discussion)
 
 - **Event segmentation / change-point chunking** (HMM/GSBS-style).
