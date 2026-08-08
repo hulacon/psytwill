@@ -37,8 +37,11 @@ instead of models), lazy imports so `--help` stays fast.
   space — the greedy prefix regex keeps `clip_text_###` and `clip_###` apart,
   generalizing word2psy's crossmodal regex trick; (2) *named-profile
   registry* (`PROFILE_REGISTRY`): explicit patterns for emotion, sentiment,
-  readability, and `word_aggregates` (`{feat}_mean` columns only — mixing
-  mean/sd/min/max would mix scales). `COMPATIBLE_SPACES` declares cross-modal
+  readability, `word_aggregates` (`{feat}_mean` columns only — mixing
+  mean/sd/min/max would mix scales), and — added Aug 2026 with aud2psy
+  v0.1 — the aud2psy frame-feature profiles (per-model `loudness`/`pitch`/
+  `spectral`/`onsets` plus a combined 13-d `acoustic` incl. `speech_prob`;
+  aud2psy's model-prefixed column naming exists to feed these patterns). `COMPATIBLE_SPACES` declares cross-modal
   pairs (`clip_text` x `clip`, the shared OpenCLIP space). `match_spaces`
   pairs spaces across two CSVs: same-name first, then compatible pairs.
 - **`metrics.py`** — `METRIC_REGISTRY`: cosine, correlation (Pearson),

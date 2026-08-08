@@ -74,6 +74,26 @@ class TestProfileDetection:
     def test_single_column_profile_rejected(self):
         assert detect_profile_spaces(["emotion_joy"]) == {}
 
+    def test_aud2psy_frame_csv(self):
+        cols = [
+            "time",
+            "loudness_rms", "loudness_db",
+            "pitch_f0", "pitch_voiced_prob",
+            "spectral_centroid", "spectral_bandwidth", "spectral_rolloff",
+            "spectral_flux", "spectral_zcr",
+            "onsets_strength", "onsets_rate", "onsets_tempo",
+            "speech_prob",
+        ]
+        spaces = detect_profile_spaces(cols)
+        assert set(spaces) == {"loudness", "pitch", "spectral", "onsets", "acoustic"}
+        assert spaces["acoustic"].n_dims == 13  # every feature, not "time"
+        assert "speech_prob" in spaces["acoustic"].columns
+        assert spaces["spectral"].n_dims == 5
+
+    def test_speech_prob_alone_is_not_a_profile(self):
+        # single column: only reachable through the combined acoustic profile
+        assert detect_profile_spaces(["time", "speech_prob"]) == {}
+
 
 class TestDetectSpaces:
     def test_combined(self):
