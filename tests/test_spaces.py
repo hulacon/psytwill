@@ -96,6 +96,14 @@ class TestProfileDetection:
         assert spaces["tonal"].n_dims == 3
         assert spaces["rhythm"].n_dims == 3
 
+    def test_music_emotion_profile_separate_from_acoustic(self):
+        cols = ["time", "music_emotion_valence", "music_emotion_arousal",
+                "loudness_rms", "loudness_db"]
+        spaces = detect_profile_spaces(cols)
+        assert spaces["music_emotion"].n_dims == 2
+        # learned affect stays out of the signal-level acoustic profile
+        assert "music_emotion_valence" not in spaces["acoustic"].columns
+
     def test_speech_prob_alone_is_not_a_profile(self):
         # single column: only reachable through the combined acoustic profile
         assert detect_profile_spaces(["time", "speech_prob"]) == {}
