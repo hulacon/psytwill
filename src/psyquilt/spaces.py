@@ -123,6 +123,7 @@ PROFILE_REGISTRY: dict[str, tuple[list[str], str]] = {
     # Learned affective judgment — deliberately NOT part of the combined
     # signal-level `acoustic` profile (the word_aggregates precedent).
     "music_emotion": (["music_emotion_*"], "DEAM-trained musical valence/arousal (aud2psy)"),
+    "speech_emotion": (["speech_emotion_*"], "MSP-Podcast vocal arousal/dominance/valence (aud2psy)"),
     "acoustic": (_ACOUSTIC_PATTERNS, "All aud2psy frame-level acoustic features"),
     # Per-chunk means of word-level features (word2psy aggregates).
     # Mean only: mixing mean/sd/min/max in one profile would mix scales.
