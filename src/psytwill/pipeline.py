@@ -23,6 +23,7 @@ from psytwill.matrices import (
     transition_records,
 )
 from psytwill.metadata import build_metadata
+from psytwill.sidecar import load_sidecar, model_checkpoint
 from psytwill.spaces import SpaceConfig, detect_spaces, match_spaces
 
 
@@ -62,6 +63,32 @@ def _select_pairs(
     ]
 
 
+def _assert_checkpoints(
+    pairs: list[tuple[SpaceConfig, SpaceConfig | None]],
+    meta_a: dict | None,
+    meta_b: dict | None,
+) -> None:
+    """Refuse cross-input pairs whose recorded checkpoints differ.
+
+    A shared feature space (clip_text x clip, or clip x clip from two
+    runs) is only comparable if both sides used identical weights
+    (Contract B §4.1). Inputs without sidecar checkpoints are legacy and
+    pass unchecked.
+    """
+    for space_a, space_b in pairs:
+        if space_b is None:
+            continue
+        ck_a = model_checkpoint(meta_a, space_a.name)
+        ck_b = model_checkpoint(meta_b, space_b.name)
+        if ck_a and ck_b and ck_a != ck_b:
+            raise SpaceError(
+                f"Checkpoint mismatch for {space_a.name} x {space_b.name}: "
+                f"input A used {ck_a!r}, input B used {ck_b!r}. These do "
+                "not live in one representational space; re-extract with "
+                "matching checkpoints."
+            )
+
+
 def build_quilt(
     input_a: str | Path,
     input_b: str | Path | None = None,
@@ -88,13 +115,16 @@ def build_quilt(
         (requires equal row counts).
     """
     df_a = read_scores(input_a)
+    meta_a = load_sidecar(input_a)
     spaces_a = detect_spaces(df_a.columns)
     cross = input_b is not None
 
     if cross:
         df_b = read_scores(input_b)
+        meta_b = load_sidecar(input_b)
         spaces_b = detect_spaces(df_b.columns)
         pairs = match_spaces(spaces_a, spaces_b)
+        _assert_checkpoints(pairs, meta_a, meta_b)
         if not pairs:
             raise SpaceError(
                 "No shared or compatible spaces between the two inputs. "
@@ -155,14 +185,28 @@ def build_quilt(
             output_dir / series_file, index=False
         )
 
-    inputs_meta = [
-        {
+    inputs_meta = []
+    input_metas = [(input_a, df_a, meta_a)] + (
+        [(input_b, df_b, meta_b)] if cross else []
+    )
+    for p, df, upstream in input_metas:
+        entry = {
             "path": str(Path(p).resolve()),
             "rows": len(df),
             "label_column": resolve_labels(df)[1],
         }
-        for p, df in [(input_a, df_a)] + ([(input_b, df_b)] if cross else [])
-    ]
+        if upstream:
+            entry["extractor"] = upstream.get("extractor")
+            entry["extractor_version"] = upstream.get("extractor_version")
+            entry["schema_version"] = upstream.get("schema_version")
+            checkpoints = {
+                name: model_checkpoint(upstream, name)
+                for name in upstream.get("models", {})
+                if model_checkpoint(upstream, name)
+            }
+            if checkpoints:
+                entry["checkpoints"] = checkpoints
+        inputs_meta.append(entry)
     meta = build_metadata(
         inputs_meta, results, matrix_files, series_file, series_kind,
         len(series_records),

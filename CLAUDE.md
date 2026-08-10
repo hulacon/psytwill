@@ -19,15 +19,30 @@ instead of models), lazy imports so `--help` stays fast.
 
 ### Sibling CSV conventions psytwill depends on
 
+Codified 2026-08-10 as the **extractor-output convention** in
+`mmmdata-agents/docs/constellation-contracts.md` §4.1 (schema_version 1.0);
+that spec is authoritative. Working summary:
+
 - Embedding columns are `{model}_{i:03d}` (`minilm_000`, `clip_text_511`,
   viz2psy's `clip_000`). word2psy's `crossmodal.py` regexes keep `clip_###`
   and `clip_text_###` apart — that pattern is reused here.
 - word2psy chunk CSVs carry `chunk_idx`, `chunk_label`, `n_words`, passthrough
   columns, and optionally word-feature aggregates (`{feat}_{mean,sd,min,max}`).
-  viz2psy CSVs carry `filename` / `image_idx` / `time` identifiers.
+  viz2psy CSVs carry `filename` / `image_idx` / `time` identifiers. The
+  canonical `stimulus_id` column (§4.1) is preferred over all of these as the
+  row label when present. `INDEX_COLUMNS` in `spaces.py` mirrors §4.1's
+  reserved-column registry.
 - NaN rows exist (e.g. word2vec OOV) and are handled explicitly, never crashed on.
 - `clip_text` (word2psy) and `clip` (viz2psy) share one OpenCLIP ViT-B-32
-  checkpoint — the cross-modal space.
+  checkpoint — the cross-modal space. Since v0.2.0 this is **verified, not
+  assumed**: `sidecar.py` loads each input's `.meta.json` (including the
+  stem-family form, `X_chunks.csv` → `X.meta.json`), gates on
+  `schema_version` major, and `build_quilt` refuses cross pairs whose
+  recorded `models.<name>.checkpoint` strings differ. CSVs without a sidecar
+  are legacy inputs: warned about, exempt from checks. Upstream provenance
+  (extractor, versions, checkpoints) is passed through into
+  `matrices.meta.json`'s `inputs` entries. Contract fixtures live in
+  `tests/test_contract.py`.
 
 ## Architecture (`src/psytwill/`)
 
@@ -54,8 +69,9 @@ instead of models), lazy imports so `--help` stays fast.
   column — pooled across both inputs in cross mode — before scale-sensitive
   metrics cosine/euclidean), `transition_records` (adjacent off-diagonal
   band), `diagonal_records` (aligned pairs, cross mode, equal N).
-  `resolve_labels` unifies the sibling label chains: `chunk_label` →
-  `filename` → `filepath` → `image_idx` → `time` → `chunk_idx` → `row_{i}`.
+  `resolve_labels` unifies the sibling label chains: `stimulus_id` →
+  `chunk_label` → `filename` → `filepath` → `image_idx` → `time` →
+  `chunk_idx` → `row_{i}`.
   Input row order is taken as narrative order.
 - **`pipeline.py`** — `build_quilt()`: read → detect → compute → write.
   `-o` is a **directory** (deliberate deviation from the siblings'

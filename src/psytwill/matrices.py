@@ -16,10 +16,14 @@ from psytwill.exceptions import InputError, SpaceError
 from psytwill.metrics import get_metric
 from psytwill.spaces import SpaceConfig
 
-# Row-label candidates, in preference order — the union of word2psy's
-# text chain (chunk_label -> chunk_idx) and viz2psy's image chain
+# Row-label candidates, in preference order — the canonical stimulus_id
+# (Contract B §4.1) first, then the union of word2psy's text chain
+# (chunk_label -> chunk_idx) and viz2psy's image chain
 # (filename -> filepath -> image_idx -> time).
-LABEL_COLUMNS = ["chunk_label", "filename", "filepath", "image_idx", "time", "chunk_idx"]
+LABEL_COLUMNS = [
+    "stimulus_id", "chunk_label", "filename", "filepath", "image_idx",
+    "time", "chunk_idx",
+]
 
 
 def resolve_labels(df: pd.DataFrame) -> tuple[list[str], str]:

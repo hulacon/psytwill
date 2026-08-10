@@ -30,7 +30,9 @@ EMBEDDING_RE = re.compile(r"^(?P<prefix>.+)_(?P<index>\d{3})$")
 
 # Row-identifier columns from the sibling CSV conventions. Excluded from
 # embedding detection defensively (none currently match the _### suffix).
+# Mirrors the reserved-column registry in constellation-contracts.md §4.1.
 INDEX_COLUMNS = {
+    "stimulus_id",
     "chunk_idx",
     "chunk_label",
     "n_words",
@@ -43,6 +45,9 @@ INDEX_COLUMNS = {
     "filepath",
     "image_idx",
     "time",
+    "voice",
+    "speaker",
+    "turn_idx",
 }
 
 # Cross-modal space pairs that live in one shared representational space

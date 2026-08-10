@@ -68,7 +68,10 @@ def build_metadata(
         matrices[r.key] = entry
 
     meta: dict[str, Any] = {
-        "psytwill_version": __version__,
+        "schema_version": "1.0",
+        "extractor": "psytwill",
+        "extractor_version": __version__,
+        "psytwill_version": __version__,  # legacy key, one deprecation cycle
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": "cross" if cross else "self",
         "inputs": inputs,
