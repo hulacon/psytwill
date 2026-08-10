@@ -14,16 +14,16 @@ from typing import Any
 
 import pandas as pd
 
-from psyquilt.exceptions import InputError, SpaceError
-from psyquilt.matrices import (
+from psytwill.exceptions import InputError, SpaceError
+from psytwill.matrices import (
     MatrixResult,
     compute_matrix,
     diagonal_records,
     resolve_labels,
     transition_records,
 )
-from psyquilt.metadata import build_metadata
-from psyquilt.spaces import SpaceConfig, detect_spaces, match_spaces
+from psytwill.metadata import build_metadata
+from psytwill.spaces import SpaceConfig, detect_spaces, match_spaces
 
 
 def read_scores(path: str | Path) -> pd.DataFrame:
@@ -65,7 +65,7 @@ def _select_pairs(
 def build_quilt(
     input_a: str | Path,
     input_b: str | Path | None = None,
-    output_dir: str | Path = "psyquilt_out",
+    output_dir: str | Path = "psytwill_out",
     spaces: dict[str, str | None] | None = None,
     metric: str | None = None,
     distance: bool = False,

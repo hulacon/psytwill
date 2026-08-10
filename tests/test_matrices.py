@@ -4,14 +4,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from psyquilt.exceptions import SpaceError
-from psyquilt.matrices import (
+from psytwill.exceptions import SpaceError
+from psytwill.matrices import (
     compute_matrix,
     diagonal_records,
     resolve_labels,
     transition_records,
 )
-from psyquilt.spaces import detect_spaces
+from psytwill.spaces import detect_spaces
 
 from tests.conftest import embedding_frame, unit
 

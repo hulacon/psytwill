@@ -4,29 +4,29 @@
 Examples
 --------
     # Self mode: every detected space -> square matrix + transitions
-    psyquilt matrices scores_chunks.csv -o out/
+    psytwill matrices scores_chunks.csv -o out/
 
     # Cross mode: shared/compatible spaces -> rectangular matrices
-    psyquilt matrices text_chunks.csv frames.csv -o out/
+    psytwill matrices text_chunks.csv frames.csv -o out/
 
     # Subset spaces; override one space's metric
-    psyquilt matrices scores_chunks.csv -o out/ --spaces minilm:euclidean,emotion
+    psytwill matrices scores_chunks.csv -o out/ --spaces minilm:euclidean,emotion
 
     # RDM form (1 - similarity)
-    psyquilt matrices scores_chunks.csv -o out/ --distance
+    psytwill matrices scores_chunks.csv -o out/ --distance
 
     # Aligned-pairs series for equal-length cross inputs
-    psyquilt matrices text_chunks.csv frames.csv -o out/ --diagonal
+    psytwill matrices text_chunks.csv frames.csv -o out/ --diagonal
 
     # Preview which spaces a CSV offers, without computing anything
-    psyquilt spaces scores_chunks.csv
+    psytwill spaces scores_chunks.csv
 """
 
 import argparse
 import sys
 
-from psyquilt import __version__
-from psyquilt.exceptions import PsyquiltError
+from psytwill import __version__
+from psytwill.exceptions import PsytwillError
 
 
 def _parse_spaces(arg: str | None) -> dict[str, str | None] | None:
@@ -44,10 +44,10 @@ def _parse_spaces(arg: str | None) -> dict[str, str | None] | None:
 
 
 def _run_matrices(args: argparse.Namespace) -> None:
-    from psyquilt.pipeline import build_quilt
+    from psytwill.pipeline import build_quilt
 
     if len(args.inputs) > 2:
-        raise PsyquiltError(
+        raise PsytwillError(
             f"Expected 1 input (self mode) or 2 (cross mode), got "
             f"{len(args.inputs)}."
         )
@@ -64,7 +64,7 @@ def _run_matrices(args: argparse.Namespace) -> None:
         diagonal=args.diagonal,
     )
 
-    print(f"psyquilt matrices ({summary['mode']} mode) -> {summary['output_dir']}/")
+    print(f"psytwill matrices ({summary['mode']} mode) -> {summary['output_dir']}/")
     for r in summary["results"]:
         n_a, n_b = r.frame.shape
         nan_note = ""
@@ -80,8 +80,8 @@ def _run_matrices(args: argparse.Namespace) -> None:
 
 
 def _run_spaces(args: argparse.Namespace) -> None:
-    from psyquilt.pipeline import read_scores
-    from psyquilt.spaces import detect_spaces
+    from psytwill.pipeline import read_scores
+    from psytwill.spaces import detect_spaces
 
     df = read_scores(args.input)
     spaces = detect_spaces(df.columns)
@@ -103,7 +103,7 @@ def _run_spaces(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="psyquilt",
+        prog="psytwill",
         description=(
             "Chunk-by-chunk relational matrices (RDMs, coherence curves) "
             "from word2psy / viz2psy scores CSVs."
@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Metrics: cosine, correlation, spearman, euclidean.",
     )
     parser.add_argument(
-        "--version", action="version", version=f"psyquilt {__version__}"
+        "--version", action="version", version=f"psytwill {__version__}"
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         args.func(args)
-    except PsyquiltError as exc:
+    except PsytwillError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     return 0

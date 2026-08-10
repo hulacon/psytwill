@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "psyquilt"
+name = "psytwill"
 version = "0.1.2"
 description = "Chunk-by-chunk relational matrices (RDMs, coherence curves) from word2psy and viz2psy feature CSVs"
 readme = "README.md"
@@ -41,12 +41,12 @@ dependencies = [
 dev = ["pytest", "ipython"]
 
 [project.scripts]
-psyquilt = "psyquilt.cli:main"
+psytwill = "psytwill.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/hulacon/psyquilt"
-Repository = "https://github.com/hulacon/psyquilt"
-Issues = "https://github.com/hulacon/psyquilt/issues"
+Homepage = "https://github.com/hulacon/psytwill"
+Repository = "https://github.com/hulacon/psytwill"
+Issues = "https://github.com/hulacon/psytwill/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

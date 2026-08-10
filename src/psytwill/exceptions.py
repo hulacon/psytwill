@@ -1,17 +1,17 @@
 """Structured errors, mirroring the siblings' exception style."""
 
 
-class PsyquiltError(Exception):
-    """Base class for all psyquilt errors."""
+class PsytwillError(Exception):
+    """Base class for all psytwill errors."""
 
 
-class InputError(PsyquiltError):
+class InputError(PsytwillError):
     """A scores CSV could not be read or is not usable."""
 
 
-class SpaceError(PsyquiltError):
+class SpaceError(PsytwillError):
     """A requested or detected feature space is invalid."""
 
 
-class MetricError(PsyquiltError):
+class MetricError(PsytwillError):
     """An unknown or inapplicable metric was requested."""

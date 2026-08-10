@@ -2,7 +2,7 @@
 
 ## What this project is
 
-psyquilt turns the chunk × feature CSVs produced by
+psytwill turns the chunk × feature CSVs produced by
 [word2psy](../word2psy) (text) and [viz2psy](../viz2psy) (images/video) into
 **chunk-by-chunk relational matrices**: stacks of N×N similarity/distance
 matrices (one per representational space — semantic embeddings, emotion
@@ -10,14 +10,14 @@ profiles, …) plus the adjacent-transition series ("coherence curves") as a
 tidy time-series table. In cog-neuro terms: model RDMs over narrative/stimulus
 time, RSA-ready.
 
-psyquilt consumes only the siblings' **scores CSVs, never raw stimuli** — so
+psytwill consumes only the siblings' **scores CSVs, never raw stimuli** — so
 it is modality-agnostic by construction: text × text, frame × frame, and
 text × frame (cross-modal) share one code path. Design decisions mirror the
 siblings deliberately: same CLI feel, flat-CSV-plus-`.meta.json` outputs, a
 registry architecture (here a registry of *feature spaces / matrix types*
 instead of models), lazy imports so `--help` stays fast.
 
-### Sibling CSV conventions psyquilt depends on
+### Sibling CSV conventions psytwill depends on
 
 - Embedding columns are `{model}_{i:03d}` (`minilm_000`, `clip_text_511`,
   viz2psy's `clip_000`). word2psy's `crossmodal.py` regexes keep `clip_###`
@@ -29,7 +29,7 @@ instead of models), lazy imports so `--help` stays fast.
 - `clip_text` (word2psy) and `clip` (viz2psy) share one OpenCLIP ViT-B-32
   checkpoint — the cross-modal space.
 
-## Architecture (`src/psyquilt/`)
+## Architecture (`src/psytwill/`)
 
 - **`spaces.py`** — feature-space detection, the registry analog. Two tiers:
   (1) *generic embedding detection*: any column group matching
@@ -67,12 +67,12 @@ instead of models), lazy imports so `--help` stays fast.
 - **`metadata.py`** — sidecar builder, viz2psy-style: embeddings described as
   `"pattern": "{name}_{NNN}"` + range, profiles as full column lists; per
   matrix: metric, form, shape, n_valid, nan_labels.
-- **`cli.py`** — `psyquilt matrices <csv> [<csv2>] -o out/` and
-  `psyquilt spaces <csv>`; heavy imports deferred into the command functions
+- **`cli.py`** — `psytwill matrices <csv> [<csv2>] -o out/` and
+  `psytwill spaces <csv>`; heavy imports deferred into the command functions
   so `--help` stays fast (~0.3 s). `--spaces minilm:euclidean,emotion`
   (subset + per-space metric), `--metric` (global), `--distance` (1 − sim),
   `--diagonal` (cross, equal N).
-- **`exceptions.py`** — `PsyquiltError` base; Input/Space/Metric errors;
+- **`exceptions.py`** — `PsytwillError` base; Input/Space/Metric errors;
   CLI catches and exits 1.
 
 **To add a space**: embedding column groups are picked up automatically;
@@ -104,7 +104,7 @@ Commit/push only when asked.
    pass in ~0.1 s. Validated end-to-end against real sibling outputs
    (Aug 2026):
    - *Two-topic passage*: 10 interleaved ocean/finance sentences (one grief,
-     one joy) through `word2psy --all --by-sentence`; psyquilt auto-detected
+     one joy) through `word2psy --all --by-sentence`; psytwill auto-detected
      6 spaces (minilm, clip_text, emotion, sentiment, readability,
      word_aggregates). Semantic RDM (minilm cosine): within-topic mean .27
      vs between-topic .03; neutral-only separation is total (within min .19
@@ -114,7 +114,7 @@ Commit/push only when asked.
      both involve the emotional sentences.
    - *Icon demo through the general cross path*: 6 redrawn PIL icons scored
      with `viz2psy clip`, 6 words with `word2psy clip_text`;
-     `psyquilt matrices words.csv icons.csv` pairs `clip_text` x `clip` via
+     `psytwill matrices words.csv icons.csv` pairs `clip_text` x `clip` via
      `COMPATIBLE_SPACES`: match sims .28–.34, non-match ≤ .24, all 6 words
      rank their icon first (matches the original .29–.34 vs ≤ .25 with
      freshly drawn icons).
@@ -151,22 +151,22 @@ across all clips, and cleanly flags "no speech".
    `text`/`onset`/`offset` CSVs, plus librosa-cheap frame-level features
    (loudness/RMS envelope — workhorse naturalistic-fMRI regressor —
    pitch, spectral, onset/tempo, speech-presence). Output mirrors
-   viz2psy's video mode (row per timepoint, `time` column) so psyquilt
+   viz2psy's video mode (row per timepoint, `time` column) so psytwill
    consumes it with zero changes. SRT ingestion is demoted to an alternate
    input format inside the transcription path (useful for full-length
    commercial films). Prior art to study: `pliers` (Yarkoni lab),
    studyforrest annotations.
-3. **Time-aware cross mode in psyquilt** (the real integration enabler,
+3. **Time-aware cross mode in psytwill** (the real integration enabler,
    needed for any time-stamped input pair): dialogue chunks and video
    frames sample time on different irregular grids. Full cross matrices
    don't care, but same-moment comparisons, aligned coherence curves, and
    common-time-base movie RDMs need a temporal join — map chunks to frames
    by overlap, or resample both streams onto a shared grid (e.g. TR-locked,
-   which fMRI wants anyway). Modality-agnostic, lives in psyquilt.
+   which fMRI wants anyway). Modality-agnostic, lives in psytwill.
 4. **aud2psy v0.2 — CLAP embeddings** (the flagship, deferred until the
    skeleton is validated): **CLAP is to audio what CLIP is to images** — a
    shared audio–text space, so `clap`/`clap_text` reproduces the
-   `clip`/`clip_text` cross-modal precedent and psyquilt absorbs it as one
+   `clip`/`clip_text` cross-modal precedent and psytwill absorbs it as one
    `COMPATIBLE_SPACES` line. Also deferred to v0.2+: speaker diarization,
    prosodic-emotion models (how a line is said vs. its content — a
    different affective signal than text emotion). Division of labor stands:
@@ -188,7 +188,7 @@ across all clips, and cleanly flags "no speech".
 
 [narRaters](https://github.com/xianNeuro/narRaters) (Xian Li, v0.3.x,
 research/non-commercial license) is a human-in-the-loop platform whose
-raters produce, for a narrative, exactly the structures psyquilt's
+raters produce, for a narrative, exactly the structures psytwill's
 aspirational matrix types would generate computationally:
 
 - **Step 2, event segmentation**: raters place event boundaries in a story
@@ -199,7 +199,7 @@ aspirational matrix types would generate computationally:
 - **Step 6, causal rating**: raters score **all event pairs** on causal
   strength (0–3) through a grid interface → a completed event × event matrix
   (`{story}_causal-{method}.xlsx`). This is a human-generated relational
-  matrix in psyquilt's exact output shape: an aspirational
+  matrix in psytwill's exact output shape: an aspirational
   narrative-dependence matrix should be validated by correlating against
   these (upper-triangle Spearman, standard RSA practice).
 - Also relevant: Steps 4–5 parse subject recalls into clauses matched to
@@ -209,6 +209,6 @@ aspirational matrix types would generate computationally:
   recalls, but no participant rating datasets.
 
 Integration idea (when the deferred items come up): a small reader that
-ingests narRaters event lists / causal matrices into psyquilt's conventions
+ingests narRaters event lists / causal matrices into psytwill's conventions
 (events as chunks; causal xlsx → labeled matrix CSV) so human and model
 matrices are directly comparable in one pipeline.

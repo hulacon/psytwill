@@ -12,9 +12,9 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from psyquilt.exceptions import InputError, SpaceError
-from psyquilt.metrics import get_metric
-from psyquilt.spaces import SpaceConfig
+from psytwill.exceptions import InputError, SpaceError
+from psytwill.metrics import get_metric
+from psytwill.spaces import SpaceConfig
 
 # Row-label candidates, in preference order — the union of word2psy's
 # text chain (chunk_label -> chunk_idx) and viz2psy's image chain

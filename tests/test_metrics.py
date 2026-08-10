@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from psyquilt.exceptions import MetricError
-from psyquilt.metrics import (
+from psytwill.exceptions import MetricError
+from psytwill.metrics import (
     correlation,
     cosine,
     euclidean,

@@ -9,9 +9,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from psyquilt import __version__
-from psyquilt.matrices import MatrixResult
-from psyquilt.spaces import SpaceConfig
+from psytwill import __version__
+from psytwill.matrices import MatrixResult
+from psytwill.spaces import SpaceConfig
 
 
 def _space_entry(space: SpaceConfig) -> dict[str, Any]:
@@ -68,7 +68,7 @@ def build_metadata(
         matrices[r.key] = entry
 
     meta: dict[str, Any] = {
-        "psyquilt_version": __version__,
+        "psytwill_version": __version__,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": "cross" if cross else "self",
         "inputs": inputs,

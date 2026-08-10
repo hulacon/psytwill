@@ -20,7 +20,7 @@ from typing import Callable, Literal
 import numpy as np
 import pandas as pd
 
-from psyquilt.exceptions import MetricError
+from psytwill.exceptions import MetricError
 
 
 def _l2_normalize(X: np.ndarray) -> np.ndarray:

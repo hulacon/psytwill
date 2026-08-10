@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from psyquilt.spaces import (
+from psytwill.spaces import (
     detect_embedding_spaces,
     detect_profile_spaces,
     detect_spaces,

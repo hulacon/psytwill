@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from psyquilt.cli import main
+from psytwill.cli import main
 
 from tests.conftest import embedding_frame, unit
 

@@ -1,4 +1,4 @@
-# psyquilt
+# psytwill
 
 Chunk-by-chunk relational matrices from [word2psy](https://github.com/hulacon/word2psy)
 and [viz2psy](https://github.com/hulacon/viz2psy) feature CSVs: N×N
