@@ -4,11 +4,14 @@ A *space* is a named group of columns in a scores CSV together with a
 default metric. Spaces come from two tiers:
 
 1. **Generic embedding detection** — any column group matching
-   ``{prefix}_{i:03d}`` (the sibling convention: ``minilm_000``,
-   ``clip_text_511``, viz2psy's ``clip_000``). The greedy prefix match
-   keeps ``clip_text_###`` and ``clip_###`` apart, generalizing the
-   two-regex trick in word2psy's ``crossmodal.py``. A group must have
-   >= 2 columns with contiguous indices starting at 000.
+   ``{prefix}_{index}`` with a fixed-width, >= 3-digit index (the sibling
+   convention: ``minilm_000``, ``clip_text_511``, viz2psy's ``clip_000``,
+   and 4-digit for >999-d spaces like ``ebind_0000..ebind_1023``). The
+   index must be *all* trailing digits, which keeps ``clip_text_###`` and
+   ``clip_###`` apart (generalizing the two-regex trick in word2psy's
+   ``crossmodal.py``) and stops a 4-digit ``ebind_1023`` from being
+   misread as prefix ``ebind_1``. A group must have >= 2 columns with
+   contiguous indices starting at 0.
 2. **Named-profile registry** — explicit column patterns for scalar
    feature families that form meaningful profile vectors (emotion,
    sentiment, readability, word-aggregate means). Ported from word2psy's
@@ -26,7 +29,9 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
-EMBEDDING_RE = re.compile(r"^(?P<prefix>.+)_(?P<index>\d{3})$")
+# Lazy prefix + unbounded index: the index captures ALL trailing digits
+# (>= 3), so 4-digit columns in >999-d spaces parse with the right prefix.
+EMBEDDING_RE = re.compile(r"^(?P<prefix>.+?)_(?P<index>\d{3,})$")
 
 # Row-identifier columns from the sibling CSV conventions. Excluded from
 # embedding detection defensively (none currently match the _### suffix).
@@ -53,10 +58,15 @@ INDEX_COLUMNS = {
 # Cross-modal space pairs that live in one shared representational space
 # (word2psy clip_text and viz2psy clip share an OpenCLIP ViT-B-32
 # checkpoint; word2psy clap_text and aud2psy clap share a LAION-CLAP
-# checkpoint). Checked by equal dimensionality at compute time.
+# checkpoint; viz2psy ebind, word2psy ebind_text, and aud2psy ebind_audio
+# all share the EBind encord-team/ebind-full checkpoint). Checked by equal
+# dimensionality at compute time.
 COMPATIBLE_SPACES = [
     ("clip_text", "clip"), ("clip", "clip_text"),
     ("clap_text", "clap"), ("clap", "clap_text"),
+    ("ebind", "ebind_text"), ("ebind_text", "ebind"),
+    ("ebind", "ebind_audio"), ("ebind_audio", "ebind"),
+    ("ebind_text", "ebind_audio"), ("ebind_audio", "ebind_text"),
 ]
 
 

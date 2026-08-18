@@ -34,6 +34,24 @@ class TestEmbeddingDetection:
         assert spaces["clip"].columns[0] == "clip_000"
         assert spaces["clip_text"].columns[0] == "clip_text_000"
 
+    def test_wide_embedding_four_digit_indices(self):
+        # 1024-d spaces use fixed 4-digit indices (contracts §4.1, amended
+        # 2026-08-17); ebind_1023 must not be misread as prefix "ebind_1".
+        cols = [f"ebind_{i:04d}" for i in range(1024)]
+        spaces = detect_embedding_spaces(cols)
+        assert set(spaces) == {"ebind"}
+        assert spaces["ebind"].n_dims == 1024
+        assert spaces["ebind"].columns[0] == "ebind_0000"
+        assert spaces["ebind"].columns[-1] == "ebind_1023"
+
+    def test_ebind_vs_ebind_text_disambiguation(self):
+        cols = [f"ebind_{i:04d}" for i in range(4)]
+        cols += [f"ebind_text_{i:04d}" for i in range(4)]
+        spaces = detect_embedding_spaces(cols)
+        assert set(spaces) == {"ebind", "ebind_text"}
+        assert spaces["ebind"].columns[0] == "ebind_0000"
+        assert spaces["ebind_text"].columns[0] == "ebind_text_0000"
+
     def test_unordered_columns_are_sorted(self):
         cols = [f"minilm_{i:03d}" for i in (2, 0, 1)]
         spaces = detect_embedding_spaces(cols)
@@ -138,6 +156,18 @@ class TestMatchSpaces:
         b = detect_spaces(_cols(("clip", 4)))
         pairs = match_spaces(a, b)
         assert [(pa.name, pb.name) for pa, pb in pairs] == [("clip_text", "clip")]
+
+    def test_ebind_arms_compatible(self):
+        a = detect_spaces([f"ebind_text_{i:04d}" for i in range(4)])
+        b = detect_spaces([f"ebind_{i:04d}" for i in range(4)])
+        pairs = match_spaces(a, b)
+        assert [(pa.name, pb.name) for pa, pb in pairs] == [("ebind_text", "ebind")]
+
+    def test_ebind_audio_x_text_compatible(self):
+        a = detect_spaces([f"ebind_audio_{i:04d}" for i in range(4)])
+        b = detect_spaces([f"ebind_text_{i:04d}" for i in range(4)])
+        pairs = match_spaces(a, b)
+        assert [(pa.name, pb.name) for pa, pb in pairs] == [("ebind_audio", "ebind_text")]
 
     def test_no_overlap(self):
         a = detect_spaces(_cols(("minilm", 3)))
