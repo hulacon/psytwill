@@ -20,6 +20,9 @@ Examples
 
     # Preview which spaces a CSV offers, without computing anything
     psytwill spaces scores_chunks.csv
+
+    # Long-form feature table from N extractor CSVs (Contract B surface)
+    psytwill features clip.csv ebind.csv caption.csv -o features.parquet
 """
 
 import argparse
@@ -101,6 +104,47 @@ def _run_spaces(args: argparse.Namespace) -> None:
         )
 
 
+def _parse_modality_map(arg: str | None) -> dict[str, str] | None:
+    """Parse ``--modality-map myext=audio,other=text`` into a dict."""
+    if arg is None:
+        return None
+    mapping = {}
+    for item in arg.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        extractor, sep, modality = item.partition("=")
+        if not sep or not extractor or not modality:
+            raise PsytwillError(
+                f"Bad --modality-map entry {item!r}; expected "
+                "EXTRACTOR=MODALITY (e.g. 'myext=audio')."
+            )
+        mapping[extractor] = modality
+    return mapping or None
+
+
+def _run_features(args: argparse.Namespace) -> None:
+    from psytwill.features import build_features
+
+    summary = build_features(
+        args.inputs,
+        output=args.output,
+        modality_map=_parse_modality_map(args.modality_map),
+    )
+    print(
+        f"psytwill features -> {summary['output']}  "
+        f"({summary['rows']} rows, {summary['n_stimuli']} stimuli, "
+        f"{len(summary['models'])} models)"
+    )
+    for entry in summary["inputs"]:
+        note = "" if entry["extractor"] else "  [legacy: no sidecar]"
+        print(
+            f"  {entry['path']}: {entry['rows']} rows, "
+            f"{entry['n_feature_columns']} feature cols{note}"
+        )
+    print(f"  {summary['meta_path']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -142,6 +186,25 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("spaces", help="List detectable spaces in a CSV")
     s.add_argument("input", help="A scores CSV/TSV file")
     s.set_defaults(func=_run_spaces)
+
+    f = sub.add_parser(
+        "features",
+        help="Aggregate N extractor CSVs into one long-form feature table",
+    )
+    f.add_argument("inputs", nargs="+", help="Extractor scores CSV/TSV files")
+    f.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output table (.parquet preferred, or .csv); "
+        "<stem>.meta.json is written alongside",
+    )
+    f.add_argument(
+        "--modality-map",
+        help="Extractor->modality overrides, e.g. 'myext=audio,other=text' "
+        "(defaults: viz2psy=visual, aud2psy=audio, word2psy=text)",
+    )
+    f.set_defaults(func=_run_features)
 
     return parser
 

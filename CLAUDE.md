@@ -83,11 +83,28 @@ that spec is authoritative. Working summary:
 - **`metadata.py`** — sidecar builder, viz2psy-style: embeddings described as
   `"pattern": "{name}_{NNN}"` + range, profiles as full column lists; per
   matrix: metric, form, shape, n_valid, nan_labels.
-- **`cli.py`** — `psytwill matrices <csv> [<csv2>] -o out/` and
-  `psytwill spaces <csv>`; heavy imports deferred into the command functions
+- **`features.py`** — `build_features()`: the long-form feature table
+  Contract B promises (§4.2.4), `psytwill features <csv>... -o
+  features.parquet`. N extractor CSVs melt into one tidy table with a
+  fixed schema — key `(stimulus_id, model, feature[, time, onset, offset,
+  voice])` plus provenance columns `(modality, extractor,
+  extractor_version)` and `value`/`value_str` (declared-string features
+  like `caption_text` survive as text). Model attribution is
+  longest-prefix match against the sidecar `models` map (incl. declared
+  `prefixes`), falling back to embedding-space detection for legacy
+  inputs; unattributed columns are kept with a null model and warned
+  about. Refuses duplicate keys across inputs and same-model checkpoint
+  mismatches. Output format follows the `-o` suffix (`.parquet` preferred
+  — §4.1's CSV-only rule binds extractors, not this aggregate surface;
+  `.csv` works without pyarrow); the table carries its own
+  `FEATURES_SCHEMA_VERSION` ("1.0") in `<stem>.meta.json`.
+- **`cli.py`** — `psytwill matrices <csv> [<csv2>] -o out/`,
+  `psytwill spaces <csv>`, and `psytwill features <csv>... -o table.parquet`;
+  heavy imports deferred into the command functions
   so `--help` stays fast (~0.3 s). `--spaces minilm:euclidean,emotion`
   (subset + per-space metric), `--metric` (global), `--distance` (1 − sim),
-  `--diagonal` (cross, equal N).
+  `--diagonal` (cross, equal N), `--modality-map` (features: extractor →
+  modality overrides).
 - **`exceptions.py`** — `PsytwillError` base; Input/Space/Metric errors;
   CLI catches and exits 1.
 
