@@ -79,6 +79,9 @@ export PIP_CACHE_DIR="$CACHE/pip"   # shared cache; also spares /home quota
 # user by the activate.d hook written below.
 mkdir -p "$CACHE"/{pip,huggingface,torch,word2psy,nltk_data,ultralytics} "$ENVS/bin"
 export HF_HOME="$CACHE/huggingface"
+# Credentials stay private: HF_HOME is group-readable, so its default
+# token file would be too. Read the token from the user's home instead.
+export HF_TOKEN_PATH="${HF_TOKEN_PATH:-$HOME/.cache/huggingface/token}"
 export TORCH_HOME="$CACHE/torch"
 export WORD2PSY_CACHE="$CACHE/word2psy"
 export NLTK_DATA="$CACHE/nltk_data"
@@ -189,21 +192,27 @@ cat > "$PREFIX/etc/conda/activate.d/stimfeat-env.sh" <<HOOK
 # Written by psytwill/scripts/setup_env.sh.
 # 1) ~/.local site-packages shadow a conda env's own — disable user site.
 # 2) Model caches are shared per-PIRG (multi-GB, identical per user).
+# 3) HF_HOME is shared and group-readable, so huggingface_hub would derive a
+#    *shared* default token file from it and a plain \`huggingface-cli login\`
+#    would expose a personal token to the whole PIRG. Point HF_TOKEN_PATH at
+#    the user's own home file; \$HOME is left unexpanded so it is per-user.
 export _STIMFEAT_SAVED_PYTHONNOUSERSITE="\${PYTHONNOUSERSITE:-}"
 export _STIMFEAT_SAVED_HF_HOME="\${HF_HOME:-}"
+export _STIMFEAT_SAVED_HF_TOKEN_PATH="\${HF_TOKEN_PATH:-}"
 export _STIMFEAT_SAVED_TORCH_HOME="\${TORCH_HOME:-}"
 export _STIMFEAT_SAVED_WORD2PSY_CACHE="\${WORD2PSY_CACHE:-}"
 export _STIMFEAT_SAVED_NLTK_DATA="\${NLTK_DATA:-}"
 export _STIMFEAT_SAVED_YOLO_CONFIG_DIR="\${YOLO_CONFIG_DIR:-}"
 export PYTHONNOUSERSITE=1
 export HF_HOME=$CACHE/huggingface
+export HF_TOKEN_PATH="\${HF_TOKEN_PATH:-\$HOME/.cache/huggingface/token}"
 export TORCH_HOME=$CACHE/torch
 export WORD2PSY_CACHE=$CACHE/word2psy
 export NLTK_DATA=$CACHE/nltk_data
 export YOLO_CONFIG_DIR=$CACHE/ultralytics
 HOOK
 cat > "$PREFIX/etc/conda/deactivate.d/stimfeat-env.sh" <<'HOOK'
-for v in PYTHONNOUSERSITE HF_HOME TORCH_HOME WORD2PSY_CACHE NLTK_DATA YOLO_CONFIG_DIR; do
+for v in PYTHONNOUSERSITE HF_HOME HF_TOKEN_PATH TORCH_HOME WORD2PSY_CACHE NLTK_DATA YOLO_CONFIG_DIR; do
   saved="_STIMFEAT_SAVED_$v"
   if [ -n "${!saved:-}" ]; then export "$v=${!saved}"; else unset "$v"; fi
   unset "$saved"
@@ -231,5 +240,7 @@ Activate with:
   conda activate $PREFIX
 
 The activate hook exports PYTHONNOUSERSITE=1 and the shared caches
-(HF_HOME, TORCH_HOME, WORD2PSY_CACHE, NLTK_DATA, YOLO_CONFIG_DIR).
+(HF_HOME, TORCH_HOME, WORD2PSY_CACHE, NLTK_DATA, YOLO_CONFIG_DIR), and
+points HF_TOKEN_PATH at \$HOME/.cache/huggingface/token so HF credentials
+stay per-user rather than landing in the shared cache.
 EOF
