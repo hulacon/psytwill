@@ -81,13 +81,24 @@ class TestProfileDetection:
 
     def test_word_aggregates_mean_only(self):
         cols = [
-            "concreteness_mean", "concreteness_sd", "concreteness_min",
-            "valence_mean", "valence_max",
+            "lexical_norms_concreteness_mean", "lexical_norms_concreteness_sd",
+            "lexical_norms_concreteness_min",
+            "lexical_norms_valence_mean", "lexical_norms_valence_max",
         ]
         spaces = detect_profile_spaces(cols)
         assert spaces["word_aggregates"].columns == [
-            "concreteness_mean", "valence_mean"
+            "lexical_norms_concreteness_mean", "lexical_norms_valence_mean"
         ]
+
+    def test_pre_0_4_0_bare_norm_columns_are_not_a_profile(self):
+        """word2psy < 0.4.0 wrote bare names; they must not silently match.
+
+        A legacy CSV should surface as unrecognised rather than be swept into
+        `word_aggregates` under the new prefixed definition -- otherwise a
+        mixed-version store looks consistent when it is not.
+        """
+        cols = ["concreteness_mean", "valence_mean", "old20_mean"]
+        assert "word_aggregates" not in detect_profile_spaces(cols)
 
     def test_single_column_profile_rejected(self):
         assert detect_profile_spaces(["emotion_joy"]) == {}

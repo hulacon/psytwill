@@ -88,33 +88,40 @@ class SpaceConfig:
 
 # --- named-profile registry (tier 2) ------------------------------------
 
+# word2psy 0.4.0 prefixed these (Contract B §4.1); they were bare before,
+# which left psytwill unable to attribute any of them to a model.
 _NORM_FEATURES = [
-    "concreteness",
-    "valence",
-    "arousal",
-    "dominance",
-    "age_of_acquisition",
-    "imageability",
-    "familiarity",
-    "semantic_size",
-    "gender_association",
-    "socialness",
-    "body_object_interaction",
-    "sensorimotor_touch",
-    "sensorimotor_hearing",
-    "sensorimotor_smell",
-    "sensorimotor_taste",
-    "sensorimotor_vision",
-    "sensorimotor_interoception",
-    "sensorimotor_mouth",
-    "sensorimotor_hand",
-    "sensorimotor_foot",
-    "sensorimotor_head",
-    "sensorimotor_torso",
-    "zipf_frequency",
+    "lexical_norms_concreteness",
+    "lexical_norms_valence",
+    "lexical_norms_arousal",
+    "lexical_norms_dominance",
+    "lexical_norms_age_of_acquisition",
+    "lexical_norms_imageability",
+    "lexical_norms_familiarity",
+    "lexical_norms_semantic_size",
+    "lexical_norms_gender_association",
+    "lexical_norms_socialness",
+    "lexical_norms_body_object_interaction",
+    "lexical_norms_sensorimotor_touch",
+    "lexical_norms_sensorimotor_hearing",
+    "lexical_norms_sensorimotor_smell",
+    "lexical_norms_sensorimotor_taste",
+    "lexical_norms_sensorimotor_vision",
+    "lexical_norms_sensorimotor_interoception",
+    "lexical_norms_sensorimotor_mouth",
+    "lexical_norms_sensorimotor_hand",
+    "lexical_norms_sensorimotor_foot",
+    "lexical_norms_sensorimotor_head",
+    "lexical_norms_sensorimotor_torso",
+    "lexical_norms_zipf_frequency",
 ]
 
-_WORDFORM_FEATURES = ["length", "n_syllables", "n_phonemes", "old20"]
+_WORDFORM_FEATURES = [
+    "wordform_length",
+    "wordform_n_syllables",
+    "wordform_n_phonemes",
+    "wordform_old20",
+]
 
 # aud2psy frame-level features (model-prefixed, one value per timepoint).
 _ACOUSTIC_PATTERNS = [
