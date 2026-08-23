@@ -172,3 +172,129 @@ def test_cli_features_verb(tmp_path, capsys):
     assert out.exists() and out.with_suffix(".meta.json").exists()
     stdout = capsys.readouterr().out
     assert "24 rows" in stdout and "3 models" in stdout
+
+
+# --------------------------------------------------------------------------
+# Streaming writes (psytwill 0.5.0)
+#
+# build_features used to melt every input, concat, then write. On the
+# MMMData store that is ~302 M rows at ~450 B/row resident -- ~135 GB, which
+# no node has. Inputs are now melted and written one at a time, so peak
+# memory tracks the largest single input instead of the total. These cover
+# the guarantees that rewrite had to preserve.
+# --------------------------------------------------------------------------
+
+def test_one_row_group_per_input(tmp_path):
+    """The streaming write is observable: N inputs -> N parquet row groups."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(3)]
+    # Disambiguate so the three inputs do not collide on the key.
+    for i, path in enumerate(inputs):
+        df = pd.read_csv(path)
+        df["stimulus_id"] = df["stimulus_id"] + f"_r{i}"
+        df.to_csv(path, index=False)
+
+    out = tmp_path / "features.parquet"
+    build_features(inputs, out)
+    assert pq.ParquetFile(out).num_row_groups == 3
+
+
+def test_refusal_leaves_no_output_and_no_partial(tmp_path):
+    """A mid-stream refusal must not leave a truncated table behind."""
+    a = image_fixture(tmp_path, name="a.csv")
+    b = image_fixture(tmp_path, checkpoint="ViT-L-14/openai", name="b.csv")
+    out = tmp_path / "features.parquet"
+    with pytest.raises(SpaceError):
+        build_features([a, b], out)
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_refusal_does_not_clobber_an_existing_table(tmp_path):
+    """The previous good table survives a failed rebuild."""
+    good = image_fixture(tmp_path, name="good.csv")
+    out = tmp_path / "features.parquet"
+    build_features([good], out)
+    before = out.read_bytes()
+
+    a = image_fixture(tmp_path, name="a.csv")
+    b = image_fixture(tmp_path, checkpoint="ViT-L-14/openai", name="b.csv")
+    with pytest.raises(SpaceError):
+        build_features([a, b], out)
+    assert out.read_bytes() == before
+
+
+def test_streaming_matches_a_single_concat(tmp_path):
+    """Row-for-row equality with the pre-streaming semantics."""
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(3)]
+    for i, path in enumerate(inputs):
+        df = pd.read_csv(path)
+        df["stimulus_id"] = df["stimulus_id"] + f"_r{i}"
+        df.to_csv(path, index=False)
+
+    out = tmp_path / "features.csv"
+    summary = build_features(inputs, out)
+    table = pd.read_csv(out)
+
+    # The reference: melt each input and concat, the way it used to work.
+    from psytwill.features import MODALITY_MAP, _coerce, _melt_input
+    parts = [_melt_input(p, MODALITY_MAP)[0] for p in inputs]
+    expected = _coerce(pd.concat(parts, ignore_index=True))
+
+    assert len(table) == len(expected) == summary["rows"]
+    assert list(table.columns) == OUTPUT_COLUMNS
+    assert table["feature"].tolist() == expected["feature"].tolist()
+    assert table["stimulus_id"].tolist() == expected["stimulus_id"].tolist()
+
+
+def test_meta_totals_are_accumulated_not_recomputed(tmp_path):
+    """rows / n_stimuli / models come from the stream, not a resident table."""
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(2)]
+    for i, path in enumerate(inputs):
+        df = pd.read_csv(path)
+        df["stimulus_id"] = df["stimulus_id"] + f"_r{i}"
+        df.to_csv(path, index=False)
+
+    out = tmp_path / "features.csv"
+    summary = build_features(inputs, out)
+    table = pd.read_csv(out)
+    meta = json.loads((tmp_path / "features.meta.json").read_text())
+
+    assert meta["output"]["rows"] == len(table) == summary["rows"]
+    assert meta["n_stimuli"] == table["stimulus_id"].nunique() == 8
+    assert meta["models"] == sorted(table["model"].dropna().unique())
+
+
+def test_duplicate_detection_survives_a_hash_collision(tmp_path, monkeypatch):
+    """Candidate collisions are confirmed against real keys, not trusted.
+
+    _key_hash is 64-bit, so distinct keys can collide. Forcing every row to
+    one hash must not manufacture a duplicate that is not there.
+    """
+    import psytwill.features as F
+
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(2)]
+    for i, path in enumerate(inputs):
+        df = pd.read_csv(path)
+        df["stimulus_id"] = df["stimulus_id"] + f"_r{i}"
+        df.to_csv(path, index=False)
+
+    monkeypatch.setattr(
+        F, "_key_hash", lambda table: np.zeros(len(table), dtype="uint64")
+    )
+    out = tmp_path / "features.csv"
+    build_features(inputs, out)          # must NOT raise
+    assert out.exists()
+
+
+def test_real_duplicates_still_refused_across_many_inputs(tmp_path):
+    """The exact check runs only on suspects, but still catches them."""
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(4)]
+    for i, path in enumerate(inputs[1:3], start=1):
+        df = pd.read_csv(path)
+        df["stimulus_id"] = df["stimulus_id"] + f"_r{i}"
+        df.to_csv(path, index=False)
+    # inputs[0] and inputs[3] keep the same ids -> one real collision, found
+    # only after two unrelated inputs have already streamed out.
+    with pytest.raises(InputError, match="duplicate feature key"):
+        build_features(inputs, tmp_path / "features.csv")

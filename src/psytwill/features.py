@@ -22,11 +22,13 @@ A ``<stem>.meta.json`` sidecar is always written alongside.
 from __future__ import annotations
 
 import json
+import os
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from psytwill import __version__
@@ -207,8 +209,90 @@ def _assert_checkpoints(entries: list[dict[str, Any]]) -> None:
             seen.setdefault(model, (checkpoint, entry["path"]))
 
 
+def _key_hash(table: pd.DataFrame) -> np.ndarray:
+    """A uint64 hash per row over KEY_COLUMNS.
+
+    The whole table never has to be resident to check key uniqueness -- 8
+    bytes a row is enough to find every *candidate* collision, and the exact
+    check then runs only on those. For the MMMData store that is 1.4 GB of
+    hashes instead of 78 GB of melted rows.
+    """
+    return pd.util.hash_pandas_object(
+        table[KEY_COLUMNS], index=False
+    ).to_numpy(dtype="uint64", copy=False)
+
+
+def _duplicate_examples(
+    inputs: list[str | Path],
+    per_input_hashes: list[np.ndarray],
+    suspects: np.ndarray,
+    modality_map: dict[str, str],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Exact duplicate rows behind a set of colliding hashes.
+
+    Only the inputs that actually carry a suspect hash are re-melted, and
+    only their suspect rows are kept, so this stays small even when the
+    aggregate is hundreds of millions of rows.
+    """
+    frames, sources = [], []
+    for path, hashes in zip(inputs, per_input_hashes):
+        hit = np.isin(hashes, suspects)
+        if not hit.any():
+            continue
+        long, _ = _melt_input(path, modality_map)
+        rows = long.loc[hit, KEY_COLUMNS].copy()
+        rows["_input"] = str(path)
+        frames.append(rows)
+        sources.append(str(path))
+    if not frames:
+        return pd.DataFrame(columns=[*KEY_COLUMNS, "_input"]), []
+    return pd.concat(frames, ignore_index=True), sources
+
+
+def _assert_unique_streaming(
+    inputs: list[str | Path],
+    per_input_hashes: list[np.ndarray],
+    modality_map: dict[str, str],
+) -> None:
+    """Refuse silent duplicate keys, without holding the table in memory."""
+    if not per_input_hashes:
+        return
+    all_hashes = np.concatenate(per_input_hashes)
+    uniq, counts = np.unique(all_hashes, return_counts=True)
+    suspects = uniq[counts > 1]
+    if not len(suspects):
+        return
+
+    # Hash collisions are possible, so confirm against the real key tuples
+    # before refusing. Only suspect rows are materialised.
+    rows, sources = _duplicate_examples(
+        inputs, per_input_hashes, suspects, modality_map
+    )
+    duplicated = rows.duplicated(subset=KEY_COLUMNS, keep=False)
+    if not duplicated.any():
+        return
+    dup = rows.loc[duplicated]
+    examples = "; ".join(
+        "(" + ", ".join(
+            f"{k}={v!r}" for k, v in row.items()
+            if k != "_input" and pd.notna(v)
+        ) + ")"
+        for _, row in dup[KEY_COLUMNS].head(3).iterrows()
+    )
+    raise InputError(
+        f"{int(duplicated.sum())} duplicate feature key(s) across inputs "
+        f"{sorted(dup['_input'].unique())}, e.g. {examples}. Each "
+        "(stimulus_id, model, feature[, time/onset/offset/voice]) may "
+        "appear once; drop the overlapping input or disambiguate upstream."
+    )
+
+
 def _assert_unique(table: pd.DataFrame, sources: pd.Series) -> None:
-    """Refuse silent duplicate keys (same feature for one stimulus twice)."""
+    """Refuse silent duplicate keys (same feature for one stimulus twice).
+
+    Retained for callers holding a whole table; ``build_features`` uses the
+    streaming path instead.
+    """
     duplicated = table.duplicated(subset=KEY_COLUMNS, keep=False)
     if not duplicated.any():
         return
@@ -223,6 +307,20 @@ def _assert_unique(table: pd.DataFrame, sources: pd.Series) -> None:
         "(stimulus_id, model, feature[, time/onset/offset/voice]) may "
         "appear once; drop the overlapping input or disambiguate upstream."
     )
+
+
+OUTPUT_DTYPES = (
+    {"time": "float64", "onset": "float64", "offset": "float64",
+     "value": "float64", "value_str": "string"}
+    | {c: "string" for c in ("stimulus_id", "voice", "modality",
+                             "extractor", "extractor_version",
+                             "model", "feature")}
+)
+
+
+def _coerce(long: pd.DataFrame) -> pd.DataFrame:
+    """Fixed column order and dtypes, so every row group shares one schema."""
+    return long[OUTPUT_COLUMNS].astype(OUTPUT_DTYPES)
 
 
 def build_features(
@@ -252,38 +350,83 @@ def build_features(
             ".parquet (preferred) or .csv."
         )
     merged_map = {**MODALITY_MAP, **(modality_map or {})}
+    inputs = list(inputs)
 
-    parts, entries = [], []
-    for path in inputs:
-        long, entry = _melt_input(path, merged_map)
-        long["_input"] = str(path)
-        parts.append(long)
-        entries.append(entry)
-    _assert_checkpoints(entries)
-
-    table = pd.concat(parts, ignore_index=True)
-    _assert_unique(table, table["_input"])
-    # Fixed dtypes even when a key is all-null, so the parquet schema is
-    # identical regardless of which inputs were mixed.
-    table = table[OUTPUT_COLUMNS].astype(
-        {"time": "float64", "onset": "float64", "offset": "float64",
-         "value": "float64", "value_str": "string"}
-        | {c: "string" for c in ("stimulus_id", "voice", "modality",
-                                 "extractor", "extractor_version",
-                                 "model", "feature")}
-    )
-
-    output.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "parquet":
         try:
-            table.to_parquet(output, index=False)
+            import pyarrow as pa
+            import pyarrow.parquet as pq
         except ImportError as exc:
             raise InputError(
                 f"Writing parquet needs pyarrow ({exc}); pip install "
                 "pyarrow, or use a .csv output suffix."
             ) from exc
-    else:
-        table.to_csv(output, index=False, float_format="%.6g")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Written to a sidecar path and renamed, so a refusal part-way through
+    # never leaves a truncated table where a complete one used to be.
+    partial = output.with_name(output.name + ".partial")
+
+    entries: list[dict[str, Any]] = []
+    per_input_hashes: list[np.ndarray] = []
+    stimulus_ids: set[str] = set()
+    models_seen: set[str] = set()
+    n_rows = 0
+    writer = None
+    wrote_csv_header = False
+
+    try:
+        for path in inputs:
+            long, entry = _melt_input(path, merged_map)
+            entries.append(entry)
+            # Incremental, so a checkpoint clash is refused at the input that
+            # introduces it rather than after every input has been melted.
+            _assert_checkpoints(entries)
+
+            table = _coerce(long)
+            del long
+            per_input_hashes.append(_key_hash(table))
+            n_rows += len(table)
+            stimulus_ids.update(table["stimulus_id"].dropna().unique().tolist())
+            models_seen.update(table["model"].dropna().unique().tolist())
+
+            if fmt == "parquet":
+                batch = pa.Table.from_pandas(table, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(partial, batch.schema)
+                writer.write_table(batch)
+                del batch
+            else:
+                table.to_csv(
+                    partial, index=False, float_format="%.6g",
+                    mode="a" if wrote_csv_header else "w",
+                    header=not wrote_csv_header,
+                )
+                wrote_csv_header = True
+            del table
+
+        if writer is not None:
+            writer.close()
+            writer = None
+        elif fmt == "parquet":
+            # No inputs produced rows; still emit a schema-correct empty file.
+            empty = _coerce(pd.DataFrame(columns=OUTPUT_COLUMNS))
+            pq.write_table(
+                pa.Table.from_pandas(empty, preserve_index=False), partial
+            )
+        elif not wrote_csv_header:
+            _coerce(pd.DataFrame(columns=OUTPUT_COLUMNS)).to_csv(
+                partial, index=False
+            )
+
+        _assert_unique_streaming(inputs, per_input_hashes, merged_map)
+    except BaseException:
+        if writer is not None:
+            writer.close()
+        partial.unlink(missing_ok=True)
+        raise
+
+    os.replace(partial, output)
 
     meta = {
         "schema_version": FEATURES_SCHEMA_VERSION,
@@ -294,13 +437,13 @@ def build_features(
         "output": {
             "path": str(output.resolve()),
             "format": fmt,
-            "rows": len(table),
+            "rows": n_rows,
             "columns": OUTPUT_COLUMNS,
             "key_columns": KEY_COLUMNS,
         },
         "inputs": entries,
-        "n_stimuli": int(table["stimulus_id"].nunique()),
-        "models": sorted(table["model"].dropna().unique()),
+        "n_stimuli": len(stimulus_ids),
+        "models": sorted(models_seen),
     }
     meta_path = output.with_suffix(".meta.json")
     with open(meta_path, "w") as f:
@@ -309,7 +452,7 @@ def build_features(
     return {
         "output": str(output),
         "meta_path": str(meta_path),
-        "rows": len(table),
+        "rows": n_rows,
         "n_stimuli": meta["n_stimuli"],
         "models": meta["models"],
         "inputs": entries,
