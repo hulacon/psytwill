@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 from psytwill import __version__
-from psytwill.exceptions import InputError, SpaceError
+from psytwill.exceptions import EmptyInputError, InputError, SpaceError
 from psytwill.matrices import resolve_labels
 from psytwill.sidecar import load_sidecar, model_checkpoint
 from psytwill.spaces import INDEX_COLUMNS, detect_embedding_spaces
@@ -42,17 +42,34 @@ FEATURES_SCHEMA_VERSION = "1.0"
 # Reserved columns that survive as keys in the long table; the remaining
 # INDEX_COLUMNS are row-identity implementation details and are dropped
 # (stimulus_id is handled separately as the primary key).
-CARRIED_KEYS = ["voice", "time", "onset", "offset"]
+# Two kinds of coordinate survive into the long table, and only two:
+#
+#   intrinsic   -- time / onset / offset / voice: properties of the stimulus
+#                  itself, which an extractor can legitimately know.
+#   structural  -- chunk_idx / word_idx: the extractor's own row order and
+#                  grouping, i.e. "which of this stimulus's rows is this".
+#
+# Experimental variables (trial order, condition, annotator, segment label)
+# are deliberately absent. They belong to the experiment, not the extractor,
+# and join back onto these coordinates.
+#
+# The structural ordinals are load-bearing, not decoration. Untimed text has
+# all-null onset/offset -- word2psy times nothing, only aud2psy transcripts do
+# -- so without chunk_idx/word_idx the key degenerates to
+# (stimulus_id, model, feature) and every caption of an image, or every word
+# of a chunk, collapses onto one row.
+CARRIED_KEYS = ["voice", "time", "onset", "offset", "chunk_idx", "word_idx"]
 
 # Fixed output schema, in column order.
 OUTPUT_COLUMNS = [
-    "stimulus_id", "voice", "time", "onset", "offset",
+    "stimulus_id", "voice", "time", "onset", "offset", "chunk_idx", "word_idx",
     "modality", "extractor", "extractor_version", "model", "feature",
     "value", "value_str",
 ]
 
 # The key that must be unique across all inputs (everything but the values).
-KEY_COLUMNS = ["stimulus_id", "voice", "time", "onset", "offset", "model", "feature"]
+KEY_COLUMNS = ["stimulus_id", "voice", "time", "onset", "offset",
+               "chunk_idx", "word_idx", "model", "feature"]
 
 # Extractor package -> modality of the stimuli it reads.
 MODALITY_MAP = {"viz2psy": "visual", "aud2psy": "audio", "word2psy": "text"}
@@ -324,6 +341,7 @@ def _assert_unique(table: pd.DataFrame, sources: pd.Series) -> None:
 
 OUTPUT_DTYPES = (
     {"time": "float64", "onset": "float64", "offset": "float64",
+     "chunk_idx": "Int64", "word_idx": "Int64",
      "value": "float64", "value_str": "string"}
     | {c: "string" for c in ("stimulus_id", "voice", "modality",
                              "extractor", "extractor_version",
@@ -381,6 +399,7 @@ def build_features(
     partial = output.with_name(output.name + ".partial")
 
     entries: list[dict[str, Any]] = []
+    skipped_empty: list[str] = []
     per_input_hashes: list[np.ndarray] = []
     stimulus_ids: set[str] = set()
     models_seen: set[str] = set()
@@ -390,7 +409,20 @@ def build_features(
 
     try:
         for path in inputs:
-            long, entry = _melt_input(path, merged_map)
+            try:
+                long, entry = _melt_input(path, merged_map)
+            except EmptyInputError:
+                # Legitimate, not a defect: a movie with no speech has an
+                # empty transcript, a 0.54 s word has no detectable beat.
+                # One such input must not take down the whole aggregate.
+                skipped_empty.append(str(path))
+                per_input_hashes.append(np.empty(0, dtype="uint64"))
+                warnings.warn(
+                    f"{path} has no rows; skipped (empty inputs are recorded "
+                    "in the sidecar as skipped_empty).",
+                    stacklevel=2,
+                )
+                continue
             entries.append(entry)
             # Incremental, so a checkpoint clash is refused at the input that
             # introduces it rather than after every input has been melted.
@@ -455,6 +487,7 @@ def build_features(
             "key_columns": KEY_COLUMNS,
         },
         "inputs": entries,
+        "skipped_empty": skipped_empty,
         "n_stimuli": len(stimulus_ids),
         "models": sorted(models_seen),
     }
@@ -466,6 +499,7 @@ def build_features(
         "output": str(output),
         "meta_path": str(meta_path),
         "rows": n_rows,
+        "skipped_empty": skipped_empty,
         "n_stimuli": meta["n_stimuli"],
         "models": meta["models"],
         "inputs": entries,

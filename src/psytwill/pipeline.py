@@ -14,7 +14,7 @@ from typing import Any
 
 import pandas as pd
 
-from psytwill.exceptions import InputError, SpaceError
+from psytwill.exceptions import EmptyInputError, InputError, SpaceError
 from psytwill.matrices import (
     MatrixResult,
     compute_matrix,
@@ -38,7 +38,7 @@ def read_scores(path: str | Path) -> pd.DataFrame:
     except Exception as exc:
         raise InputError(f"Could not read {path}: {exc}") from exc
     if df.empty:
-        raise InputError(f"{path} contains no rows.")
+        raise EmptyInputError(f"{path} contains no rows.")
     return df
 
 

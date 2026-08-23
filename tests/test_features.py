@@ -336,3 +336,116 @@ def test_duplicate_count_is_reported_from_the_hash_pass(tmp_path):
     # 3 identical inputs -> 2 excess rows per key across all keys.
     one = build_features([inputs[0]], tmp_path / "one.csv")
     assert f"~{one['rows'] * 2} duplicate" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# Structural ordinals in the key, and empty inputs (psytwill 0.6.0)
+# --------------------------------------------------------------------------
+
+def text_fixture(tmp_path, name, n_chunks=2, words_per_chunk=3, timed=False):
+    """word2psy-shaped word-level table: untimed unless asked otherwise.
+
+    word2psy times nothing -- only aud2psy transcripts carry real onsets --
+    so the default here is the shape that actually dominates the store.
+    """
+    rows = []
+    for c in range(n_chunks):
+        for w in range(words_per_chunk):
+            rows.append({
+                "stimulus_id": "shared0001",
+                "chunk_idx": c,
+                "word_idx": w,
+                "onset": float(c * 10 + w) if timed else None,
+                "offset": float(c * 10 + w + 1) if timed else None,
+                "wordform_length": float(w + 3),
+            })
+    df = pd.DataFrame(rows)
+    sidecar = {
+        "schema_version": "1.0",
+        "extractor": "word2psy",
+        "extractor_version": "0.5.1",
+        "models": {"wordform": {"checkpoint": "builtin",
+                                "features": {"columns": ["wordform_length"]}}},
+    }
+    return _write(tmp_path / name, df, sidecar)
+
+
+def test_untimed_word_rows_are_keyed_by_their_ordinals(tmp_path):
+    """The P2 case: all-null onset, so word_idx must carry the identity."""
+    path = text_fixture(tmp_path, "w.csv")
+    out = tmp_path / "features.csv"
+    summary = build_features([path], out)
+    table = pd.read_csv(out)
+
+    assert summary["rows"] == 6                      # 2 chunks x 3 words
+    assert not table.duplicated(subset=KEY_COLUMNS).any()
+    assert set(table["chunk_idx"]) == {0, 1}
+    assert set(table["word_idx"]) == {0, 1, 2}
+    assert table["onset"].isna().all()
+
+
+def test_multiple_untimed_chunks_per_stimulus_survive(tmp_path):
+    """The P1 case: five captions of one image, no timing to separate them."""
+    rows = [{"stimulus_id": "shared0001", "chunk_idx": i,
+             "readability_flesch": float(i)} for i in range(5)]
+    sidecar = {
+        "schema_version": "1.0", "extractor": "word2psy",
+        "extractor_version": "0.5.1",
+        "models": {"readability": {"checkpoint": "builtin",
+                   "features": {"columns": ["readability_flesch"]}}},
+    }
+    path = _write(tmp_path / "c.csv", pd.DataFrame(rows), sidecar)
+    summary = build_features([path], tmp_path / "features.csv")
+    assert summary["rows"] == 5
+    assert summary["n_stimuli"] == 1
+
+
+def test_ordinals_are_in_the_fixed_schema(tmp_path):
+    path = text_fixture(tmp_path, "w.csv")
+    build_features([path], tmp_path / "features.csv")
+    table = pd.read_csv(tmp_path / "features.csv")
+    assert list(table.columns) == OUTPUT_COLUMNS
+    assert "chunk_idx" in KEY_COLUMNS and "word_idx" in KEY_COLUMNS
+
+
+def test_ordinals_are_nullable_for_inputs_that_lack_them(tmp_path):
+    """Image tables have no chunks; the columns stay null, not absent."""
+    path = image_fixture(tmp_path)
+    build_features([path], tmp_path / "features.csv")
+    table = pd.read_csv(tmp_path / "features.csv")
+    assert table["chunk_idx"].isna().all()
+    assert table["word_idx"].isna().all()
+
+
+def test_empty_input_is_skipped_not_fatal(tmp_path):
+    """A movie with no speech must not take down its 60-movie group."""
+    good = image_fixture(tmp_path, name="good.csv")
+    empty = _write(
+        tmp_path / "empty.csv",
+        pd.DataFrame(columns=["stimulus_id", "clip_000"]),
+        {"schema_version": "1.0", "extractor": "viz2psy",
+         "extractor_version": "0.7.1",
+         "models": {"clip": {"checkpoint": CLIP_CKPT}}},
+    )
+    out = tmp_path / "features.csv"
+    with pytest.warns(UserWarning, match="no rows"):
+        summary = build_features([good, empty], out)
+    assert summary["rows"] > 0
+    assert summary["skipped_empty"] == [str(empty)]
+    meta = json.loads((tmp_path / "features.meta.json").read_text())
+    assert meta["skipped_empty"] == [str(empty)]
+
+
+def test_all_inputs_empty_still_writes_a_schema_correct_table(tmp_path):
+    empty = _write(
+        tmp_path / "empty.csv",
+        pd.DataFrame(columns=["stimulus_id", "clip_000"]),
+        {"schema_version": "1.0", "extractor": "viz2psy",
+         "extractor_version": "0.7.1",
+         "models": {"clip": {"checkpoint": CLIP_CKPT}}},
+    )
+    out = tmp_path / "features.csv"
+    with pytest.warns(UserWarning, match="no rows"):
+        summary = build_features([empty], out)
+    assert summary["rows"] == 0
+    assert list(pd.read_csv(out).columns) == OUTPUT_COLUMNS
