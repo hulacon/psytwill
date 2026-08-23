@@ -222,31 +222,40 @@ def _key_hash(table: pd.DataFrame) -> np.ndarray:
     ).to_numpy(dtype="uint64", copy=False)
 
 
+# How many colliding hashes to confirm exactly. A duplicate key is a hard
+# refusal, so the message only needs a handful of real examples -- but the
+# suspect set itself can be tens of millions of rows when a column is
+# duplicated across every input, and materialising all of them is what an
+# unbounded version of this did before it OOMed a 32 GB job.
+DUP_CONFIRM_HASHES = 512
+
+
 def _duplicate_examples(
     inputs: list[str | Path],
     per_input_hashes: list[np.ndarray],
     suspects: np.ndarray,
     modality_map: dict[str, str],
-) -> tuple[pd.DataFrame, list[str]]:
-    """Exact duplicate rows behind a set of colliding hashes.
+) -> pd.DataFrame:
+    """Exact rows behind a bounded sample of colliding hashes.
 
-    Only the inputs that actually carry a suspect hash are re-melted, and
-    only their suspect rows are kept, so this stays small even when the
-    aggregate is hundreds of millions of rows.
+    Only the inputs carrying one of the sampled hashes are re-melted, and
+    only those rows are kept, so confirmation costs a bounded amount of
+    memory however pervasive the duplication is.
     """
-    frames, sources = [], []
+    sample = suspects[:DUP_CONFIRM_HASHES]
+    frames = []
     for path, hashes in zip(inputs, per_input_hashes):
-        hit = np.isin(hashes, suspects)
+        hit = np.isin(hashes, sample)
         if not hit.any():
             continue
         long, _ = _melt_input(path, modality_map)
         rows = long.loc[hit, KEY_COLUMNS].copy()
         rows["_input"] = str(path)
         frames.append(rows)
-        sources.append(str(path))
+        del long
     if not frames:
-        return pd.DataFrame(columns=[*KEY_COLUMNS, "_input"]), []
-    return pd.concat(frames, ignore_index=True), sources
+        return pd.DataFrame(columns=[*KEY_COLUMNS, "_input"])
+    return pd.concat(frames, ignore_index=True)
 
 
 def _assert_unique_streaming(
@@ -259,15 +268,17 @@ def _assert_unique_streaming(
         return
     all_hashes = np.concatenate(per_input_hashes)
     uniq, counts = np.unique(all_hashes, return_counts=True)
-    suspects = uniq[counts > 1]
-    if not len(suspects):
+    collided = counts > 1
+    if not collided.any():
         return
+    suspects = uniq[collided]
+    # Excess rows over one per key. Exact up to hash collisions, which the
+    # confirmation below rules out for the sample it inspects.
+    n_excess = int((counts[collided] - 1).sum())
 
     # Hash collisions are possible, so confirm against the real key tuples
-    # before refusing. Only suspect rows are materialised.
-    rows, sources = _duplicate_examples(
-        inputs, per_input_hashes, suspects, modality_map
-    )
+    # before refusing -- on a bounded sample, not the whole suspect set.
+    rows = _duplicate_examples(inputs, per_input_hashes, suspects, modality_map)
     duplicated = rows.duplicated(subset=KEY_COLUMNS, keep=False)
     if not duplicated.any():
         return
@@ -279,9 +290,11 @@ def _assert_unique_streaming(
         ) + ")"
         for _, row in dup[KEY_COLUMNS].head(3).iterrows()
     )
+    n_inputs = len(dup["_input"].unique())
+    shown = sorted(dup["_input"].unique())[:4]
     raise InputError(
-        f"{int(duplicated.sum())} duplicate feature key(s) across inputs "
-        f"{sorted(dup['_input'].unique())}, e.g. {examples}. Each "
+        f"~{n_excess} duplicate feature key(s) across the inputs; confirmed "
+        f"in {n_inputs} of them, e.g. {shown}, rows like {examples}. Each "
         "(stimulus_id, model, feature[, time/onset/offset/voice]) may "
         "appear once; drop the overlapping input or disambiguate upstream."
     )

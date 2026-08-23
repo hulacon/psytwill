@@ -298,3 +298,41 @@ def test_real_duplicates_still_refused_across_many_inputs(tmp_path):
     # only after two unrelated inputs have already streamed out.
     with pytest.raises(InputError, match="duplicate feature key"):
         build_features(inputs, tmp_path / "features.csv")
+
+
+def test_duplicate_confirmation_is_bounded(tmp_path, monkeypatch):
+    """Confirming duplicates must not materialise the whole suspect set.
+
+    When a column is duplicated across every input the suspect set is the
+    table -- tens of millions of rows in the MMMData store. An unbounded
+    confirmation pass OOMed a 32 GB job; only a sample is inspected now.
+    """
+    import psytwill.features as F
+
+    monkeypatch.setattr(F, "DUP_CONFIRM_HASHES", 2)
+    seen = []
+    real_melt = F._melt_input
+
+    def counting_melt(path, mm):
+        seen.append(str(path))
+        return real_melt(path, mm)
+
+    monkeypatch.setattr(F, "_melt_input", counting_melt)
+
+    # Four identical inputs: every key collides, four ways.
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(4)]
+    with pytest.raises(InputError, match="duplicate feature key"):
+        build_features(inputs, tmp_path / "features.csv")
+
+    # 4 melts to stream + at most 4 to confirm; never a re-melt per suspect.
+    assert len(seen) <= 8
+
+
+def test_duplicate_count_is_reported_from_the_hash_pass(tmp_path):
+    """The count covers all duplicates, not just the confirmed sample."""
+    inputs = [image_fixture(tmp_path, name=f"s{i}.csv") for i in range(3)]
+    with pytest.raises(InputError) as exc:
+        build_features(inputs, tmp_path / "features.csv")
+    # 3 identical inputs -> 2 excess rows per key across all keys.
+    one = build_features([inputs[0]], tmp_path / "one.csv")
+    assert f"~{one['rows'] * 2} duplicate" in str(exc.value)
