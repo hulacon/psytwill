@@ -206,6 +206,37 @@ across all clips, and cleanly flags "no speech".
    aud2psy owns acoustic/paralinguistic features + transcription export;
    verbal content stays word2psy's job — no duplication.
 
+### Long-term ambition: inversion (`psytwill invert`)
+
+Run the store backwards — given a feature vector, generate the pixels/words/
+sounds consistent with it. The natural absolute-scale counterpart to `compare`:
+inversion quality measures how much of a stimulus a space actually *carries*,
+with a ceiling, where cross-space comparison measures are all relative. If one
+space subsumes another, inverting it alone should reconstruct about as well as
+inverting the union.
+
+Three tiers, three mechanisms. Frame-level DSP features (spectral, loudness,
+pitch, timbre, egemaps; gist) invert analytically — vocoder / DDSP / texture
+synthesis. Semantic embeddings (clip, ebind, dinov2, clap, minilm, word2vec)
+need a learned prior; the output is a sample consistent with the embedding, not
+the original. Scalar heads (aesthetics, resmem, emonet, places, sentiment,
+readability, surprisal) are a few bits each — constraints, not codes.
+
+The joint form is the interesting one: every sibling extractor is a forward
+measurement operator, so inversion is `argmin_x Σ_k w_k d_k(f_k(x), y_k) +
+prior(x)` with a generative prior. Cheap to wire because `f_k` is not a
+reimplementation — it is viz2psy/aud2psy/word2psy, the same code that produced
+the CSVs psytwill already reads.
+
+Caveats that are properties of the Contract B store: `caption_*`/`annot_*`
+families invert to the caption, not the stimulus; pooled `_chunks` grain has
+irreversibly lost within-chunk order (prefer `_words`); the EBind audio arm
+carries no lexical signal for isolated-word audio.
+
+Full treatment, including the pilot design and scoring, is the *Feature
+inversion* item in `mmmdata-agents/docs/project-todos.md`. Aspirational — do
+not start without discussion.
+
 ### Explicitly deferred (do not build without discussion)
 
 - **Event segmentation / change-point chunking** (HMM/GSBS-style).
