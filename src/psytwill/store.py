@@ -24,6 +24,15 @@ a row *is*, and every downstream measure assumes rows are stimuli.
 in more than one group file — ``ebind`` appears in both the image group and
 its own group, byte-identical. Left in, a space trivially predicts itself and
 the comparison matrix acquires a meaningless perfect cell.
+
+**Prefixed provenance columns are not dimensions.** Contract B §4.1 reserves
+*unprefixed* names (``chunk_idx``, ``n_words``, ...), so a per-model
+bookkeeping column named ``{model}_n_pooled`` is a feature column by the
+letter of the contract and is attributed to its model — correctly, for
+provenance. As geometry it is poison: measured on the real store, a count
+with sd 1.14 sat beside fasttext embedding dimensions with sd 0.0085 and
+*was* PC1, dragging the participation ratio of ``cap:fasttext`` to 1.1 and of
+``cap:word2vec`` to 1.7 against 2.2 and 20.0 for the same spaces without it.
 """
 
 from __future__ import annotations
@@ -40,6 +49,15 @@ from psytwill.exceptions import InputError, SpaceError
 DEFAULT_KEY: tuple[str, ...] = ("stimulus_id",)
 VALUE_COLUMNS = ("value", "value_str")
 META_COLUMNS = ("modality", "extractor", "extractor_version")
+
+RESERVED_FEATURE_SUFFIXES: tuple[str, ...] = ("_n_pooled",)
+"""Suffixes marking a prefixed provenance column rather than a dimension.
+
+Kept as suffixes, not full names, because the column is namespaced to its
+model by design (word2psy 0.5.0 named it ``{prefix}_n_pooled`` precisely so
+the melt would attribute it). Unprefixed reserved names never reach here —
+:mod:`psytwill.features` drops them at melt time.
+"""
 
 
 @dataclass
@@ -77,6 +95,8 @@ class LoadReport:
     pooled: dict[str, int] = field(default_factory=dict)
     deduped: dict[str, str] = field(default_factory=dict)
     """Dropped space -> the identical space it duplicated."""
+    dropped_provenance: dict[str, list[str]] = field(default_factory=dict)
+    """Space -> prefixed provenance columns excluded from its matrix."""
 
 
 def _read(
@@ -214,6 +234,17 @@ def load_spaces(
             rep.pooled[name] = n_rep
 
         wide = wide.reindex(sorted(wide.columns), axis=1)
+        provenance = [
+            c for c in wide.columns
+            if str(c).endswith(RESERVED_FEATURE_SUFFIXES)
+        ]
+        if provenance:
+            wide = wide.drop(columns=provenance)
+            rep.dropped_provenance[name] = [str(c) for c in provenance]
+            if wide.shape[1] == 0:
+                rep.skipped_empty.append(name)
+                del rep.dropped_provenance[name]
+                continue
         labels = [
             str(i) if not isinstance(i, tuple) else "|".join(str(x) for x in i)
             for i in wide.index

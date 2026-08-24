@@ -169,3 +169,87 @@ def test_dedupe_keeps_genuinely_different_spaces(tmp_path):
     )
     spaces = load_spaces(a) | load_spaces(b)
     assert len(dedupe_spaces(spaces)) == 2
+
+
+def provenance_rows(stimuli, model, suffix="_n_pooled", scale=100.0):
+    """One prefixed bookkeeping column per stimulus, on a much larger scale."""
+    return [
+        {
+            "stimulus_id": s,
+            "chunk_idx": i,
+            "modality": "text",
+            "extractor": "word2psy",
+            "model": model,
+            "feature": f"{model}{suffix}",
+            "value": scale * (i + 1),
+            "value_str": None,
+        }
+        for i, s in enumerate(stimuli)
+    ]
+
+
+class TestProvenanceColumns:
+    """``{model}_n_pooled`` is provenance, not a dimension (Contract B §4.1 gap)."""
+
+    def _table(self, tmp_path, model="fasttext"):
+        stimuli = [f"img{i:03d}" for i in range(8)]
+        rng = np.random.RandomState(1)
+        rows = long_rows(stimuli, model, 4, value=lambda s, r, d: rng.randn())
+        rows += provenance_rows(stimuli, model)
+        return write_table(tmp_path / "prov.parquet", rows), stimuli
+
+    def test_dropped_from_the_matrix_and_reported(self, tmp_path):
+        path, stimuli = self._table(tmp_path)
+        rep = LoadReport()
+        spaces = load_spaces(path, report=rep)
+        space = spaces["fasttext"]
+        assert space.dim == 4
+        assert space.features == [f"fasttext_{d:03d}" for d in range(4)]
+        assert rep.dropped_provenance == {"fasttext": ["fasttext_n_pooled"]}
+        assert space.n == len(stimuli)
+
+    def test_the_count_would_otherwise_be_pc1(self, tmp_path):
+        """The regression this guards: a large-scale count dominates the spectrum."""
+        path, _ = self._table(tmp_path)
+        X = load_spaces(path)["fasttext"].X
+        counts = np.arange(1, X.shape[0] + 1, dtype=float) * 100.0
+
+        def top_share(M):
+            L = np.linalg.svd(M - M.mean(0), compute_uv=False) ** 2
+            return L[0] / L.sum()
+
+        assert top_share(X) < 0.6
+        assert top_share(np.column_stack([X, counts])) > 0.95
+
+    def test_a_provenance_only_model_is_skipped_not_emptied(self, tmp_path):
+        stimuli = [f"img{i:03d}" for i in range(5)]
+        path = write_table(
+            tmp_path / "only.parquet", provenance_rows(stimuli, "lonely")
+        )
+        rep = LoadReport()
+        spaces = load_spaces(path, report=rep)
+        assert "lonely" not in spaces
+        assert rep.skipped_empty == ["lonely"]
+        assert rep.dropped_provenance == {}
+
+    def test_a_real_feature_ending_in_a_digit_run_is_untouched(self, tmp_path):
+        """Only the declared suffixes go; ordinary features are never guessed at."""
+        stimuli = [f"img{i:03d}" for i in range(6)]
+        rows = long_rows(stimuli, "llstat", 3)
+        rows += [
+            {
+                "stimulus_id": s,
+                "chunk_idx": i,
+                "modality": "visual",
+                "extractor": "viz2psy",
+                "model": "llstat",
+                "feature": "llstat_n_edges",
+                "value": float(i),
+                "value_str": None,
+            }
+            for i, s in enumerate(stimuli)
+        ]
+        rep = LoadReport()
+        spaces = load_spaces(write_table(tmp_path / "kept.parquet", rows), report=rep)
+        assert "llstat_n_edges" in spaces["llstat"].features
+        assert rep.dropped_provenance == {}
