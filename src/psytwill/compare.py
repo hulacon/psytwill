@@ -131,10 +131,13 @@ def participation_ratio(X) -> float:
     from the SVD of the column-centered matrix, so it costs the same whether
     the space is 3-d or 1024-d.
     """
-    A = _column_center(_as_2d(X, "X"))
+    A = _as_2d(X, "X")
+    # Drop NaN rows *before* centering: a column mean taken over a NaN is NaN,
+    # which would propagate across the whole matrix and leave nothing to drop.
     A = A[~np.isnan(A).any(axis=1)]
     if A.shape[0] < 2:
         raise SpaceError("Participation ratio needs at least 2 rows.")
+    A = _column_center(A)
     s = np.linalg.svd(A, compute_uv=False)
     lam = s**2
     total = lam.sum()
@@ -226,6 +229,96 @@ def ridge_predictivity(
         n_splits=n_splits_used,
         grouped=g is not None,
         alphas_selected=sorted(set(chosen)),
+    )
+
+
+# --------------------------------------------------------------------------
+# noise ceiling for a pooled target
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ReliabilityResult:
+    """How much of a pooled space is signal rather than which raters it got."""
+
+    reliability: float
+    """Spearman-Brown corrected split-half reliability of the *pooled* space."""
+    half_correlation: float
+    """Mean per-dimension correlation between the two half-pools, uncorrected."""
+    per_split: list[float]
+    n_groups: int
+    n_singleton: int
+    """Groups with one replicate, which cannot be split and were excluded."""
+    n_splits: int
+
+
+def split_half_reliability(
+    X,
+    groups: Sequence,
+    *,
+    n_splits: int = 50,
+    random_state: int = 0,
+) -> ReliabilityResult:
+    """Ceiling on how well *any* predictor can reach a pooled target.
+
+    A space built by averaging five human captions per image is not a noiseless
+    target: a different five captions would give a different vector. Predicting
+    it with R^2 = 0.68 against an implicit ceiling of 1.0 understates the
+    predictor whenever the target cannot support 1.0 — which is the whole
+    reason the charter asks for this number beside those cells.
+
+    ``X`` holds the **unpooled** replicate rows and ``groups`` says which
+    stimulus each belongs to. Each draw splits every group's replicates in two,
+    pools each half, and correlates the halves per dimension; the mean is
+    Spearman-Brown corrected from half-length back to the full pool, because
+    the quantity of interest is the reliability of the pooled space actually
+    used as a target, not of half of it.
+
+    Groups with a single replicate cannot be split and are excluded rather than
+    silently counted as perfectly reliable; the count is returned.
+    """
+    A = _as_2d(X, "X")
+    g = np.asarray(groups)
+    if g.shape[0] != A.shape[0]:
+        raise SpaceError(
+            f"'groups' has {g.shape[0]} entries for {A.shape[0]} rows of X. "
+            "Pass the unpooled replicate rows with one group label each."
+        )
+    order = {lab: i for i, lab in enumerate(pd.unique(g))}
+    members = {lab: np.flatnonzero(g == lab) for lab in order}
+    singletons = [lab for lab, idx in members.items() if len(idx) < 2]
+    usable = [lab for lab in order if len(members[lab]) >= 2]
+    if len(usable) < 3:
+        raise SpaceError(
+            f"Only {len(usable)} group(s) have 2+ replicates, so there is "
+            "nothing to split. A pooled space needs replicates to have a "
+            "reliability at all."
+        )
+
+    rng = np.random.RandomState(random_state)
+    per_split: list[float] = []
+    for _ in range(n_splits):
+        left = np.empty((len(usable), A.shape[1]))
+        right = np.empty_like(left)
+        for row, lab in enumerate(usable):
+            idx = members[lab].copy()
+            rng.shuffle(idx)
+            half = len(idx) // 2
+            left[row] = A[idx[:half]].mean(axis=0)
+            right[row] = A[idx[half:]].mean(axis=0)
+        rs = [_pearson(left[:, d], right[:, d]) for d in range(A.shape[1])]
+        per_split.append(float(np.mean(rs)))
+
+    half_r = float(np.mean(per_split))
+    # Spearman-Brown from half-length to full length
+    corrected = 2.0 * half_r / (1.0 + half_r) if half_r > -1.0 else 0.0
+    return ReliabilityResult(
+        reliability=float(np.clip(corrected, 0.0, 1.0)),
+        half_correlation=half_r,
+        per_split=per_split,
+        n_groups=len(usable),
+        n_singleton=len(singletons),
+        n_splits=n_splits,
     )
 
 
@@ -345,6 +438,8 @@ def neighbor_overlap_null(
     n_perm: int = 1000,
     block_size: int | None = None,
     random_state: int = 0,
+    knn_x: np.ndarray | None = None,
+    knn_y: np.ndarray | None = None,
 ) -> NullResult:
     """Neighbour overlap against a permutation null, without recomputing kNN.
 
@@ -356,13 +451,25 @@ def neighbor_overlap_null(
     that row's neighbours. So both graphs are built once and the null costs
     O(n k) per permutation.
 
+    ``knn_x`` / ``knn_y`` accept graphs the caller already built — a driver
+    comparing 35 spaces would otherwise rebuild each space's graph 34 times.
+    They are checked against the surviving row count, because a graph built
+    before NaN removal indexes rows that are no longer there.
+
     Verified against the generic path in the test suite, which is what keeps
     this an optimization rather than a second, subtly different measure.
     """
     A, B, _, _ = _align(X, Y)
     n = A.shape[0]
-    na = knn_indices(A, k=k, metric=metric)
-    nb = knn_indices(B, k=k, metric=metric)
+    na = knn_indices(A, k=k, metric=metric) if knn_x is None else np.asarray(knn_x)
+    nb = knn_indices(B, k=k, metric=metric) if knn_y is None else np.asarray(knn_y)
+    for graph, side in ((na, "knn_x"), (nb, "knn_y")):
+        if graph.shape[0] != n:
+            raise SpaceError(
+                f"'{side}' has {graph.shape[0]} rows but {n} rows survived NaN "
+                "removal, so the cached graph is for a different row set. Pass "
+                "the graph built on these same rows, or omit it."
+            )
     observed = _overlap_from_knn(na, nb)
 
     rng = np.random.RandomState(random_state)

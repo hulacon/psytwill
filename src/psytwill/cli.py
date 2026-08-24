@@ -23,13 +23,17 @@ Examples
 
     # Long-form feature table from N extractor CSVs (Contract B surface)
     psytwill features clip.csv ebind.csv caption.csv -o features.parquet
+
+    # How the spaces in N feature tables relate to each other
+    psytwill compare image.parquet:image caption.parquet:cap -o geometry/
 """
 
 import argparse
 import sys
 
 from psytwill import __version__
-from psytwill.exceptions import PsytwillError
+from psytwill.compare import DEFAULT_K
+from psytwill.exceptions import InputError, PsytwillError
 
 
 def _parse_spaces(arg: str | None) -> dict[str, str | None] | None:
@@ -145,6 +149,93 @@ def _run_features(args: argparse.Namespace) -> None:
     print(f"  {summary['meta_path']}")
 
 
+def _parse_table_arg(arg: str) -> tuple[str, str | None]:
+    """``path.parquet:prefix`` -> (path, prefix). Prefix is optional."""
+    path, sep, prefix = arg.rpartition(":")
+    if not sep or len(prefix) > 40 or "/" in prefix or "." in prefix:
+        return arg, None
+    return path, prefix
+
+
+def _run_compare(args: argparse.Namespace) -> None:
+    from psytwill.geometry import compare_spaces, write_geometry
+    from psytwill.store import LoadReport, align_spaces, dedupe_spaces, load_spaces
+
+    key = tuple(args.key.split(","))
+    models = args.models.split(",") if args.models else None
+    measures = args.measures.split(",") if args.measures else None
+    report = LoadReport()
+    spaces: dict = {}
+    for raw in args.inputs:
+        path, prefix = _parse_table_arg(raw)
+        loaded = load_spaces(
+            path,
+            key=key,
+            models=models,
+            pool="mean" if args.pool == "mean" else None,
+            prefix=prefix,
+            report=report,
+        )
+        clash = set(loaded) & set(spaces)
+        if clash:
+            raise InputError(
+                f"Space name(s) {sorted(clash)} came from two tables. Give each "
+                "input a prefix (path.parquet:image) so they cannot collide."
+            )
+        spaces.update(loaded)
+    print(f"loaded {len(spaces)} spaces from {len(args.inputs)} table(s)")
+
+    spaces = dedupe_spaces(spaces, report=report)
+    spaces, labels = align_spaces(spaces)
+    print(f"  {len(report.deduped)} deduped, {len(report.skipped_string)} string "
+          f"families skipped, aligned at n={len(labels)}")
+    for name, cols in sorted(report.dropped_provenance.items()):
+        print(f"  dropped provenance columns from {name}: {', '.join(cols)}")
+
+    groups = None
+    if args.group_by:
+        groups = [lab.split(args.group_sep)[0] for lab in labels]
+        print(f"  folds grouped by label prefix: {len(set(groups))} groups")
+
+    total_seen = [0]
+
+    def progress(done: int, total: int, label: str) -> None:
+        if done == 1 or done == total or done % max(1, total // 20) == 0:
+            print(f"  [{done:>6d}/{total}] {label}", flush=True)
+        total_seen[0] = total
+
+    result = compare_spaces(
+        spaces,
+        measures=measures,
+        k=args.k,
+        n_splits=args.n_splits,
+        groups=groups,
+        n_permutations=args.permutations,
+        block_size=args.block_size,
+        random_state=args.seed,
+        progress=progress,
+    )
+    paths = write_geometry(
+        result,
+        args.output,
+        name=args.name,
+        inputs=args.inputs,
+        labels=labels,
+        extra={
+            "load_report": {
+                "deduped": report.deduped,
+                "skipped_string": report.skipped_string,
+                "skipped_empty": report.skipped_empty,
+                "pooled": report.pooled,
+                "dropped_provenance": report.dropped_provenance,
+            }
+        },
+    )
+    print(f"wrote {len(result.pairs)} pair rows, {len(result.manifest)} spaces")
+    for kind in ("pairs", "manifest", "meta_path"):
+        print(f"  {paths[kind]}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -205,6 +296,53 @@ def build_parser() -> argparse.ArgumentParser:
         "(defaults: viz2psy=visual, aud2psy=audio, word2psy=text)",
     )
     f.set_defaults(func=_run_features)
+
+    c = sub.add_parser(
+        "compare",
+        help="How the spaces in N feature tables relate (Contract B geometry)",
+    )
+    c.add_argument(
+        "inputs",
+        nargs="+",
+        help="Long-form feature tables, optionally 'path.parquet:prefix'",
+    )
+    c.add_argument("-o", "--output", required=True, help="Output directory")
+    c.add_argument("--name", default="space_geometry", help="Output file stem")
+    c.add_argument(
+        "--key",
+        default="stimulus_id",
+        help="Row grain, comma-separated (e.g. 'stimulus_id,time')",
+    )
+    c.add_argument("--models", help="Comma-separated model subset")
+    c.add_argument("--measures", help="Comma-separated measure subset")
+    c.add_argument(
+        "--pool",
+        choices=("mean", "none"),
+        default="mean",
+        help="Pool replicate rows sharing a key, or refuse them",
+    )
+    c.add_argument("--k", type=int, default=DEFAULT_K, help="Neighbours for overlap")
+    c.add_argument("--n-splits", type=int, default=5, help="Ridge CV folds")
+    c.add_argument(
+        "--permutations",
+        type=int,
+        default=1000,
+        help="Neighbour-overlap null draws (0 skips the null)",
+    )
+    c.add_argument(
+        "--block-size",
+        type=int,
+        help="Permute contiguous blocks of this size; required on a temporal grid",
+    )
+    c.add_argument(
+        "--group-by",
+        action="store_true",
+        help="Group ridge folds by the label prefix before --group-sep "
+        "(one fold per clip on a movie grid)",
+    )
+    c.add_argument("--group-sep", default="|", help="Separator for --group-by")
+    c.add_argument("--seed", type=int, default=0)
+    c.set_defaults(func=_run_compare)
 
     return parser
 

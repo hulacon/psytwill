@@ -303,3 +303,81 @@ def test_fast_null_reproduces_the_generic_one_exactly(rng, block_size):
     assert fast.observed == pytest.approx(generic.observed)
     assert np.allclose(fast.null, generic.null)
     assert fast.p_value == pytest.approx(generic.p_value)
+
+
+def test_participation_ratio_drops_nan_rows_before_centering(rng):
+    """Centering first makes every column mean NaN, wiping the whole matrix."""
+    X = rng.randn(50, 4)
+    X[7, 2] = np.nan
+    pr = participation_ratio(X)
+    assert pr == pytest.approx(participation_ratio(np.delete(X, 7, axis=0)))
+    assert 1.0 < pr <= 4.0
+
+
+# --- noise ceiling ---------------------------------------------------------
+
+
+def _replicated(n_groups, n_rep, d, rng, noise):
+    """Replicate rows around a per-group truth, with a known noise level."""
+    truth = rng.randn(n_groups, d)
+    X = np.repeat(truth, n_rep, axis=0) + noise * rng.randn(n_groups * n_rep, d)
+    groups = np.repeat(np.arange(n_groups), n_rep)
+    return X, groups
+
+
+def test_reliability_is_near_one_when_replicates_agree(rng):
+    from psytwill.compare import split_half_reliability
+
+    X, g = _replicated(200, 4, 5, rng, noise=0.01)
+    assert split_half_reliability(X, g, n_splits=10).reliability > 0.99
+
+
+def test_reliability_is_near_zero_when_replicates_are_noise(rng):
+    from psytwill.compare import split_half_reliability
+
+    X = rng.randn(800, 5)
+    g = np.repeat(np.arange(200), 4)
+    assert split_half_reliability(X, g, n_splits=10).reliability < 0.15
+
+
+def test_reliability_falls_as_replicate_noise_rises(rng):
+    from psytwill.compare import split_half_reliability
+
+    vals = []
+    for noise in (0.25, 1.0, 3.0):
+        X, g = _replicated(200, 4, 5, rng, noise=noise)
+        vals.append(split_half_reliability(X, g, n_splits=10).reliability)
+    assert vals[0] > vals[1] > vals[2]
+
+
+def test_spearman_brown_lifts_the_half_correlation(rng):
+    from psytwill.compare import split_half_reliability
+
+    X, g = _replicated(200, 4, 5, rng, noise=1.0)
+    res = split_half_reliability(X, g, n_splits=10)
+    assert res.reliability > res.half_correlation  # the pool beats half of it
+    assert res.n_groups == 200 and res.n_singleton == 0
+
+
+def test_singleton_groups_are_excluded_not_counted_as_perfect(rng):
+    from psytwill.compare import split_half_reliability
+
+    X, g = _replicated(100, 4, 5, rng, noise=0.5)
+    X = np.vstack([X, rng.randn(6, 5)])
+    g = np.concatenate([g, np.arange(1000, 1006)])  # six one-off groups
+    res = split_half_reliability(X, g, n_splits=5)
+    assert res.n_groups == 100 and res.n_singleton == 6
+
+
+def test_reliability_needs_replicates_at_all(rng):
+    from psytwill.compare import split_half_reliability
+
+    with pytest.raises(SpaceError, match="nothing to split"):
+        split_half_reliability(rng.randn(10, 3), np.arange(10), n_splits=2)
+
+
+def test_reliability_checks_the_group_length(rng):
+    from psytwill.compare import split_half_reliability
+
+    with pytest.raises(SpaceError, match="entries for 10 rows"):
+        split_half_reliability(rng.randn(10, 3), np.arange(4))
