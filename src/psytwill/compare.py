@@ -305,28 +305,87 @@ def second_order_rsa(X, Y, *, metric: str = "correlation") -> float:
 # --------------------------------------------------------------------------
 
 
-def neighbor_overlap(X, Y, *, k: int = DEFAULT_K, metric: str = "cosine") -> float:
-    """Mean fraction of each row's k nearest neighbours shared by both spaces.
-
-    Chance is roughly ``k / (n - 1)``; :func:`permutation_null` gives the
-    calibrated version.
-    """
-    A, B, _, _ = _align(X, Y)
+def knn_indices(X, *, k: int = DEFAULT_K, metric: str = "cosine") -> np.ndarray:
+    """Indices of each row's ``k`` nearest neighbours, nearest first."""
+    A = _as_2d(X, "X")
     n = A.shape[0]
     if n < 3:
         raise SpaceError("Neighbour overlap needs at least 3 rows.")
-    k_eff = min(k, n - 1)
     cfg = get_metric(metric)
     sign = -1.0 if cfg.form == "similarity" else 1.0  # rank nearest first
+    D = sign * cfg.func(A, A)
+    np.fill_diagonal(D, np.inf)  # never a neighbour of itself
+    return np.argsort(D, axis=1, kind="stable")[:, : min(k, n - 1)]
 
-    def knn(M: np.ndarray) -> np.ndarray:
-        D = sign * cfg.func(M, M)
-        np.fill_diagonal(D, np.inf)  # never a neighbour of itself
-        return np.argsort(D, axis=1, kind="stable")[:, :k_eff]
 
-    na, nb = knn(A), knn(B)
-    shared = [len(set(na[i]) & set(nb[i])) for i in range(n)]
-    return float(np.mean(shared) / k_eff)
+def _overlap_from_knn(na: np.ndarray, nb: np.ndarray) -> float:
+    k_eff = na.shape[1]
+    shared = sum(len(set(na[i]) & set(nb[i])) for i in range(na.shape[0]))
+    return float(shared / (na.shape[0] * k_eff))
+
+
+def neighbor_overlap(X, Y, *, k: int = DEFAULT_K, metric: str = "cosine") -> float:
+    """Mean fraction of each row's k nearest neighbours shared by both spaces.
+
+    Chance is roughly ``k / (n - 1)``; :func:`neighbor_overlap_null` gives the
+    calibrated version.
+    """
+    A, B, _, _ = _align(X, Y)
+    return _overlap_from_knn(
+        knn_indices(A, k=k, metric=metric), knn_indices(B, k=k, metric=metric)
+    )
+
+
+def neighbor_overlap_null(
+    X,
+    Y,
+    *,
+    k: int = DEFAULT_K,
+    metric: str = "cosine",
+    n_perm: int = 1000,
+    block_size: int | None = None,
+    random_state: int = 0,
+) -> NullResult:
+    """Neighbour overlap against a permutation null, without recomputing kNN.
+
+    The generic :func:`permutation_null` re-runs its measure on every permuted
+    copy of ``Y``, which for this measure means an O(n^2 d) neighbour search
+    per permutation — 1000 permutations x 595 space pairs is not a run anyone
+    finishes. But permuting ``Y``'s rows only *relabels* its neighbour graph:
+    if row ``i`` takes the data of row ``p(i)``, its neighbours are ``p`` of
+    that row's neighbours. So both graphs are built once and the null costs
+    O(n k) per permutation.
+
+    Verified against the generic path in the test suite, which is what keeps
+    this an optimization rather than a second, subtly different measure.
+    """
+    A, B, _, _ = _align(X, Y)
+    n = A.shape[0]
+    na = knn_indices(A, k=k, metric=metric)
+    nb = knn_indices(B, k=k, metric=metric)
+    observed = _overlap_from_knn(na, nb)
+
+    rng = np.random.RandomState(random_state)
+    inverse = np.empty(n, dtype=int)
+    null = []
+    for _ in range(n_perm):
+        perm = block_permutation(n, rng, block_size)
+        # row i of the permuted Y holds original row perm[i]; its neighbours
+        # are the original neighbours of perm[i], relabeled into new positions
+        inverse[perm] = np.arange(n)
+        nb_perm = inverse[nb[perm]]
+        null.append(_overlap_from_knn(na, nb_perm))
+
+    arr = np.asarray(null)
+    return NullResult(
+        observed=observed,
+        p_value=float((1 + (arr >= observed).sum()) / (n_perm + 1)),
+        null_mean=float(arr.mean()),
+        null_sd=float(arr.std()),
+        n_perm=n_perm,
+        block_size=block_size,
+        null=null,
+    )
 
 
 # --------------------------------------------------------------------------

@@ -15,8 +15,10 @@ from psytwill.compare import (
     block_permutation,
     cka,
     get_measure,
+    knn_indices,
     linear_cka,
     neighbor_overlap,
+    neighbor_overlap_null,
     participation_ratio,
     permutation_null,
     rbf_cka,
@@ -267,3 +269,37 @@ def test_applicability_flags_scalar_heads_without_refusing_them():
     assert "1-d source" in applicability("ridge", 1, 1024)
     assert "single ordering" in applicability("neighbor_overlap", 1024, 1)
     assert applicability("rsa", 512, 20) is None
+
+
+# --- the fast neighbour-overlap null ---------------------------------------
+
+
+def test_knn_indices_excludes_self_and_clamps_k(rng):
+    X = rng.randn(6, 4)
+    idx = knn_indices(X, k=99)
+    assert idx.shape == (6, 5)                       # k clamped to n - 1
+    assert all(i not in idx[i] for i in range(6))    # never its own neighbour
+
+
+@pytest.mark.parametrize("block_size", [None, 20])
+def test_fast_null_reproduces_the_generic_one_exactly(rng, block_size):
+    """The relabeling shortcut must be an optimization, not a second measure.
+
+    Permuting Y's rows only relabels its neighbour graph, so both graphs are
+    built once instead of once per permutation. If that identity is ever
+    broken, this test catches it as a numeric divergence rather than as a
+    plausible-looking null.
+    """
+    X = rng.randn(120, 8)
+    Y = X @ rng.randn(8, 5) + rng.randn(120, 5) * 2
+
+    generic = permutation_null(
+        lambda a, b: neighbor_overlap(a, b, k=10),
+        X, Y, n_perm=30, block_size=block_size, random_state=3,
+    )
+    fast = neighbor_overlap_null(
+        X, Y, k=10, n_perm=30, block_size=block_size, random_state=3
+    )
+    assert fast.observed == pytest.approx(generic.observed)
+    assert np.allclose(fast.null, generic.null)
+    assert fast.p_value == pytest.approx(generic.p_value)
