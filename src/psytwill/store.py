@@ -79,10 +79,34 @@ class LoadReport:
     """Dropped space -> the identical space it duplicated."""
 
 
-def _read(path: Path, columns: Sequence[str], model: str | None = None) -> pd.DataFrame:
-    filters = [("model", "=", model)] if model else None
+def _read(
+    path: Path,
+    columns: Sequence[str],
+    model: str | None = None,
+    models: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Read selected columns, string columns as categoricals.
+
+    One pass per *file*, not per model: the long table repeats `stimulus_id`,
+    `model` and `feature` on every row, so a 15.9 M-row group re-read once per
+    model dominated everything else. Dictionary-encoding the string columns is
+    what makes a single whole-file read affordable.
+
+    Every groupby downstream must pass ``observed=True`` — grouping categorical
+    keys without it forms the full cartesian product of categories, which for
+    (stimulus_id x feature) is millions of empty cells.
+    """
+    import pyarrow.parquet as pq
+
+    if model is not None:
+        filters = [("model", "=", model)]
+    elif models is not None:
+        filters = [("model", "in", list(models))]
+    else:
+        filters = None
     try:
-        return pd.read_parquet(path, columns=list(columns), filters=filters)
+        table = pq.read_table(path, columns=list(columns), filters=filters)
+        return table.to_pandas(strings_to_categorical=True)
     except Exception as exc:  # pragma: no cover - environment-dependent
         raise InputError(
             f"Could not read '{path}' ({exc}). Parquet input needs pyarrow; "
@@ -96,14 +120,9 @@ def _schema_names(path: Path) -> set[str]:
     return set(pq.ParquetFile(path).schema_arrow.names)
 
 
-def model_inventory(path: str | Path) -> pd.DataFrame:
-    """Models in a table, with feature counts and whether they are string-valued.
-
-    Cheap: reads four columns, never the values matrix.
-    """
-    p = Path(path)
-    df = _read(p, ["model", "feature", "value", "value_str"])
-    g = df.groupby("model", dropna=False)
+def _inventory_from_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Model inventory from an already-read frame (no second pass over the file)."""
+    g = df.groupby("model", dropna=False, observed=True)
     out = pd.DataFrame(
         {
             "n_features": g["feature"].nunique(),
@@ -114,6 +133,16 @@ def model_inventory(path: str | Path) -> pd.DataFrame:
     ).reset_index()
     out["is_string"] = (out.n_numeric == 0) & (out.n_string > 0)
     return out.sort_values("n_features", ascending=False).reset_index(drop=True)
+
+
+def model_inventory(path: str | Path) -> pd.DataFrame:
+    """Models in a table, with feature counts and whether they are string-valued.
+
+    Cheap relative to loading: reads four columns, never pivots them.
+    """
+    return _inventory_from_frame(
+        _read(Path(path), ["model", "feature", "value", "value_str"])
+    )
 
 
 def load_spaces(
@@ -150,7 +179,13 @@ def load_spaces(
             f"{sorted(available & set(('stimulus_id','voice','time','onset','offset','chunk_idx','word_idx')))}."
         )
 
-    inv = model_inventory(p)
+    cols = (
+        list(key)
+        + ["model", "feature", "value", "value_str"]
+        + [c for c in META_COLUMNS if c in available]
+    )
+    frame = _read(p, cols, models=models)
+    inv = _inventory_from_frame(frame)
     wanted = set(models) if models is not None else set(inv["model"].dropna())
     spaces: dict[str, SpaceMatrix] = {}
 
@@ -165,17 +200,10 @@ def load_spaces(
             rep.skipped_empty.append(name)
             continue
 
-        cols = list(key) + ["feature", "value"] + [
-            c for c in META_COLUMNS if c in available
-        ]
-        df = _read(p, cols, model=str(row.model))
-        wide = (
-            df.groupby(list(key) + ["feature"], dropna=False)["value"]
-            .mean()
-            .unstack("feature")
-            .sort_index()
-        )
-        n_rep = int(df.groupby(list(key) + ["feature"], dropna=False).size().max())
+        df = frame[frame["model"] == row.model]
+        grouped = df.groupby(list(key) + ["feature"], dropna=False, observed=True)["value"]
+        wide = grouped.mean().unstack("feature").sort_index()
+        n_rep = int(grouped.size().max())
         if n_rep > 1 and pool is None:
             raise SpaceError(
                 f"'{name}' has up to {n_rep} rows per key {tuple(key)}. Either "
