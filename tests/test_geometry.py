@@ -295,6 +295,53 @@ def test_cli_compare_writes_all_three_outputs(two_tables, tmp_path):
     assert "load_report" in meta
 
 
+def test_cli_compare_stride_keeps_every_nth_row_per_clip(tmp_path):
+    from psytwill.cli import main
+
+    rng = np.random.RandomState(0)
+    rows = [
+        {
+            "stimulus_id": clip,
+            "time": 0.5 * t,
+            "modality": "visual",
+            "extractor": "viz2psy",
+            "model": model,
+            "feature": f"{model}_{d:03d}",
+            "value": float(rng.randn()),
+            "value_str": None,
+        }
+        for clip, n_t in (("clipA", 7), ("clipB", 5))  # uneven clip lengths
+        for t in range(n_t)
+        for model, dim in (("m1", 3), ("m2", 2))
+        for d in range(dim)
+    ]
+    pd.DataFrame(rows).to_parquet(tmp_path / "grid.parquet", index=False)
+    out = tmp_path / "geo"
+    rc = main(
+        [
+            "compare",
+            str(tmp_path / "grid.parquet"),
+            "-o",
+            str(out),
+            "--key",
+            "stimulus_id,time",
+            "--stride",
+            "2",
+            "--measures",
+            "cka_linear,rsa",
+            "--permutations",
+            "0",
+        ]
+    )
+    assert rc == 0
+    meta = json.loads((out / "space_geometry.meta.json").read_text())
+    # ceil(7/2) + ceil(5/2) = 4 + 3, restarting the count at each clip
+    assert meta["n_labels"] == 7
+    assert meta["stride"] == 2
+    pairs = pd.read_parquet(out / "space_geometry.pairs.parquet")
+    assert set(pairs["n_used"]) == {7}
+
+
 def test_cli_compare_refuses_colliding_names_without_a_prefix(two_tables, tmp_path):
     """Two tables both offering 'clip' would silently overwrite one another."""
     from psytwill.cli import main

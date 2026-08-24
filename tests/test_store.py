@@ -131,6 +131,73 @@ def test_keying_finer_keeps_replicates_apart(replicate_table):
     assert "|" in s.labels[0]
 
 
+# --- temporal windows ------------------------------------------------------
+
+
+def grid_rows(stimuli, model, dim, times, *, value=None):
+    """Long-form rows for one model on a temporal grid."""
+    out = []
+    for s_i, s in enumerate(stimuli):
+        for t_i, t in enumerate(times):
+            for d in range(dim):
+                v = value(s_i, t_i, d) if callable(value) else float(t_i)
+                out.append(
+                    {
+                        "stimulus_id": s,
+                        "time": float(t),
+                        "modality": "visual",
+                        "extractor": "viz2psy",
+                        "model": model,
+                        "feature": f"{model}_{d:03d}",
+                        "value": v,
+                        "value_str": None,
+                    }
+                )
+    return out
+
+
+def test_window_pools_rows_and_records_the_count(tmp_path):
+    # 0.5 s grid, 4 bins; window=1.0 pools bins pairwise
+    t = write_table(
+        tmp_path / "grid.parquet",
+        grid_rows(["clipA"], "m1", 2, [0.0, 0.5, 1.0, 1.5]),
+    )
+    rep = LoadReport()
+    s = load_spaces(t, key=("stimulus_id", "time"), window=1.0, report=rep)["m1"]
+    assert s.X.shape == (2, 2)
+    assert s.labels == ["clipA|0.0", "clipA|1.0"]
+    assert s.n_replicates == 2
+    assert rep.pooled == {"m1": 2}
+    # bins 0,1 mean to 0.5 and bins 2,3 to 2.5 (value = bin index)
+    assert s.X[:, 0] == pytest.approx([0.5, 2.5])
+
+
+def test_window_reconciles_bin_start_and_bin_center_stamps(tmp_path):
+    # The real store: visual groups stamp 0.0, 0.5, ... and audio groups
+    # stamp 0.25, 0.75, ... — unbinned, the two grids share no labels.
+    vis = write_table(
+        tmp_path / "vis.parquet", grid_rows(["c"], "m1", 2, [0.0, 0.5, 1.0])
+    )
+    aud = write_table(
+        tmp_path / "aud.parquet", grid_rows(["c"], "m2", 2, [0.25, 0.75, 1.25])
+    )
+    key = ("stimulus_id", "time")
+    with pytest.raises(SpaceError, match="share no labels"):
+        align_spaces(
+            load_spaces(vis, key=key) | load_spaces(aud, key=key)
+        )
+    spaces = load_spaces(vis, key=key, window=0.5) | load_spaces(
+        aud, key=key, window=0.5
+    )
+    _, labels = align_spaces(spaces)
+    assert labels == ["c|0.0", "c|0.5", "c|1.0"]
+
+
+def test_window_without_time_in_key_states_the_fix(image_table):
+    with pytest.raises(SpaceError, match="'time'"):
+        load_spaces(image_table, window=0.5)
+
+
 # --- alignment and dedupe --------------------------------------------------
 
 
@@ -141,6 +208,17 @@ def test_align_restricts_to_shared_labels(tmp_path):
     aligned, labels = align_spaces(spaces)
     assert labels == ["y", "z"]
     assert all(s.X.shape[0] == 2 for s in aligned.values())
+
+
+def test_align_preserves_temporal_order_not_string_order(tmp_path):
+    # "c|100.5" string-sorts before "c|12.5"; a block-permutation null on
+    # string-sorted rows would shuffle blocks that are not temporal blocks.
+    times = [2.0, 12.5, 100.5]
+    a = write_table(tmp_path / "a.parquet", grid_rows(["c"], "m1", 2, times))
+    b = write_table(tmp_path / "b.parquet", grid_rows(["c"], "m2", 2, times))
+    key = ("stimulus_id", "time")
+    _, labels = align_spaces(load_spaces(a, key=key) | load_spaces(b, key=key))
+    assert labels == ["c|2.0", "c|12.5", "c|100.5"]
 
 
 def test_align_refuses_disjoint_sets(tmp_path):
@@ -159,6 +237,24 @@ def test_dedupe_drops_the_same_space_under_a_second_name(tmp_path):
     kept = dedupe_spaces(spaces, report=rep)
     assert set(kept) == {"image:ebind"}
     assert rep.deduped == {"ebindgrp:ebind": "image:ebind"}
+
+
+def test_dedupe_survives_differing_dictionary_order(tmp_path):
+    # Two files, same rows, opposite row order on disk. pyarrow gives each
+    # file its own category order, so without lexical re-ordering the two
+    # copies load in different row orders and dedupe misses them — exactly
+    # how the movie ebind duplicate slipped through the Phase-0 probe.
+    rows = grid_rows(["clipA", "clipB"], "ebind", 3, [0.0, 0.5])
+    a = write_table(tmp_path / "grp_a.parquet", rows)
+    b = write_table(tmp_path / "grp_b.parquet", list(reversed(rows)))
+    key = ("stimulus_id", "time")
+    spaces = load_spaces(a, key=key, prefix="frames") | load_spaces(
+        b, key=key, prefix="ebindgrp"
+    )
+    rep = LoadReport()
+    kept = dedupe_spaces(spaces, report=rep)
+    assert set(kept) == {"frames:ebind"}
+    assert rep.deduped == {"ebindgrp:ebind": "frames:ebind"}
 
 
 def test_dedupe_keeps_genuinely_different_spaces(tmp_path):

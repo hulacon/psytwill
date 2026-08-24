@@ -174,6 +174,7 @@ def _run_compare(args: argparse.Namespace) -> None:
             models=models,
             pool="mean" if args.pool == "mean" else None,
             prefix=prefix,
+            window=args.window,
             report=report,
         )
         clash = set(loaded) & set(spaces)
@@ -191,6 +192,27 @@ def _run_compare(args: argparse.Namespace) -> None:
           f"families skipped, aligned at n={len(labels)}")
     for name, cols in sorted(report.dropped_provenance.items()):
         print(f"  dropped provenance columns from {name}: {', '.join(cols)}")
+
+    if args.stride > 1:
+        # Every Nth surviving row *within* each clip (the label prefix), so
+        # the kept rows stay evenly spaced in time and no clip is favored.
+        from dataclasses import replace
+
+        idx: list[int] = []
+        prev = None
+        for i, lab in enumerate(labels):
+            clip = lab.split(args.group_sep)[0]
+            if clip != prev:
+                prev, j = clip, 0
+            if j % args.stride == 0:
+                idx.append(i)
+            j += 1
+        labels = [labels[i] for i in idx]
+        spaces = {
+            name: replace(s, labels=labels, X=s.X[idx])
+            for name, s in spaces.items()
+        }
+        print(f"  stride {args.stride}: kept n={len(labels)} rows")
 
     groups = None
     if args.group_by:
@@ -222,6 +244,7 @@ def _run_compare(args: argparse.Namespace) -> None:
         inputs=args.inputs,
         labels=labels,
         extra={
+            "stride": args.stride,
             "load_report": {
                 "deduped": report.deduped,
                 "skipped_string": report.skipped_string,
@@ -320,6 +343,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("mean", "none"),
         default="mean",
         help="Pool replicate rows sharing a key, or refuse them",
+    )
+    c.add_argument(
+        "--window",
+        type=float,
+        help="Bin 'time' into windows of this many seconds before pooling; "
+        "required on a temporal grid (it is the timescale axis, and it "
+        "reconciles bin-start vs bin-center time stamps across groups)",
+    )
+    c.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Keep every Nth aligned row within each clip (label prefix "
+        "before --group-sep) before comparing — for running the n^2 "
+        "measures at a grain whose full n cannot afford them",
     )
     c.add_argument("--k", type=int, default=DEFAULT_K, help="Neighbours for overlap")
     c.add_argument("--n-splits", type=int, default=5, help="Ridge CV folds")

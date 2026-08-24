@@ -126,7 +126,17 @@ def _read(
         filters = None
     try:
         table = pq.read_table(path, columns=list(columns), filters=filters)
-        return table.to_pandas(strings_to_categorical=True)
+        df = table.to_pandas(strings_to_categorical=True)
+        # Each file's dictionary order is its own; sort_index on a categorical
+        # follows category codes, so two files holding the same rows would
+        # come back in different row orders. Lexical categories make row
+        # order a property of the data, not of the file that carried it.
+        for c in df.columns:
+            if isinstance(df[c].dtype, pd.CategoricalDtype):
+                df[c] = df[c].cat.reorder_categories(
+                    sorted(df[c].cat.categories), ordered=True
+                )
+        return df
     except Exception as exc:  # pragma: no cover - environment-dependent
         raise InputError(
             f"Could not read '{path}' ({exc}). Parquet input needs pyarrow; "
@@ -172,6 +182,7 @@ def load_spaces(
     models: Iterable[str] | None = None,
     pool: Literal["mean"] | None = "mean",
     prefix: str | None = None,
+    window: float | None = None,
     report: LoadReport | None = None,
 ) -> dict[str, SpaceMatrix]:
     """Load each model in a long-form table as a :class:`SpaceMatrix`.
@@ -182,12 +193,28 @@ def load_spaces(
     them instead, which is the right setting when a duplicate key would mean
     the grain is wrong rather than replicated.
 
+    ``window`` (seconds) bins ``time`` to ``floor(time / window) * window``
+    before grouping, so rows landing in the same window pool. On a temporal
+    grid it is never optional, for two reasons. It is the timescale axis:
+    the same spaces loaded at two widths are two different comparisons, and
+    which width a number came from must be visible in the call. And the
+    store's grids do not agree on what ``time`` stamps: visual and caption
+    groups stamp bin *starts* (0.0, 0.5, ...) while audio groups stamp bin
+    *centers* (0.25, 0.75, ...), so aligning unbinned grids intersects to
+    zero rows — silently in spirit, loudly in practice. Binning at the native
+    width is what puts them on one index.
+
     ``prefix`` namespaces the returned keys (``"image:clip"``), so spaces from
     several group files can be merged without collision.
     """
     p = Path(path)
     if not p.exists():
         raise InputError(f"No such feature table: '{p}'.")
+    if window is not None and "time" not in key:
+        raise SpaceError(
+            f"window={window} needs 'time' in the key to bin, but the key is "
+            f"{tuple(key)}. Add 'time', or drop the window."
+        )
     rep = report if report is not None else LoadReport()
 
     available = _schema_names(p)
@@ -205,6 +232,10 @@ def load_spaces(
         + [c for c in META_COLUMNS if c in available]
     )
     frame = _read(p, cols, models=models)
+    if window is not None:
+        # +1e-9 so a float-noise 0.9999... lands in its true bin, not the one
+        # below; exact for the store's power-of-two grid, harmless elsewhere.
+        frame["time"] = np.floor(frame["time"].to_numpy() / window + 1e-9) * window
     inv = _inventory_from_frame(frame)
     wanted = set(models) if models is not None else set(inv["model"].dropna())
     spaces: dict[str, SpaceMatrix] = {}
@@ -272,6 +303,12 @@ def align_spaces(
     speech — so the intersection is computed rather than assumed, and the
     surviving labels are returned for the caller to record as the *n* the
     measures actually ran on.
+
+    Order comes from the first space, not from sorting the labels: every space
+    leaves :func:`load_spaces` sorted by its typed key, and a label like
+    ``"clip|100.5"`` string-sorts before ``"clip|12.5"``. Grouped folds do not
+    care, but a block-permutation null shuffles *contiguous* rows and is only
+    a temporal null if contiguous means adjacent in time.
     """
     if not spaces:
         return {}, []
@@ -281,7 +318,7 @@ def align_spaces(
             "Spaces share no labels. Check they were keyed at the same grain "
             "and come from the same stimulus set."
         )
-    labels = sorted(common)
+    labels = [lab for lab in next(iter(spaces.values())).labels if lab in common]
     out = {}
     for name, s in spaces.items():
         idx = {lab: i for i, lab in enumerate(s.labels)}
@@ -308,18 +345,24 @@ def dedupe_spaces(
     under a different name.
     """
     rep = report if report is not None else LoadReport()
+
+    def same(a: SpaceMatrix, b: SpaceMatrix) -> bool:
+        if a.X.shape != b.X.shape or a.features != b.features:
+            return False
+        if a.labels == b.labels:
+            return np.array_equal(a.X, b.X, equal_nan=True)
+        # Same rows in a different order are still the same space: the two
+        # ebind copies proved two files can disagree on row order alone.
+        if set(a.labels) != set(b.labels):
+            return False
+        idx = {lab: i for i, lab in enumerate(b.labels)}
+        return np.array_equal(
+            a.X, b.X[[idx[lab] for lab in a.labels]], equal_nan=True
+        )
+
     kept: dict[str, SpaceMatrix] = {}
     for name, s in spaces.items():
-        dup = next(
-            (
-                k
-                for k, other in kept.items()
-                if other.X.shape == s.X.shape
-                and other.features == s.features
-                and np.array_equal(other.X, s.X, equal_nan=True)
-            ),
-            None,
-        )
+        dup = next((k for k, other in kept.items() if same(other, s)), None)
         if dup is None:
             kept[name] = s
         else:
