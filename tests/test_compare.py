@@ -281,6 +281,19 @@ def test_knn_indices_excludes_self_and_clamps_k(rng):
     assert all(i not in idx[i] for i in range(6))    # never its own neighbour
 
 
+def test_knn_indices_owns_its_memory(rng):
+    """A cached graph must cost n*k, not pin the n^2 argsort it was cut from.
+
+    An argsort-then-slice returns a view whose base is the full n x n index
+    array; caching 33 such graphs at n=29,598 held 231 GB and OOM-killed the
+    movie-grid run twice (jobs 46628461/46628942) before this was found.
+    """
+    X = rng.randn(50, 4)
+    idx = knn_indices(X, k=5)
+    base = idx.base
+    assert base is None or base.nbytes <= idx.nbytes
+
+
 @pytest.mark.parametrize("block_size", [None, 20])
 def test_fast_null_reproduces_the_generic_one_exactly(rng, block_size):
     """The relabeling shortcut must be an optimization, not a second measure.

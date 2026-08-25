@@ -408,7 +408,10 @@ def knn_indices(X, *, k: int = DEFAULT_K, metric: str = "cosine") -> np.ndarray:
     sign = -1.0 if cfg.form == "similarity" else 1.0  # rank nearest first
     D = sign * cfg.func(A, A)
     np.fill_diagonal(D, np.inf)  # never a neighbour of itself
-    return np.argsort(D, axis=1, kind="stable")[:, : min(k, n - 1)]
+    # .copy(): the slice is otherwise a view pinning the full n x n argsort
+    # array — a cached graph must cost n*k, not n^2 (231 GB across 33 cached
+    # spaces at n=29,598, vs 156 MB copied).
+    return np.argsort(D, axis=1, kind="stable")[:, : min(k, n - 1)].copy()
 
 
 def _overlap_from_knn(na: np.ndarray, nb: np.ndarray) -> float:
