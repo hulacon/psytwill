@@ -134,6 +134,7 @@ PROFILE_REGISTRY: dict[str, tuple[list[str], str]] = {
     "emotion": (["emotion_*"], "GoEmotions probability profile"),
     "sentiment": (["sentiment_*"], "Negative/neutral/positive profile"),
     "readability": (["readability_*"], "Classic readability metrics"),
+    "interaction": (["interaction_*"], "Social-interaction rates (word2psy)"),
     # aud2psy per-model profiles (speech_prob is a single column, so it
     # only appears inside the combined acoustic profile).
     "loudness": (["loudness_*"], "RMS energy and dB level (aud2psy)"),

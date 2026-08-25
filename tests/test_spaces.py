@@ -133,6 +133,12 @@ class TestProfileDetection:
         # learned affect stays out of the signal-level acoustic profile
         assert "music_emotion_valence" not in spaces["acoustic"].columns
 
+    def test_interaction_profile(self):
+        cols = ["chunk_idx", "interaction_second_person",
+                "interaction_person_noun", "interaction_question"]
+        spaces = detect_profile_spaces(cols)
+        assert spaces["interaction"].n_dims == 3
+
     def test_conversation_profile_separate_from_acoustic(self):
         cols = ["time", "conversation_n_speakers", "conversation_turn_rate",
                 "conversation_speech_fraction", "loudness_rms", "loudness_db"]
