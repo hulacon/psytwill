@@ -149,6 +149,10 @@ PROFILE_REGISTRY: dict[str, tuple[list[str], str]] = {
     # Raw openSMILE LLDs — its own 25-d profile, not folded into `acoustic`
     # (parallel algorithms to the librosa set; would also swamp the 19-d mix).
     "egemaps": (["egemaps_*"], "eGeMAPS prosody/voice-quality LLDs (aud2psy)"),
+    # Diarization-derived speaker/turn structure — who-speaks-when, not
+    # signal acoustics; stays out of `acoustic` (the music_emotion
+    # precedent: derived structure does not join the signal-level mix).
+    "conversation": (["conversation_*"], "Conversation structure from diarization (aud2psy)"),
     "acoustic": (_ACOUSTIC_PATTERNS, "All aud2psy frame-level acoustic features"),
     # Per-chunk means of word-level features (word2psy aggregates).
     # Mean only: mixing mean/sd/min/max in one profile would mix scales.

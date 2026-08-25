@@ -133,6 +133,14 @@ class TestProfileDetection:
         # learned affect stays out of the signal-level acoustic profile
         assert "music_emotion_valence" not in spaces["acoustic"].columns
 
+    def test_conversation_profile_separate_from_acoustic(self):
+        cols = ["time", "conversation_n_speakers", "conversation_turn_rate",
+                "conversation_speech_fraction", "loudness_rms", "loudness_db"]
+        spaces = detect_profile_spaces(cols)
+        assert spaces["conversation"].n_dims == 3
+        # diarization-derived structure stays out of the signal-level profile
+        assert "conversation_n_speakers" not in spaces["acoustic"].columns
+
     def test_speech_prob_alone_is_not_a_profile(self):
         # single column: only reachable through the combined acoustic profile
         assert detect_profile_spaces(["time", "speech_prob"]) == {}
