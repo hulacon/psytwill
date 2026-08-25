@@ -154,6 +154,11 @@ PROFILE_REGISTRY: dict[str, tuple[list[str], str]] = {
     # signal acoustics; stays out of `acoustic` (the music_emotion
     # precedent: derived structure does not join the signal-level mix).
     "conversation": (["conversation_*"], "Conversation structure from diarization (aud2psy)"),
+    # Optical-flow statistics — viz2psy's temporal arm, video only.
+    "motion": (["motion_*"], "Optical-flow motion statistics (viz2psy)"),
+    # Face count/size/configuration — social-visual structure beyond
+    # yolo's person count.
+    "faces": (["faces_*"], "Face count/size/configuration (viz2psy)"),
     "acoustic": (_ACOUSTIC_PATTERNS, "All aud2psy frame-level acoustic features"),
     # Per-chunk means of word-level features (word2psy aggregates).
     # Mean only: mixing mean/sd/min/max in one profile would mix scales.
