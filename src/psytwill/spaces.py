@@ -102,6 +102,7 @@ _NORM_FEATURES = [
     "lexical_norms_gender_association",
     "lexical_norms_socialness",
     "lexical_norms_body_object_interaction",
+    "lexical_norms_animacy",
     "lexical_norms_sensorimotor_touch",
     "lexical_norms_sensorimotor_hearing",
     "lexical_norms_sensorimotor_smell",
