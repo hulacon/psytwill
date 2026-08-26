@@ -25,3 +25,7 @@ class SpaceError(PsytwillError):
 
 class MetricError(PsytwillError):
     """An unknown or inapplicable metric was requested."""
+
+
+class CorpusError(PsytwillError):
+    """An external fit-corpus id or registry entry is invalid."""
