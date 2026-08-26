@@ -26,6 +26,9 @@ Examples
 
     # How the spaces in N feature tables relate to each other
     psytwill compare image.parquet:image caption.parquet:cap -o geometry/
+
+    # Shared-dimension counts against one source space (CV-CCA)
+    psytwill decompose image.parquet:image -o decomp/ --source image:ebind
 """
 
 import argparse
@@ -33,6 +36,7 @@ import sys
 
 from psytwill import __version__
 from psytwill.compare import DEFAULT_K
+from psytwill.decompose import DEFAULT_RANK_CAP
 from psytwill.exceptions import InputError, PsytwillError
 
 
@@ -157,13 +161,17 @@ def _parse_table_arg(arg: str) -> tuple[str, str | None]:
     return path, prefix
 
 
-def _run_compare(args: argparse.Namespace) -> None:
-    from psytwill.geometry import compare_spaces, write_geometry
+def _load_aligned(args: argparse.Namespace):
+    """The loading path both geometry verbs share: load, dedupe, align, stride.
+
+    Returns ``(spaces, labels, groups, report)``. Kept as one function so
+    ``compare`` and ``decompose`` cannot drift apart in what a row is — the
+    decomposition must run on exactly the rows the verdict ran on.
+    """
     from psytwill.store import LoadReport, align_spaces, dedupe_spaces, load_spaces
 
     key = tuple(args.key.split(","))
     models = args.models.split(",") if args.models else None
-    measures = args.measures.split(",") if args.measures else None
     report = LoadReport()
     spaces: dict = {}
     for raw in args.inputs:
@@ -219,12 +227,31 @@ def _run_compare(args: argparse.Namespace) -> None:
         groups = [lab.split(args.group_sep)[0] for lab in labels]
         print(f"  folds grouped by label prefix: {len(set(groups))} groups")
 
-    total_seen = [0]
+    return spaces, labels, groups, report
 
-    def progress(done: int, total: int, label: str) -> None:
-        if done == 1 or done == total or done % max(1, total // 20) == 0:
-            print(f"  [{done:>6d}/{total}] {label}", flush=True)
-        total_seen[0] = total
+
+def _report_dict(report) -> dict:
+    return {
+        "deduped": report.deduped,
+        "skipped_string": report.skipped_string,
+        "skipped_empty": report.skipped_empty,
+        "pooled": report.pooled,
+        "dropped_provenance": report.dropped_provenance,
+    }
+
+
+def _print_progress(done: int, total: int, label: str) -> None:
+    if done == 1 or done == total or done % max(1, total // 20) == 0:
+        print(f"  [{done:>6d}/{total}] {label}", flush=True)
+
+
+def _run_compare(args: argparse.Namespace) -> None:
+    from psytwill.geometry import compare_spaces, write_geometry
+
+    measures = args.measures.split(",") if args.measures else None
+    spaces, labels, groups, report = _load_aligned(args)
+
+    progress = _print_progress
 
     result = compare_spaces(
         spaces,
@@ -243,19 +270,43 @@ def _run_compare(args: argparse.Namespace) -> None:
         name=args.name,
         inputs=args.inputs,
         labels=labels,
-        extra={
-            "stride": args.stride,
-            "load_report": {
-                "deduped": report.deduped,
-                "skipped_string": report.skipped_string,
-                "skipped_empty": report.skipped_empty,
-                "pooled": report.pooled,
-                "dropped_provenance": report.dropped_provenance,
-            }
-        },
+        extra={"stride": args.stride, "load_report": _report_dict(report)},
     )
     print(f"wrote {len(result.pairs)} pair rows, {len(result.manifest)} spaces")
     for kind in ("pairs", "manifest", "meta_path"):
+        print(f"  {paths[kind]}")
+
+
+def _run_decompose(args: argparse.Namespace) -> None:
+    from psytwill.decompose import decompose_spaces, write_decomposition
+
+    spaces, labels, groups, report = _load_aligned(args)
+
+    result = decompose_spaces(
+        spaces,
+        args.source,
+        groups=groups,
+        n_splits=args.n_splits,
+        rank_cap=args.rank_cap,
+        n_perm=args.permutations,
+        block_size=args.block_size,
+        prefix_alpha=args.prefix_alpha,
+        random_state=args.seed,
+        progress=_print_progress,
+    )
+    paths = write_decomposition(
+        result,
+        args.output,
+        name=args.name,
+        inputs=args.inputs,
+        labels=labels,
+        extra={"stride": args.stride, "load_report": _report_dict(report)},
+    )
+    print(
+        f"wrote {len(result.components)} component rows, "
+        f"{len(result.summary)} pair summaries"
+    )
+    for kind in ("components", "summary", "meta_path"):
         print(f"  {paths[kind]}")
 
 
@@ -320,67 +371,103 @@ def build_parser() -> argparse.ArgumentParser:
     )
     f.set_defaults(func=_run_features)
 
+    def add_loading_args(p: argparse.ArgumentParser, default_name: str) -> None:
+        """Args shared by the two geometry verbs, so a row means the same thing."""
+        p.add_argument(
+            "inputs",
+            nargs="+",
+            help="Long-form feature tables, optionally 'path.parquet:prefix'",
+        )
+        p.add_argument("-o", "--output", required=True, help="Output directory")
+        p.add_argument("--name", default=default_name, help="Output file stem")
+        p.add_argument(
+            "--key",
+            default="stimulus_id",
+            help="Row grain, comma-separated (e.g. 'stimulus_id,time')",
+        )
+        p.add_argument("--models", help="Comma-separated model subset")
+        p.add_argument(
+            "--pool",
+            choices=("mean", "none"),
+            default="mean",
+            help="Pool replicate rows sharing a key, or refuse them",
+        )
+        p.add_argument(
+            "--window",
+            type=float,
+            help="Bin 'time' into windows of this many seconds before pooling; "
+            "required on a temporal grid (it is the timescale axis, and it "
+            "reconciles bin-start vs bin-center time stamps across groups)",
+        )
+        p.add_argument(
+            "--stride",
+            type=int,
+            default=1,
+            help="Keep every Nth aligned row within each clip (label prefix "
+            "before --group-sep) before comparing — for running measures at "
+            "a grain whose full n cannot afford them",
+        )
+        p.add_argument(
+            "--block-size",
+            type=int,
+            help="Permute contiguous blocks of this size; required on a temporal grid",
+        )
+        p.add_argument(
+            "--group-by",
+            action="store_true",
+            help="Group CV folds by the label prefix before --group-sep "
+            "(one fold per clip on a movie grid)",
+        )
+        p.add_argument("--group-sep", default="|", help="Separator for --group-by")
+        p.add_argument("--n-splits", type=int, default=5, help="CV folds")
+        p.add_argument("--seed", type=int, default=0)
+
     c = sub.add_parser(
         "compare",
         help="How the spaces in N feature tables relate (Contract B geometry)",
     )
-    c.add_argument(
-        "inputs",
-        nargs="+",
-        help="Long-form feature tables, optionally 'path.parquet:prefix'",
-    )
-    c.add_argument("-o", "--output", required=True, help="Output directory")
-    c.add_argument("--name", default="space_geometry", help="Output file stem")
-    c.add_argument(
-        "--key",
-        default="stimulus_id",
-        help="Row grain, comma-separated (e.g. 'stimulus_id,time')",
-    )
-    c.add_argument("--models", help="Comma-separated model subset")
+    add_loading_args(c, "space_geometry")
     c.add_argument("--measures", help="Comma-separated measure subset")
-    c.add_argument(
-        "--pool",
-        choices=("mean", "none"),
-        default="mean",
-        help="Pool replicate rows sharing a key, or refuse them",
-    )
-    c.add_argument(
-        "--window",
-        type=float,
-        help="Bin 'time' into windows of this many seconds before pooling; "
-        "required on a temporal grid (it is the timescale axis, and it "
-        "reconciles bin-start vs bin-center time stamps across groups)",
-    )
-    c.add_argument(
-        "--stride",
-        type=int,
-        default=1,
-        help="Keep every Nth aligned row within each clip (label prefix "
-        "before --group-sep) before comparing — for running the n^2 "
-        "measures at a grain whose full n cannot afford them",
-    )
     c.add_argument("--k", type=int, default=DEFAULT_K, help="Neighbours for overlap")
-    c.add_argument("--n-splits", type=int, default=5, help="Ridge CV folds")
     c.add_argument(
         "--permutations",
         type=int,
         default=1000,
         help="Neighbour-overlap null draws (0 skips the null)",
     )
-    c.add_argument(
-        "--block-size",
-        type=int,
-        help="Permute contiguous blocks of this size; required on a temporal grid",
-    )
-    c.add_argument(
-        "--group-by",
-        action="store_true",
-        help="Group ridge folds by the label prefix before --group-sep "
-        "(one fold per clip on a movie grid)",
-    )
-    c.add_argument("--group-sep", default="|", help="Separator for --group-by")
-    c.add_argument("--seed", type=int, default=0)
     c.set_defaults(func=_run_compare)
+
+    d = sub.add_parser(
+        "decompose",
+        help="Shared-dimension counts via cross-validated CCA (constraint-4 "
+        "decomposition): one source space against every other",
+    )
+    add_loading_args(d, "space_decomposition")
+    d.add_argument(
+        "--source",
+        required=True,
+        help="Space every other space is decomposed against (e.g. 'frames:ebind')",
+    )
+    d.add_argument(
+        "--rank-cap",
+        type=int,
+        default=DEFAULT_RANK_CAP,
+        help="Max PCA rank per space before whitening",
+    )
+    d.add_argument(
+        "--permutations",
+        type=int,
+        default=250,
+        help="Null draws for the per-component threshold (0 skips; the "
+        "shared count is then undefined)",
+    )
+    d.add_argument(
+        "--prefix-alpha",
+        type=float,
+        default=0.01,
+        help="Per-component null quantile a component must clear",
+    )
+    d.set_defaults(func=_run_decompose)
 
     return parser
 
