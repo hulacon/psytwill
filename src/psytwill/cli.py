@@ -32,7 +32,9 @@ Examples
 """
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from psytwill import __version__
 from psytwill.compare import DEFAULT_K
@@ -151,6 +153,30 @@ def _run_features(args: argparse.Namespace) -> None:
             f"{entry['n_feature_columns']} feature cols{note}"
         )
     print(f"  {summary['meta_path']}")
+
+
+def _run_project(args: argparse.Namespace) -> None:
+    from psytwill.project import project_onto_intervals
+
+    frame, meta = project_onto_intervals(
+        args.gridded,
+        args.intervals,
+        window=args.window,
+        models=args.models.split(",") if args.models else None,
+        bins=args.bins,
+    )
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(out, index=False)
+    meta_path = out.parent / (out.name.removesuffix(".parquet") + ".meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2))
+    print(
+        f"psytwill project ({meta['bins']} bins) -> {out}  "
+        f"({meta['rows']} rows, {meta['n_intervals']} intervals x "
+        f"{len(meta['models'])} models, {meta['n_overlapped_bins']} "
+        "overlapped bins)"
+    )
+    print(f"  {meta_path}")
 
 
 def _parse_table_arg(arg: str) -> tuple[str, str | None]:
@@ -468,6 +494,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-component null quantile a component must clear",
     )
     d.set_defaults(func=_run_decompose)
+
+    pj = sub.add_parser(
+        "project",
+        help="Pool a gridded group table onto an interval index (the "
+        "time-aware cross mode's irregular half)",
+    )
+    pj.add_argument("gridded", help="Gridded long-form group table (has 'time')")
+    pj.add_argument(
+        "--intervals",
+        required=True,
+        help="Interval-keyed group table supplying (stimulus_id, chunk_idx, "
+        "onset, offset); its feature content is ignored",
+    )
+    pj.add_argument(
+        "--window",
+        type=float,
+        required=True,
+        help="Grid width in seconds; stamps are binned before containment, "
+        "reconciling bin-start vs bin-center conventions",
+    )
+    pj.add_argument("--models", help="Comma-separated model subset")
+    pj.add_argument(
+        "--bins",
+        choices=["all", "odd", "even"],
+        default="all",
+        help="All bins (the measurement) or one parity of the within-interval "
+        "bin ranks (a split-half stability ceiling's two halves)",
+    )
+    pj.add_argument("-o", "--output", required=True, help="Output parquet path")
+    pj.set_defaults(func=_run_project)
 
     return parser
 
