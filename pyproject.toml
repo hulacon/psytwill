@@ -38,7 +38,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ipython"]
+# pyarrow is a *test* dependency, not a runtime one: psytwill writes parquet
+# through pandas, which needs an engine, and 40 of the 227 tests exercise
+# that path. Without it a fresh `pip install -e ".[dev]"` gives 40 failures
+# that look like broken code and are not (measured 2026-08-29).
+dev = ["pytest", "ipython", "pyarrow"]
 
 [project.scripts]
 psytwill = "psytwill.cli:main"
