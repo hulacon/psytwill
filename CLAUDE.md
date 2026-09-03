@@ -130,6 +130,21 @@ Ben works in explicitly approved phases: propose, wait for go-ahead at design
 checkpoints, summarize finished work with concrete validation numbers.
 Commit/push only when asked.
 
+- **`timelines.py`** (0.10.0) — the third input class: BIDS `events.tsv`.
+  Resolves every presentation to a registry `stimulus_id` by §4.2's rules
+  (image trials by `mmmId`, word trials by `(word, voice)`, movie trials by
+  case-insensitive `movie_name` incl. variants; unresolved = error), orders
+  a subject's presentations across sessions, and adds the contextual
+  features that exist only once embedded: `lag_trials` (across everything
+  given), `lag_seconds` (same run only — runs share no clock),
+  `prev_session`/`prev_run`, and optionally `ctx_<model>_k<k>_cosdist`
+  (cosine distance to the mean of the preceding k items in the run, in one
+  chosen space). Item-level rows of a `features` table attach wide. Own
+  `schema_version` (`TIMELINES_SCHEMA_VERSION`) in `<stem>.meta.json`.
+  Experimental time only — HRF/TR belong to braintwill (contracts §4.3
+  item 5). The dense movie half (frame grid shifted by movie onset) is not
+  built; movies resolve and get lags like any item.
+
 ## Roadmap
 
 1. **Phase 1 — matrices + transitions + CLI** (built Aug 2026, skeleton
