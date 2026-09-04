@@ -11,5 +11,7 @@ extractor CSVs into one tidy `(stimulus_id, modality, extractor, model,
 feature[, time], value)` table (parquet or CSV):
 
     psytwill features clip.csv ebind.csv caption.csv -o features.parquet
+    psytwill timelines sub-01_ses-*_task-TB*_events.tsv --registry stimuli/stimulus_registry \
+        --features features.parquet --context-model clip -o sub-01_timeline.parquet
 
 *Under construction.*

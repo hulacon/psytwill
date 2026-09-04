@@ -155,6 +155,28 @@ def _run_features(args: argparse.Namespace) -> None:
     print(f"  {summary['meta_path']}")
 
 
+def _run_timelines(args: argparse.Namespace) -> None:
+    from psytwill.timelines import build_timeline
+
+    summary = build_timeline(
+        args.events,
+        registry_dir=args.registry,
+        output=args.output,
+        features=args.features,
+        models=args.models.split(",") if args.models else None,
+        context_model=args.context_model,
+        context_k=args.context_k,
+    )
+    sets = ", ".join(f"{k}={v}" for k, v in sorted(summary["sets"].items()))
+    print(
+        f"psytwill timelines -> {summary['output']}  "
+        f"({summary['rows']} rows, {summary['presentations']} presentations; {sets})"
+    )
+    if summary["models"]:
+        print(f"  features attached: {', '.join(summary['models'])}")
+    print(f"  {summary['meta_path']}")
+
+
 def _run_project(args: argparse.Namespace) -> None:
     from psytwill.project import project_onto_intervals
 
@@ -524,6 +546,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pj.add_argument("-o", "--output", required=True, help="Output parquet path")
     pj.set_defaults(func=_run_project)
+
+    tl = sub.add_parser(
+        "timelines",
+        help="Embed stimulus sets in experimental time: events.tsv -> registry "
+        "ids -> ordered presentations with lags (contracts §4.3 item 5)",
+    )
+    tl.add_argument(
+        "events",
+        nargs="+",
+        help="BIDS events.tsv files for one subject (give every session so "
+        "lag_trials spans them); entities are read from the file names",
+    )
+    tl.add_argument(
+        "--registry",
+        required=True,
+        help="stimuli/stimulus_registry/ directory (shared1000.tsv, twp1000.tsv, movies.tsv)",
+    )
+    tl.add_argument(
+        "--features",
+        help="A `psytwill features` table (.parquet/.csv); its item-level rows "
+        "are attached wide, voice-specific rows by (stimulus_id, voice)",
+    )
+    tl.add_argument("--models", help="Comma-separated model subset to attach")
+    tl.add_argument(
+        "--context-model",
+        help="Model whose embedding gives ctx_<model>_k<k>_cosdist: cosine "
+        "distance to the mean of the preceding k items in the run",
+    )
+    tl.add_argument("--context-k", type=int, default=5, help="Context width in items (default 5)")
+    tl.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output table (.parquet preferred, .csv/.tsv); <stem>.meta.json alongside",
+    )
+    tl.set_defaults(func=_run_timelines)
 
     return parser
 
