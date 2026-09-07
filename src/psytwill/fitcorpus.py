@@ -101,6 +101,13 @@ CORPORA: dict[str, CorpusSpec] = {
             serves="V<->A residual shared axes; external brains (AV)",
         ),
         CorpusSpec(
+            "blender",
+            tier="a",
+            serves="V<->A residual: the animated wedge (CC-BY open movies)",
+            notes="Big Buck Bunny (2008) onward; Tears of Steel excluded as "
+                  "live action; ratified 2026-09-07",
+        ),
+        CorpusSpec(
             "things",
             tier="validation",
             serves="external-brain validation for the V block",
