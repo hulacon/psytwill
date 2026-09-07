@@ -205,6 +205,44 @@ def test_lag_across_sessions_has_trials_but_no_seconds(events, registry_dir):
     assert again["prev_session"] == "04" and again["prev_run"] == "01"
 
 
+def test_same_run_number_in_another_task_is_another_scan(tmp_path, registry_dir):
+    # TB encoding and retrieval number their runs independently: ses-04
+    # task-TBencoding_run-01 and task-TBretrieval_run-01 are two scans with
+    # two clocks. Found on real data 2026-09-07 (mmmdata-agents cluster-reentry
+    # R16): 625 of 1,888 "same-run" lags were across the two files, and the
+    # first image of every retrieval run inherited the encoding run's context.
+    f = tmp_path / "func2"
+    f.mkdir()
+    enc = f / "sub-01_ses-04_task-TBencoding_run-01_events.tsv"
+    ret = f / "sub-01_ses-04_task-TBretrieval_run-01_events.tsv"
+    _tb_events(enc, [(1, "cabin", "nova", 1), (2, "river", "echo", 2)])
+    _tb_events(ret, [(1, "cabin", "nova", 1)])  # A again, same onset 9.0 on a different clock
+    tl = add_lags(read_events([enc, ret], Registry.from_dir(registry_dir)))
+    a = tl[(tl["stimulus_id"] == "shared0001_nsd00001")]
+    assert a["task"].tolist() == ["TBencoding", "TBretrieval"]
+    again = a.iloc[1]
+    assert again["n_prior"] == 1 and again["lag_trials"] > 0
+    assert np.isnan(again["lag_seconds"])  # not 0.0: different scan, no shared clock
+    assert again["prev_session"] == "04" and again["prev_task"] == "TBencoding" and again["prev_run"] == "01"
+
+
+def test_context_restarts_at_each_scan_not_each_run_number(tmp_path, registry_dir, features_table):
+    f = tmp_path / "func3"
+    f.mkdir()
+    enc = f / "sub-01_ses-04_task-TBencoding_run-01_events.tsv"
+    ret = f / "sub-01_ses-04_task-TBretrieval_run-01_events.tsv"
+    _tb_events(enc, [(1, "cabin", "nova", 1), (2, "river", "echo", 2)])
+    _tb_events(ret, [(2, "river", "echo", 2), (1, "cabin", "nova", 1)])
+    tl = add_lags(read_events([enc, ret], Registry.from_dir(registry_dir)))
+    wide, cols = load_item_features(features_table)
+    out = add_context_distance(attach_features(tl, wide), "clip", cols["clip"], k=5)
+    col = "ctx_clip_k5_cosdist"
+    for task in ("TBencoding", "TBretrieval"):
+        imgs = out[(out["task"] == task) & out["trial_type"].eq("image")]
+        assert np.isnan(imgs[col].iloc[0]), task  # first image of the scan has no context
+        assert imgs[col].iloc[1] == pytest.approx(1.0), task
+
+
 def test_presentation_idx_skips_non_stimulus_rows(events, registry_dir):
     tl = add_lags(read_events(events, Registry.from_dir(registry_dir)))
     assert tl.loc[~tl["is_stimulus"], "presentation_idx"].isna().all()

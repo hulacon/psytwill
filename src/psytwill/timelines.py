@@ -11,9 +11,11 @@ once items are placed in time:
 * ``lag_trials`` — stimulus presentations since this item was last shown,
   counted across every events file given (sessions included);
 * ``lag_seconds`` — seconds since it was last shown, defined only when the
-  previous presentation was in the same run (runs share no clock);
-* ``prev_session`` / ``prev_run`` — where the previous presentation was, so
-  a session lag is derivable post hoc;
+  previous presentation was in the same scan — same session, task *and* run
+  (scans share no clock, and a retrieval ``run-01`` is not the encoding
+  ``run-01`` it shares a number with);
+* ``prev_session`` / ``prev_task`` / ``prev_run`` — where the previous
+  presentation was, so a session lag is derivable post hoc;
 * optionally, cosine distance of the item's embedding in one chosen space to
   the mean of the preceding *k* items in the run (``--context-model``).
 
@@ -69,7 +71,7 @@ TIMELINE_COLUMNS = [
     "subject", "session", "task", "run", "row_idx", "presentation_idx",
     "onset", "duration", "trial_type", "is_stimulus", "stimulus_set",
     "stimulus_id", "voice", "n_prior", "lag_trials", "lag_seconds",
-    "prev_session", "prev_run",
+    "prev_session", "prev_task", "prev_run",
 ]
 KEY_COLUMNS = ["subject", "session", "task", "run", "row_idx"]
 
@@ -207,6 +209,13 @@ def read_events(paths: Sequence[str | Path], registry: Registry) -> pd.DataFrame
 
     Order is (session, run, onset, file row). Session and run sort as
     integers when they are digits, so ``ses-10`` follows ``ses-09``.
+
+    Two files that share a session and run number but not a task (TB
+    encoding and retrieval are numbered independently) interleave by onset
+    under this order, so ``row_idx``/``presentation_idx`` and therefore
+    ``lag_trials`` count across both scans as if they were one. The true
+    order of scans within a session is in ``scans.tsv``, which this reader
+    does not consult yet; give it one task per call when that matters.
     """
     frames = []
     unresolved: list[str] = []
@@ -275,8 +284,9 @@ def add_lags(tl: pd.DataFrame) -> pd.DataFrame:
     Identity is ``stimulus_id`` alone: the same word in another voice is the
     same item. ``lag_trials`` counts stimulus presentations (rows with an id)
     between the two showings, across everything given. ``lag_seconds`` is the
-    onset difference when the previous showing was in the same session and
-    run, else NaN — onsets in different runs share no clock.
+    onset difference when the previous showing was in the same scan (same
+    session, task and run), else NaN — onsets in different scans share no
+    clock, and two tasks' ``run-01`` files are two scans.
     """
     tl = tl.copy()
     stim = tl["is_stimulus"].to_numpy()
@@ -288,25 +298,36 @@ def add_lags(tl: pd.DataFrame) -> pd.DataFrame:
     lag_trials = np.full(len(tl), np.nan)
     lag_seconds = np.full(len(tl), np.nan)
     prev_ses: list[Optional[str]] = [None] * len(tl)
+    prev_task: list[Optional[str]] = [None] * len(tl)
     prev_run: list[Optional[str]] = [None] * len(tl)
-    last: dict[str, tuple[int, float, str, Optional[str], int]] = {}
+    last: dict[str, tuple[int, float, str, str, Optional[str], int]] = {}
     count: dict[str, int] = {}
     for i in np.flatnonzero(stim):
         sid = tl.at[i, "stimulus_id"]
         n_prior[i] = count.get(sid, 0)
         if sid in last:
-            p_idx, p_onset, p_ses, p_run, _ = last[sid]
+            p_idx, p_onset, p_ses, p_task, p_run, _ = last[sid]
             lag_trials[i] = pres_idx[i] - p_idx
-            if p_ses == tl.at[i, "session"] and p_run == tl.at[i, "run"]:
+            same_scan = (
+                p_ses == tl.at[i, "session"]
+                and p_task == tl.at[i, "task"]
+                and p_run == tl.at[i, "run"]
+            )
+            if same_scan:
                 lag_seconds[i] = float(tl.at[i, "onset"]) - p_onset
             prev_ses[i] = p_ses
+            prev_task[i] = p_task
             prev_run[i] = p_run
-        last[sid] = (pres_idx[i], float(tl.at[i, "onset"]), tl.at[i, "session"], tl.at[i, "run"], i)
+        last[sid] = (
+            pres_idx[i], float(tl.at[i, "onset"]),
+            tl.at[i, "session"], tl.at[i, "task"], tl.at[i, "run"], i,
+        )
         count[sid] = count.get(sid, 0) + 1
     tl["n_prior"] = n_prior
     tl["lag_trials"] = lag_trials
     tl["lag_seconds"] = lag_seconds
     tl["prev_session"] = prev_ses
+    tl["prev_task"] = prev_task
     tl["prev_run"] = prev_run
     return tl
 
@@ -389,9 +410,9 @@ def attach_features(tl: pd.DataFrame, wide: pd.DataFrame) -> pd.DataFrame:
 def add_context_distance(tl: pd.DataFrame, model: str, cols: Sequence[str], k: int) -> pd.DataFrame:
     """Cosine distance from each item to the mean of the preceding *k* items.
 
-    Context is the preceding *k* stimulus presentations **in the same
-    session and run** that carry this model's features; the first item of a
-    run has no context and gets NaN. Column: ``ctx_{model}_k{k}_cosdist``.
+    Context is the preceding *k* stimulus presentations **in the same scan
+    (session, task and run)** that carry this model's features; the first
+    item of a scan has no context and gets NaN. Column: ``ctx_{model}_k{k}_cosdist``.
     """
     if k < 1:
         raise InputError("--context-k must be >= 1")
@@ -401,7 +422,7 @@ def add_context_distance(tl: pd.DataFrame, model: str, cols: Sequence[str], k: i
     name = f"ctx_{model}_k{k}_cosdist"
     out = np.full(len(tl), np.nan)
     X = tl[list(cols)].to_numpy(dtype=float)
-    for (_, _), idx in tl.groupby(["session", "run"], sort=False, dropna=False).indices.items():
+    for _, idx in tl.groupby(["session", "task", "run"], sort=False, dropna=False).indices.items():
         history: list[np.ndarray] = []
         for i in idx:
             if not tl.at[i, "is_stimulus"]:
