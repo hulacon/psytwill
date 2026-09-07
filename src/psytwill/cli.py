@@ -358,6 +358,62 @@ def _run_decompose(args: argparse.Namespace) -> None:
         print(f"  {paths[kind]}")
 
 
+def _run_battery(args: argparse.Namespace) -> None:
+    from psytwill.battery import (
+        BATTERY,
+        BATTERY_CLAMPED_ON,
+        BATTERY_VERSION,
+        EXTRACTOR_VERSIONS,
+        check_sidecar,
+        models_seen,
+        to_records,
+    )
+    from psytwill.exceptions import BatteryError
+
+    if args.check:
+        violations: list[str] = []
+        sidecars = []
+        for path in args.check:
+            sidecar = json.loads(Path(path).read_text())
+            sidecars.append(sidecar)
+            violations += check_sidecar(sidecar, source=str(path))
+        for line in violations:
+            print(line)
+        never = sorted(set(BATTERY) - models_seen(sidecars)) if args.require_all else []
+        for name in never:
+            print(f"never emitted: {name}", file=sys.stderr)
+        n = len(violations)
+        print(
+            f"battery {BATTERY_VERSION}: {len(args.check)} sidecar(s), "
+            f"{n} violation{'s' if n != 1 else ''}"
+            + (f", {len(never)} pinned model(s) never emitted" if args.require_all else "")
+        )
+        if n or never:
+            raise BatteryError(
+                f"{n} violation{'s' if n != 1 else ''}"
+                + (f" + {len(never)} never-emitted" if never else "")
+                + f" against battery {BATTERY_VERSION}"
+            )
+        return
+
+    rows = to_records()
+    if args.json:
+        print(json.dumps(rows, indent=1))
+        return
+    print(
+        f"psytwill battery {BATTERY_VERSION} (clamped {BATTERY_CLAMPED_ON}): "
+        f"{len(rows)} models; "
+        + ", ".join(f"{k} {v}" for k, v in EXTRACTOR_VERSIONS.items())
+    )
+    print(f"{'model':16} {'extractor':9} {'modality':8} {'kind':9} {'dim':>5}  checkpoint")
+    for r in rows:
+        dim = "-" if r["dim"] is None else r["dim"]
+        print(
+            f"{r['model']:16} {r['extractor']:9} {r['modality']:8} {r['kind']:9} "
+            f"{dim:>5}  {r['checkpoint'] or '(analytic)'}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -546,6 +602,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pj.add_argument("-o", "--output", required=True, help="Output parquet path")
     pj.set_defaults(func=_run_project)
+
+    b = sub.add_parser(
+        "battery",
+        help="The clamped feature battery (psytwill-space v0.1 input "
+        "declaration): list it, or check sidecars against its pins",
+    )
+    b.add_argument("--json", action="store_true", help="machine-readable list")
+    b.add_argument(
+        "--check",
+        nargs="+",
+        metavar="META_JSON",
+        help="§4.1 extractor sidecars and/or psytwill group sidecars to "
+        "check for unknown models, checkpoint/extractor/prefix drift "
+        "(exit 1 on any violation)",
+    )
+    b.add_argument(
+        "--require-all",
+        action="store_true",
+        help="with --check: also fail if a pinned model appears in no sidecar",
+    )
+    b.set_defaults(func=_run_battery)
 
     tl = sub.add_parser(
         "timelines",

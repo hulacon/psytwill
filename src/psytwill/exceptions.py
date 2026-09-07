@@ -29,3 +29,7 @@ class MetricError(PsytwillError):
 
 class CorpusError(PsytwillError):
     """An external fit-corpus id or registry entry is invalid."""
+
+
+class BatteryError(PsytwillError):
+    """The clamped battery is inconsistent, or an input violates it."""
