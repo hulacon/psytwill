@@ -457,6 +457,154 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 1 if n_bad else 0
 
 
+# ---------------------------------------------------------------------------
+# Aggregate — Contract B `features` long table, one parquet per group
+# ---------------------------------------------------------------------------
+# Mirrors mmmdata's stimfeat_campaign.py `aggregate`: a group is keyed
+# (corpus, source, table) and holds EVERY model of that table across all
+# units, written to <durable>/<corpus>/groups/<corpus>_<source>[_<table>]_
+# features.parquet by psytwill.features.build_features (streaming writer).
+
+def _dir_stems(directory: Path) -> list[str]:
+    """Every cell stem any source writes into `directory`, longest first.
+
+    Built once for the whole tree (one pass over every source's units), not
+    per directory — each `units()` call globs a media directory on GPFS.
+    """
+    cache = _dir_stems.cache  # type: ignore[attr-defined]
+    if not cache:
+        by_dir: dict[Path, set[str]] = {}
+        for s_ in build_sources():
+            for u in s_.units():
+                by_dir.setdefault(u.out_dir, set()).update(stem_for(s_, u, m).stem for m in s_.models)
+        for d, stems in by_dir.items():
+            cache[d] = sorted(stems, key=len, reverse=True)
+    return cache.get(directory, [])
+
+
+_dir_stems.cache = {}  # type: ignore[attr-defined]
+
+
+def family_tables(src: Source, unit: Unit, model: str) -> dict[str, Path]:
+    """{table name: csv} for one cell — `<stem>.csv` ("main") and `<stem>_<table>.csv`.
+
+    A bare `<stem>*.csv` glob over-matches: `ebind.csv` (frames) also globs
+    `ebind_audio_frames.csv` (audio), `speech.csv` globs `speech_emotion.csv`.
+    Longest stem in the directory wins, as in the mmmdata campaign.
+    """
+    stem = stem_for(src, unit, model)
+    mine = stem.stem
+    others = [n for n in _dir_stems(stem.parent) if len(n) > len(mine)]
+    out: dict[str, Path] = {}
+    for path in sorted(stem.parent.glob(mine + "*.csv")):
+        if any(path.stem == n or path.stem.startswith(n + "_") for n in others):
+            continue
+        name = path.stem[len(mine):].lstrip("_") or "main"
+        out[name] = path
+    return out
+
+
+def _table_usable(path: Path) -> tuple[bool, str]:
+    """Can psytwill aggregate this table? (usable, reason-if-not)."""
+    from psytwill.spaces import INDEX_COLUMNS
+
+    with open(path, newline="") as f:
+        header = next(csv.reader(f), [])
+    if not [c for c in header if c not in INDEX_COLUMNS]:
+        return False, "no feature columns"
+    if "stimulus_id" not in header:
+        return False, "no stimulus_id (§4.1)"
+    return True, ""
+
+
+def aggregate_groups(args: argparse.Namespace) -> tuple[dict[tuple[str, str, str], list[Path]], list[tuple[Path, str]]]:
+    groups: dict[tuple[str, str, str], list[Path]] = {}
+    skipped: list[tuple[Path, str]] = []
+    for src, unit, model in _filtered(args):
+        if not is_done(stem_for(src, unit, model)):
+            continue
+        for table, path in family_tables(src, unit, model).items():
+            usable, why = _table_usable(path)
+            if not usable:
+                skipped.append((path, why))
+                continue
+            groups.setdefault((src.corpus, src.source, table), []).append(path)
+    return {k: sorted(v) for k, v in sorted(groups.items())}, skipped
+
+
+def agg_output(key: tuple[str, str, str]) -> Path:
+    corpus, source, table = key
+    name = f"{corpus}_{source}" + ("" if table == "main" else f"_{table}")
+    return ROOTS.durable / corpus / "groups" / f"{name}_features.parquet"
+
+
+def cmd_aggregate(args: argparse.Namespace) -> int:
+    if args.model:
+        sys.exit("ERROR: `aggregate --model` would write a partial group (a group holds every model of its table); narrow with --corpus/--source instead")
+    if args.unit or args.unit_index is not None:
+        sys.exit("ERROR: `aggregate` is per corpus/source, not per unit")
+    groups, skipped = aggregate_groups(args)
+    if not groups:
+        print("no aggregatable tables matched the filters")
+        return 0
+    by_reason: dict[str, dict[str, int]] = {}
+    for path, why in skipped:
+        by_reason.setdefault(why, {}).setdefault(path.name, 0)
+        by_reason[why][path.name] += 1
+    for why, names in sorted(by_reason.items()):
+        print(f"skipped {sum(names.values()):>6} table(s): {why}")
+        for name, n in sorted(names.items()):
+            print(f"    {n:>5}  {name}")
+    # a group holds every unit of its (corpus, source); incomplete ones are
+    # reported and left unbuilt unless --allow-partial
+    complete: dict[tuple[str, str, str], list[Path]] = {}
+    for key, paths in groups.items():
+        corpus, source, table = key
+        src = next(s_ for s_ in build_sources() if s_.corpus == corpus and s_.source == source)
+        n_units, n_seen = len(src.units()), len({p.parent for p in paths})
+        if n_seen < n_units and not args.allow_partial:
+            print(f"  INCOMPLETE {corpus}/{source}/{table}: {n_seen}/{n_units} units done — skipped")
+            continue
+        complete[key] = paths
+    groups = complete
+    if not groups:
+        print("no complete groups (pass --allow-partial to build anyway)")
+        return 1
+    print(f"{len(groups)} group(s):")
+    todo = []
+    for key, paths in groups.items():
+        out = agg_output(key)
+        state = "done" if out.exists() and not args.redo else "todo"
+        print(f"  {'/'.join(key):<34} {len(paths):>6} inputs  -> {out.relative_to(ROOTS.durable)}  [{state}]")
+        if state == "todo":
+            todo.append((key, paths, out))
+    if args.dry_run:
+        print(f"\ndry run: {len(todo)} group(s) would be built")
+        return 0
+    if not todo:
+        print("\nnothing to do (use --redo to rebuild)")
+        return 0
+    from psytwill.features import build_features
+
+    n_fail = 0
+    for key, paths, out in todo:
+        label = "/".join(key)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            summary = build_features([str(p) for p in paths], output=out)
+        except Exception as exc:  # noqa: BLE001
+            n_fail += 1
+            print(f"  FAIL {label}: {type(exc).__name__}: {exc}", flush=True)
+            if args.fail_fast:
+                return 1
+            continue
+        print(f"  ok   {label}: {summary['rows']:,} rows, {summary['n_stimuli']:,} stimuli, "
+              f"{len(summary['models'])} models, {out.stat().st_size/1e6:.0f} MB, {time.time() - t0:.0f}s", flush=True)
+    print(f"\n{len(todo) - n_fail}/{len(todo)} group(s) built")
+    return 1 if n_fail else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--durable-root")
@@ -479,6 +627,12 @@ def main() -> int:
     p.add_argument("--fail-fast", action="store_true")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("verify"); p.set_defaults(func=cmd_verify)
+    p = sub.add_parser("aggregate", help="build one Contract B features parquet per (corpus, source, table) group"); filters(p)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--redo", action="store_true")
+    p.add_argument("--fail-fast", action="store_true")
+    p.add_argument("--allow-partial", action="store_true", help="write a group even if some units are not done")
+    p.set_defaults(func=cmd_aggregate)
 
     args = ap.parse_args()
     global ROOTS
