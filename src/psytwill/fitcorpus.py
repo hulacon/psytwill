@@ -65,8 +65,9 @@ CORPORA: dict[str, CorpusSpec] = {
         CorpusSpec(
             "twp-unpresented",
             tier="local",
-            serves="A private (domain-matched voice/word audio)",
-            notes="the 3,000 twp recordings frozen out of twp1000",
+            serves="A private; A<->L (domain-matched voice/word audio)",
+            notes="the 3,000 twp recordings frozen out of twp1000 (every "
+                  "word in its three never-presented voices), packed per voice",
         ),
         CorpusSpec(
             "librispeech",
@@ -89,7 +90,20 @@ CORPORA: dict[str, CorpusSpec] = {
             serves="A<->L (spoken stories); external brains (aud/lang)",
         ),
         CorpusSpec("jamendo", tier="a", serves="A private (music arm)"),
-        CorpusSpec("fma", tier="a", serves="A private (music arm)"),
+        CorpusSpec(
+            "fma",
+            tier="a",
+            serves="A private (music arm: genre-balanced clips)",
+            notes="fma_small, a seeded per-genre draw packed into units; "
+                  "ratified 2026-08-25 (decision 4)",
+        ),
+        CorpusSpec(
+            "musopen",
+            tier="a",
+            serves="A private (music arm: public-domain orchestral score)",
+            notes="the Musopen DVD compilation (PD); the orchestral-style "
+                  "add to decision 4",
+        ),
         CorpusSpec(
             "friends",
             tier="b",

@@ -24,6 +24,12 @@ Usage
     extract.py run --corpus nsd --unit u000 [--dry-run] [--redo] [--fail-fast]
     extract.py run --corpus movie10 --unit-index 7   # array-task form
     extract.py verify                      # re-check every written sidecar
+    extract.py run --corpus librispeech --unit-index 3 --skip-model psychoacoustic   # GPU job
+    extract.py run --corpus librispeech --unit-index 3 --model psychoacoustic        # CPU job
+
+Short-file corpora (speech, music, words) are first packed into units by
+`stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
+reads, and `<unit>_segments.csv` beside it maps unit time back to files.
 
 Roots (flags win over env; there are no defaults -- a site names them):
     --durable-root / $PSYTWILL_FITCORPUS_DURABLE   feature store
@@ -206,6 +212,50 @@ def _cneuromod_transcript_units(corpus: str) -> list[Unit]:
     return out
 
 
+# Corpora staged by stage.py into one wav per unit (`<corpus>/inputs/units.csv`).
+# Speech corpora with curated text ship their own transcript input (stage.py
+# writes it); narratives has none in ds002345, so its L input is the unit's
+# Whisper output, as for CNeuroMod; music has no transcript source at all.
+STAGED_CURATED = {
+    "librispeech": "read audiobook speech (LibriSpeech train-clean-100), packed per speaker; curated transcripts",
+    "gigaspeech": "podcast speech (GigaSpeech S, podcast source only), whole episodes packed; curated transcripts",
+    "twp-unpresented": "the never-presented twp recordings packed per voice; text = the word",
+}
+STAGED_WHISPER = {"narratives": "spoken stories (Narratives ds002345), one story per unit"}
+STAGED_MUSIC = {
+    "fma": "genre-balanced music clips (fma_small draw), packed per genre",
+    "musopen": "public-domain orchestral recordings (Musopen DVD), movements packed",
+}
+
+
+def _staged_units(corpus: str) -> list[Unit]:
+    manifest = ROOTS.durable / corpus / "inputs" / "units.csv"
+    if not manifest.exists():
+        return []
+    out = []
+    with open(manifest, newline="") as f:
+        for row in csv.DictReader(f):
+            out.append(Unit(
+                id=row["unit"],
+                out_dir=ROOTS.durable / corpus / "features" / row["unit"],
+                inputs=[row["path"]],
+                extra=["--stimulus-id", row["stimulus_id"]],
+            ))
+    return out
+
+
+def _staged_transcript_units(corpus: str) -> list[Unit]:
+    out = []
+    for u in _staged_units(corpus):
+        out.append(Unit(
+            id=u.id,
+            out_dir=u.out_dir,
+            inputs=[str(ROOTS.durable / corpus / "inputs" / f"{u.id}_transcript.csv")],
+            extra=["--text-column", "text", "--id-column", "stimulus_id"],
+        ))
+    return out
+
+
 def build_sources() -> list[Source]:
     S: list[Source] = []
     S.append(Source(
@@ -236,6 +286,26 @@ def build_sources() -> list[Source]:
             corpus, "transcript", "word2psy", "transcript_", L_MODELS,
             f"Whisper transcript segments of {corpus} (what is said), scored as text",
             lambda c=corpus: _cneuromod_transcript_units(c),
+            depends=f"{corpus}/audio/transcribe",
+        ))
+    for corpus, what in {**STAGED_CURATED, **STAGED_WHISPER, **STAGED_MUSIC}.items():
+        S.append(Source(
+            corpus, "audio", "aud2psy", "", _ordered_audio(),
+            f"{what}; {GRID_HOP} s hop; diarize/transcribe run before conversation/speech_rate",
+            lambda c=corpus: _staged_units(c),
+        ))
+    for corpus in STAGED_CURATED:
+        S.append(Source(
+            corpus, "transcript", "word2psy", "transcript_", L_MODELS,
+            f"curated text of each {corpus} unit (stage.py writes it), scored as text",
+            lambda c=corpus: _staged_transcript_units(c),
+            depends="inputs",
+        ))
+    for corpus in STAGED_WHISPER:
+        S.append(Source(
+            corpus, "transcript", "word2psy", "transcript_", L_MODELS,
+            f"Whisper transcript segments of {corpus} (what is said), scored as text",
+            lambda c=corpus: _staged_transcript_units(c),
             depends=f"{corpus}/audio/transcribe",
         ))
     return S
@@ -304,6 +374,8 @@ def _filtered(args: argparse.Namespace) -> list[tuple[Source, Unit, str]]:
             for model in src.models:
                 if args.model and model != args.model:
                     continue
+                if model in (args.skip_model or ()):
+                    continue
                 cells.append((src, unit, model))
     return cells
 
@@ -324,7 +396,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
             units = units[args.unit_index:args.unit_index + 1]
         if args.unit:
             units = [u for u in units if u.id == args.unit]
-        models = [m for m in src.models if not args.model or m == args.model]
+        models = [m for m in src.models if (not args.model or m == args.model)
+                  and m not in (args.skip_model or ())]
         n = len(units) * len(models)
         done = sum(is_done(stem_for(src, u, m)) for u in units for m in models)
         rows.append((src.key, src.package, len(units), len(models), n, done, src.what, src.depends))
@@ -366,6 +439,9 @@ def cmd_inputs(args: argparse.Namespace) -> int:
     # transcripts: from each unit's transcribe output (once it exists)
     for corpus in ("movie10", "friends"):
         n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _cneuromod_units(corpus))
+        print(f"{corpus} transcripts: {n} input CSVs written")
+    for corpus in STAGED_WHISPER:
+        n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _staged_units(corpus))
         print(f"{corpus} transcripts: {n} input CSVs written")
     return 0
 
@@ -539,8 +615,8 @@ def agg_output(key: tuple[str, str, str]) -> Path:
 
 
 def cmd_aggregate(args: argparse.Namespace) -> int:
-    if args.model:
-        sys.exit("ERROR: `aggregate --model` would write a partial group (a group holds every model of its table); narrow with --corpus/--source instead")
+    if args.model or args.skip_model:
+        sys.exit("ERROR: `aggregate --model/--skip-model` would write a partial group (a group holds every model of its table); narrow with --corpus/--source instead")
     if args.unit or args.unit_index is not None:
         sys.exit("ERROR: `aggregate` is per corpus/source, not per unit")
     groups, skipped = aggregate_groups(args)
@@ -616,6 +692,9 @@ def main() -> int:
         p.add_argument("--corpus", choices=sorted(CORPORA))
         p.add_argument("--source")
         p.add_argument("--model", choices=sorted(BATTERY))
+        p.add_argument("--skip-model", action="append", choices=sorted(BATTERY), metavar="MODEL",
+                       help="leave this model to another job (repeatable; e.g. the CPU-only "
+                            "psychoacoustic cells run on the compute partition)")
         p.add_argument("--unit")
         p.add_argument("--unit-index", type=int, help="position in the corpus's unit list (array tasks)")
 
