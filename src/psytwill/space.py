@@ -78,6 +78,7 @@ class SpaceWhitener:
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         Z = (np.asarray(X, dtype=float) - self.mean) / self.std
+        Z = np.where(np.isnan(Z), 0.0, Z)  # mean imputation of undefined entries
         return (Z @ self.components.T) * self.scales
 
 
@@ -91,10 +92,11 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
     X = np.asarray(X, dtype=float)
     if X.ndim != 2 or X.shape[0] < 3:
         raise SpaceError(f"'{space.name}': need at least 3 training rows to whiten.")
-    mean = X.mean(axis=0)
-    std = X.std(axis=0)
+    mean = np.nanmean(X, axis=0)
+    std = np.nanstd(X, axis=0)
     std = np.where(std > 0, std, 1.0)  # constant columns pass through as zeros
     Z = (X - mean) / std
+    Z = np.where(np.isnan(Z), 0.0, Z)  # mean imputation (undefined -> the column mean)
     pr = float(participation_ratio(Z))
     # eigendecomposition of the covariance via SVD of Z
     _, s, vt = np.linalg.svd(Z, full_matrices=False)
@@ -167,6 +169,58 @@ def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: 
     )
 
 
+
+# --------------------------------------------------------------------------
+# NaN policy
+# --------------------------------------------------------------------------
+
+DEFAULT_MAX_NAN_FRAC = 0.5
+
+
+def _impute(X: np.ndarray) -> np.ndarray:
+    """Column-mean imputation (for statistics that cannot skip rows)."""
+    X = np.asarray(X, dtype=float)
+    if not np.isnan(X).any():
+        return X
+    mean = np.nanmean(X, axis=0)
+    mean = np.where(np.isnan(mean), 0.0, mean)
+    return np.where(np.isnan(X), mean, X)
+
+
+def prepare_member(space: SpaceMatrix, *, max_nan_frac: float = DEFAULT_MAX_NAN_FRAC) -> tuple[SpaceMatrix, list[str]]:
+    """Drop columns undefined in more than ``max_nan_frac`` of rows.
+
+    A feature that exists only for a minority of stimuli (``faces_mutual_dist``
+    needs two faces; 98 % of NSD images have fewer) would otherwise force the
+    whole member onto that minority. Sparse gaps in the kept columns are
+    mean-imputed for the fit and dropped row-wise by the criterion.
+    """
+    X = np.asarray(space.X, dtype=float)
+    frac = np.isnan(X).mean(axis=0) if X.size else np.zeros(X.shape[1])
+    keep = frac <= max_nan_frac
+    dropped = [f for f, k in zip(space.features, keep) if not k]
+    if not dropped:
+        return space, []
+    if not keep.any():
+        raise SpaceError(f"'{space.name}': every column is undefined in more than {max_nan_frac:.0%} of rows")
+    out = SpaceMatrix(name=space.name, labels=list(space.labels), X=X[:, keep],
+                      features=[f for f, k in zip(space.features, keep) if k],
+                      modality=space.modality, extractor=space.extractor, n_replicates=space.n_replicates)
+    return out, dropped
+
+
+def select_features(space: SpaceMatrix, features: Sequence[str]) -> SpaceMatrix:
+    """Restrict ``space`` to ``features`` in that order (a fit's kept columns)."""
+    idx = {f: i for i, f in enumerate(space.features)}
+    missing = [f for f in features if f not in idx]
+    if missing:
+        raise SpaceError(f"'{space.name}' lacks {len(missing)} feature(s) the fit needs, e.g. {missing[:3]}")
+    take = [idx[f] for f in features]
+    return SpaceMatrix(name=space.name, labels=list(space.labels), X=np.asarray(space.X, dtype=float)[:, take],
+                      features=list(features), modality=space.modality, extractor=space.extractor,
+                      n_replicates=space.n_replicates)
+
+
 # --------------------------------------------------------------------------
 # criterion
 # --------------------------------------------------------------------------
@@ -233,7 +287,8 @@ class BlockFit:
     manifest: dict = field(default_factory=dict)
 
     def project(self, spaces: dict[str, SpaceMatrix]) -> tuple[np.ndarray, list[str]]:
-        aligned, labels = align_spaces({m: spaces[m] for m in self.members})
+        picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
+        aligned, labels = align_spaces(picked)
         return self.map.scores(aligned, k=self.k), labels
 
 
@@ -264,6 +319,7 @@ def fit_block(
     eval_n: int | None = 5000,
     block_size: int | None = None,
     random_state: int = 0,
+    max_nan_frac: float = DEFAULT_MAX_NAN_FRAC,
     progress=None,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline."""
@@ -275,6 +331,11 @@ def fit_block(
     if len(members) < 1:
         raise SpaceError("a block needs at least one member space")
     aligned, labels = align_spaces({m: spaces[m] for m in members})
+    dropped_columns: dict[str, list[str]] = {}
+    for m in members:
+        aligned[m], dropped = prepare_member(aligned[m], max_nan_frac=max_nan_frac)
+        if dropped:
+            dropped_columns[m] = dropped
     n = len(labels)
     if n < 3 * n_splits:
         raise SpaceError(f"{n} aligned rows is too few for {n_splits} folds")
@@ -285,7 +346,7 @@ def fit_block(
         g = np.asarray(groups)
 
     # participation-ratio bound the block must come in under
-    pr = {m: float(participation_ratio(aligned[m].X)) for m in members}
+    pr = {m: float(participation_ratio(_impute(aligned[m].X))) for m in members}
     pr_sum = float(sum(pr.values()))
     # The walk runs up to the concatenation's own rank (sum of whitened ranks);
     # the summed participation ratio is REPORTED as the Settles-when bound,
@@ -336,6 +397,8 @@ def fit_block(
             "participation_ratio": pr[m],
             "whitened_rank": final.whiteners[m].rank,
             "dim": aligned[m].dim,
+            "dropped_columns": dropped_columns.get(m, []),
+            "nan_fraction_kept": float(np.isnan(aligned[m].X).mean()),
             "r2_per_fold": [r["r2"] for r in rows],
             "overlap_per_fold": [r["overlap"] for r in rows],
             "overlap_p_per_fold": [r["overlap_p"] for r in rows],
@@ -356,6 +419,7 @@ def fit_block(
         "grouped": g is not None,
         "criterion": {"r2_min": r2_min, "alpha": alpha, "k_nn": k_nn, "n_perm": n_perm,
                       "eval_n": eval_n, "block_size": block_size, "random_state": random_state},
+        "max_nan_frac": max_nan_frac,
         "k_schedule": schedule,
         "block_eigenvalues": [float(v) for v in final.block_eigenvalues],
         "per_member": per_member,
@@ -434,10 +498,8 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
     for m in fit.members:
         if m not in spaces:
             raise SpaceError(f"member '{m}' missing from the table; have {sorted(spaces)}")
-        want = fit.map.whiteners[m].features
-        if list(spaces[m].features) != list(want):
-            raise SpaceError(f"'{m}' feature columns differ from the fit ({len(spaces[m].features)} vs {len(want)})")
-    aligned, labels = align_spaces({m: spaces[m] for m in fit.members})
+    picked = {m: select_features(spaces[m], fit.map.whiteners[m].features) for m in fit.members}
+    aligned, labels = align_spaces(picked)
     S = fit.map.scores(aligned, k=fit.k)
     out = []
     for m in fit.members:

@@ -10,6 +10,7 @@ import pytest
 
 from psytwill.space import (
     BlockFit,
+    prepare_member,
     check_fit,
     fit_block,
     fit_whitener,
@@ -143,3 +144,24 @@ class TestFit:
         sp, _ = members
         with pytest.raises(Exception, match="cannot beat alpha"):
             fit_block(sp, ["a"], n_perm=50, alpha=0.01, eval_n=None, n_splits=3)
+
+
+class TestNaNPolicy:
+    def test_mostly_undefined_column_is_dropped_and_recorded(self, members):
+        sp, _ = members
+        X = sp["b"].X.copy()
+        X[:, 0] = np.nan
+        X[::50, 0] = 1.0  # defined for 2 % of rows
+        X[::7, 1] = np.nan  # sparse gaps stay, mean-imputed for the fit
+        sp = dict(sp)
+        sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=X, features=sp["b"].features)
+        kept, dropped = prepare_member(sp["b"])
+        assert dropped == ["b_000"] and kept.dim == 11
+        fit = fit_block(sp, ["a", "b"], block="T", r2_min=0.9, **_fit_kwargs())
+        assert fit.manifest["per_member"]["b"]["dropped_columns"] == ["b_000"]
+        assert fit.manifest["subsumes_all_members"]
+        # projecting the original (13-column) table selects the kept columns by name
+        S, _ = fit.project(sp)
+        assert np.isfinite(S).all() and S.shape[1] == fit.k
+        rows = check_fit(fit, sp, n_perm=150, eval_n=None, k_nn=10)
+        assert all(r["passed"] for r in rows)
