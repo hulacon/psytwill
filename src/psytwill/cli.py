@@ -39,7 +39,7 @@ from pathlib import Path
 from psytwill import __version__
 from psytwill.compare import DEFAULT_K
 from psytwill.decompose import DEFAULT_RANK_CAP
-from psytwill.exceptions import InputError, PsytwillError
+from psytwill.exceptions import InputError, PsytwillError, SpaceError
 
 
 def _parse_spaces(arg: str | None) -> dict[str, str | None] | None:
@@ -414,6 +414,158 @@ def _run_battery(args: argparse.Namespace) -> None:
         )
 
 
+
+# --------------------------------------------------------------------------
+# space: private-block fits (psytwill-space v0.1)
+# --------------------------------------------------------------------------
+
+
+def _space_members(args: argparse.Namespace, available: list[str]) -> list[str]:
+    """Members from --members, else every available model whose battery pin
+    has the block's modality and a numeric kind (embedding | profile)."""
+    if args.members:
+        return [m.strip() for m in args.members.split(",") if m.strip()]
+    from psytwill.battery import BATTERY
+
+    modality = {"V": "visual", "A": "audio", "L": "text"}.get(args.block, args.block)
+    want = {name for name, m in BATTERY.items()
+            if m.modality == modality and m.kind in ("embedding", "profile")}
+    members = [name for name in available if name in want]
+    if not members:
+        raise SpaceError(
+            f"no available model belongs to block {args.block!r} ({modality}); tables hold {sorted(available)}"
+        )
+    return members
+
+
+def _space_load(args: argparse.Namespace, members: list[str] | None = None):
+    """Load member spaces one model at a time (a 300 M-row group table does
+    not fit in pandas whole), dropping --exclude-ids rows. Returns
+    (spaces, members, n_excluded, report)."""
+    from psytwill.store import LoadReport, SpaceMatrix, load_spaces, model_inventory
+
+    key = tuple(args.key.split(","))
+    rep = LoadReport()
+    where: dict[str, str] = {}
+    for path in args.features:
+        for m in model_inventory(path)["model"].dropna().unique():
+            where.setdefault(str(m), str(path))
+    if members is None:
+        members = _space_members(args, list(where))
+    missing = [m for m in members if m not in where]
+    if missing:
+        raise SpaceError(f"member(s) {missing} not in the given tables; available {sorted(where)}")
+    ids: set[str] = set()
+    if args.exclude_ids:
+        ids = {line.strip() for line in Path(args.exclude_ids).read_text().splitlines() if line.strip()}
+    spaces: dict = {}
+    for m in members:
+        got = load_spaces(where[m], key=key, models=[m], window=args.window, report=rep)
+        if m not in got:
+            raise SpaceError(f"model {m!r} loaded as none of {sorted(got)} (string-valued or empty?)")
+        sm = got[m]
+        if ids:
+            keep = [i for i, lab in enumerate(sm.labels) if lab.split("|")[0] not in ids]
+            if len(keep) != sm.n:
+                sm = SpaceMatrix(name=sm.name, labels=[sm.labels[i] for i in keep], X=sm.X[keep],
+                                 features=sm.features, modality=sm.modality, extractor=sm.extractor,
+                                 n_replicates=sm.n_replicates)
+        spaces[m] = sm
+        print(f"  loaded {m}: {sm.n} rows x {sm.dim} features", flush=True)
+    return spaces, members, len(ids), rep
+
+
+def _run_space_fit(args: argparse.Namespace) -> None:
+    from psytwill.space import DEFAULT_K_SCHEDULE, fit_block, save_fit
+
+    spaces, members, n_excl, rep = _space_load(args)
+    groups = None
+    schedule = tuple(int(k) for k in args.k_schedule.split(",")) if args.k_schedule else DEFAULT_K_SCHEDULE
+    if args.groups_from_label:
+        from psytwill.store import align_spaces
+
+        _, labels = align_spaces({m: spaces[m] for m in members})
+        groups = [lab.split("|")[0] for lab in labels]
+
+    def progress(i, n, what):
+        if i == 1 or i % 25 == 0 or i == n:
+            print(f"  [{i}/{n}] {what}", flush=True)
+
+    fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
+                    groups=groups, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
+                    n_perm=args.n_perm, eval_n=args.eval_n, block_size=args.block_size,
+                    random_state=args.seed, progress=progress)
+    fit.manifest["inputs"] = [str(p) for p in args.features]
+    fit.manifest["key"] = args.key
+    fit.manifest["window"] = args.window
+    fit.manifest["n_excluded_ids"] = n_excl
+    fit.manifest["exclude_ids_file"] = args.exclude_ids
+    npz, manifest, curve = save_fit(fit, args.output, stem=args.stem)
+    verdict = "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member"
+    print(f"psytwill space fit [{args.block}] -> {manifest}")
+    print(f"  k={fit.k} ({verdict}); PR bound {fit.manifest['pr_sum_bound']:.1f}; "
+          f"n={fit.manifest['n_rows']} rows, {len(members)} members, excluded {n_excl} ids")
+    for m in members:
+        pm = fit.manifest["per_member"][m]
+        print(f"  {m:<18} PR {pm['participation_ratio']:6.1f} rank {pm['whitened_rank']:>4}  "
+              f"R2 {min(pm['r2_per_fold']) if pm['r2_per_fold'] else float('nan'):.3f}  "
+              f"overlap {min(pm['overlap_per_fold']) if pm['overlap_per_fold'] else float('nan'):.3f}  "
+              f"{'pass' if pm['passed_all_folds'] else 'FAIL'}")
+    print(f"  weights {npz}\n  curve {curve}")
+
+
+def _run_space_project(args: argparse.Namespace) -> None:
+    import pandas as pd
+
+    from psytwill.space import load_fit
+
+    fit = load_fit(args.space)
+    spaces, _, _, _ = _space_load(args, members=fit.members)
+    S, labels = fit.project(spaces)
+    df = pd.DataFrame(S, columns=[f"{fit.block}_{j:03d}" for j in range(S.shape[1])])
+    keys = args.key.split(",")
+    parts = [lab.split("|") for lab in labels]
+    for j, kname in enumerate(keys):
+        df.insert(j, kname, [p[j] if j < len(p) else None for p in parts])
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.suffix == ".parquet":
+        df.to_parquet(out, index=False)
+    else:
+        df.to_csv(out, index=False)
+    meta = {"space": str(args.space), "block": fit.block, "k": fit.k, "inputs": [str(p) for p in args.features],
+            "key": args.key, "window": args.window, "rows": int(len(df))}
+    (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
+    print(f"psytwill space project [{fit.block}, k={fit.k}] -> {out}  ({len(df)} rows)")
+
+
+def _run_space_check(args: argparse.Namespace) -> None:
+    from psytwill.space import check_fit, load_fit
+
+    fit = load_fit(args.space)
+    spaces, _, _, _ = _space_load(args, members=fit.members)
+    groups = None
+    if args.groups_from_label:
+        from psytwill.store import align_spaces
+
+        _, labels = align_spaces({m: spaces[m] for m in fit.members})
+        groups = [lab.split("|")[0] for lab in labels]
+    rows = check_fit(fit, spaces, groups=groups, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
+                     n_perm=args.n_perm, eval_n=args.eval_n, block_size=args.block_size, random_state=args.seed)
+    n_pass = sum(r["passed"] for r in rows)
+    print(f"psytwill space check [{fit.block}, k={fit.k}] on {rows[0]['n_rows']} rows: {n_pass}/{len(rows)} members pass")
+    for r in rows:
+        print(f"  {r['member']:<18} R2 {r['r2']:.3f}  overlap {r['overlap']:.3f} (null {r['null_mean']:.3f}, p={r['overlap_p']:.3f})  "
+              f"{'pass' if r['passed'] else 'FAIL'}")
+    if args.output:
+        import pandas as pd
+
+        pd.DataFrame(rows).to_csv(args.output, index=False)
+        print(f"  {args.output}")
+    if n_pass < len(rows):
+        raise SpaceError(f"{len(rows) - n_pass} member(s) not subsumed")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -659,6 +811,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output table (.parquet preferred, .csv/.tsv); <stem>.meta.json alongside",
     )
     tl.set_defaults(func=_run_timelines)
+
+    sp = sub.add_parser(
+        "space",
+        help="Private-block fits (psytwill-space v0.1): fit | project | check",
+    )
+    spsub = sp.add_subparsers(dest="space_verb", required=True)
+
+    def _space_common(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--features", nargs="+", required=True, help="`psytwill features` table(s)")
+        q.add_argument("--key", default="stimulus_id", help="row grain, comma-separated (default stimulus_id)")
+        q.add_argument("--window", type=float, help="bin `time` at this width (needs time in --key)")
+        q.add_argument("--exclude-ids", help="file of stimulus_ids to drop (one per line)")
+        q.add_argument("--groups-from-label", action="store_true",
+                       help="grouped folds / block nulls keyed on the first key column (clip id)")
+
+    def _space_criterion(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--r2-min", type=float, default=0.5)
+        q.add_argument("--alpha", type=float, default=0.01)
+        q.add_argument("--k-nn", type=int, default=20)
+        q.add_argument("--n-perm", type=int, default=250)
+        q.add_argument("--eval-n", type=int, default=5000, help="rows per fold for the kNN overlap (0 = all)")
+        q.add_argument("--block-size", type=int, help="block-permutation width for temporal grids")
+        q.add_argument("--seed", type=int, default=0)
+
+    f = spsub.add_parser("fit", help="fit one private block and freeze it")
+    _space_common(f)
+    f.add_argument("--block", required=True, help="V | A | L (battery modality) or a custom name with --members")
+    f.add_argument("--members", help="comma-separated member spaces (default: the block's battery members present)")
+    f.add_argument("--k-schedule", help="comma-separated k candidates (default 8,16,...,256 below the PR bound)")
+    f.add_argument("--n-splits", type=int, default=5)
+    _space_criterion(f)
+    f.add_argument("-o", "--output", required=True, help="output directory")
+    f.add_argument("--stem", help="file stem (default <block>_v1)")
+    f.set_defaults(func=_run_space_fit)
+
+    pr = spsub.add_parser("project", help="apply a frozen block to a features table")
+    _space_common(pr)
+    pr.add_argument("--space", required=True, help="the fit's .json manifest")
+    pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
+    pr.set_defaults(func=_run_space_project)
+
+    ck = spsub.add_parser("check", help="the subsumption criterion on any table, no refit")
+    _space_common(ck)
+    ck.add_argument("--space", required=True, help="the fit's .json manifest")
+    _space_criterion(ck)
+    ck.add_argument("-o", "--output", help="per-member CSV")
+    ck.set_defaults(func=_run_space_check)
 
     return parser
 
