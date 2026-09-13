@@ -165,3 +165,89 @@ class TestNaNPolicy:
         assert np.isfinite(S).all() and S.shape[1] == fit.k
         rows = check_fit(fit, sp, n_perm=150, eval_n=None, k_nn=10)
         assert all(r["passed"] for r in rows)
+
+
+class TestRankMetricRule:
+    """Cosine neighbour graphs are degenerate below whitened rank 3.
+
+    In one dimension cosine similarity takes only +/-1, so every pair ties and
+    the stable argsort hands back the same index list for every row. The graph
+    is then a constant and its overlap with anything is chance. DECIDED
+    2026-09-12: score those members with Euclidean neighbours instead.
+    """
+
+    def test_metric_selected_by_rank(self):
+        from psytwill.space import EUCLIDEAN_RANK_BELOW, metric_for_rank
+
+        assert EUCLIDEAN_RANK_BELOW == 3
+        assert [metric_for_rank(r) for r in (1, 2)] == ["euclidean", "euclidean"]
+        assert [metric_for_rank(r) for r in (3, 4, 91)] == ["cosine"] * 3
+
+    def test_cosine_graph_is_constant_on_a_one_column_member(self):
+        """The defect itself, pinned: an all-positive 1-d member yields one
+        neighbour set for (almost) every row, so overlap cannot beat its null."""
+        from collections import Counter
+
+        from psytwill.compare import knn_indices
+
+        rng = np.random.default_rng(0)
+        y = 5.0 + 2.0 * rng.normal(size=(N, 1))  # an all-positive rating scale
+        cos = [tuple(r) for r in knn_indices(y, k=10, metric="cosine")]
+        euc = [tuple(r) for r in knn_indices(y, k=10, metric="euclidean")]
+        assert Counter(cos).most_common(1)[0][1] / len(cos) > 0.95  # ~one set
+        assert len(set(euc)) == len(euc)  # a genuine ordering, all distinct
+
+    def test_rank_one_member_subsumes_under_the_rule(self, members):
+        """A 1-d member that is a clean read-out of the shared latent must pass.
+
+        Under cosine it cannot, at any k -- which is what stalled the 2026-09-10
+        V fit -- so this is the regression test for the rule.
+        """
+        sp, Z = members
+        rng = np.random.default_rng(7)
+        y = Z @ rng.normal(size=Z.shape[1]) + 0.02 * rng.normal(size=Z.shape[0])
+        sp = dict(sp)
+        sp["d"] = SpaceMatrix(name="d", labels=sp["a"].labels,
+                              X=(10.0 + y)[:, None], features=["d_000"])
+        fit = fit_block(sp, ["a", "b", "c", "d"], block="V", **_fit_kwargs())
+        assert fit.map.whiteners["d"].rank == 1
+        assert fit.manifest["per_member"]["d"]["metric"] == "euclidean"
+        assert fit.manifest["per_member"]["a"]["metric"] == "cosine"
+        assert fit.manifest["per_member"]["d"]["passed_all_folds"]
+        assert fit.manifest["subsumes_all_members"]
+
+
+class TestPRBasisAndReporting:
+    """The bound is summed on the same basis as the whitening (DECIDED
+    2026-09-12), and the numbers that carry the compression claim are
+    reported alongside it."""
+
+    def test_bound_matches_the_whitener_participation_ratios(self, members, tmp_path):
+        sp, _ = members
+        fit = fit_block(sp, list(sp), block="V", **_fit_kwargs())
+        assert fit.manifest["pr_basis"] == "correlation"
+        pr_sum = sum(fit.map.whiteners[m].participation_ratio for m in fit.members)
+        assert fit.manifest["pr_sum_bound"] == pytest.approx(pr_sum)
+        # and the persisted member_pr must agree, or a reader can derive two bounds
+        _, manifest, _ = save_fit(fit, tmp_path, stem="V_v0.1")
+        import json
+
+        meta = json.loads(manifest.read_text())
+        assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
+        assert meta["space_schema_version"] == "1.1"
+
+    def test_compression_numbers_are_reported(self, members):
+        sp, _ = members
+        fit = fit_block(sp, list(sp), block="V", **_fit_kwargs())
+        man = fit.manifest
+        assert man["n_raw_columns"] == 64 + 12 + 6
+        assert man["concat_rank"] >= man["k"]
+        # the block's own effective dimensionality sits at or below its rank
+        assert 0 < man["block_pr"] <= man["concat_rank"]
+
+    def test_eval_rows_recorded_per_member(self, members):
+        sp, _ = members
+        fit = fit_block(sp, list(sp), block="V", **_fit_kwargs())
+        for m in fit.members:
+            rows = fit.manifest["per_member"][m]["eval_rows"]
+            assert rows and all(r > 0 for r in rows)

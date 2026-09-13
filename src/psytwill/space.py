@@ -52,7 +52,23 @@ from psytwill.exceptions import SpaceError
 from psytwill.store import SpaceMatrix, align_spaces
 
 DEFAULT_K_SCHEDULE: tuple[int, ...] = (8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256)
-SPACE_SCHEMA_VERSION = "1.0"
+#: Members whitened below this rank are scored with Euclidean neighbours
+#: instead of cosine. Cosine similarity in one dimension takes only the
+#: values +/-1, so every pair ties and `argsort(kind="stable")` returns the
+#: same index list for every row -- a constant graph whose overlap with
+#: anything is chance by construction. MEASURED 2026-09-12 on the V block:
+#: rank-1 members produced 21 distinct neighbour sets across 5,000 rows
+#: (99.6 %% sharing one), rank 2 produced 576 (88.5 %% sharing one), and
+#: every member of rank >= 4 produced 5,000 of 5,000. Euclidean restores a
+#: well-ordered graph for those members and leaves non-degenerate ones
+#: essentially unchanged.
+EUCLIDEAN_RANK_BELOW: int = 3
+
+
+def metric_for_rank(rank: int) -> str:
+    """Neighbour metric for a member whitened to ``rank`` directions."""
+    return "euclidean" if int(rank) < EUCLIDEAN_RANK_BELOW else "cosine"
+SPACE_SCHEMA_VERSION = "1.1"
 
 
 # --------------------------------------------------------------------------
@@ -177,16 +193,6 @@ def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: 
 DEFAULT_MAX_NAN_FRAC = 0.5
 
 
-def _impute(X: np.ndarray) -> np.ndarray:
-    """Column-mean imputation (for statistics that cannot skip rows)."""
-    X = np.asarray(X, dtype=float)
-    if not np.isnan(X).any():
-        return X
-    mean = np.nanmean(X, axis=0)
-    mean = np.where(np.isnan(mean), 0.0, mean)
-    return np.where(np.isnan(X), mean, X)
-
-
 def prepare_member(space: SpaceMatrix, *, max_nan_frac: float = DEFAULT_MAX_NAN_FRAC) -> tuple[SpaceMatrix, list[str]]:
     """Drop columns undefined in more than ``max_nan_frac`` of rows.
 
@@ -236,6 +242,8 @@ class MemberCheck:
     overlap_p: float
     null_mean: float
     n_rows: int
+    metric: str = "cosine"
+    eval_rows: int = 0
 
     def passes(self, r2_min: float, alpha: float) -> bool:
         return bool(self.r2 >= r2_min and self.overlap_p < alpha)
@@ -244,8 +252,14 @@ class MemberCheck:
 def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int, fold: int,
                  groups: Sequence | None = None, k_nn: int = DEFAULT_K, n_perm: int = 250,
                  eval_n: int | None = 5000, block_size: int | None = None,
-                 random_state: int = 0, alphas: Sequence[float] = DEFAULT_ALPHAS) -> MemberCheck:
-    """Ridge R^2 (scores -> space) and neighbour overlap vs null on the given rows."""
+                 random_state: int = 0, alphas: Sequence[float] = DEFAULT_ALPHAS,
+                 metric: str = "cosine") -> MemberCheck:
+    """Ridge R^2 (scores -> space) and neighbour overlap vs null on the given rows.
+
+    ``metric`` applies to BOTH sides of the neighbour comparison. The mixed
+    form (block cosine, member Euclidean) was measured to pass a member the
+    block recovers at R^2 = 0.10, so it is not offered.
+    """
     rr = ridge_predictivity(scores, space_X, groups=groups, alphas=alphas, random_state=random_state)
     n = scores.shape[0]
     if eval_n is not None and n > eval_n:
@@ -254,9 +268,10 @@ def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int
     else:
         sub = np.arange(n)
     nr = neighbor_overlap_null(scores[sub], space_X[sub], k=k_nn, n_perm=n_perm,
-                               block_size=block_size, random_state=random_state)
+                               metric=metric, block_size=block_size, random_state=random_state)
     return MemberCheck(member=member, k=k, fold=fold, r2=float(rr.r2), overlap=float(nr.observed),
-                       overlap_p=float(nr.p_value), null_mean=float(nr.null_mean), n_rows=int(n))
+                       overlap_p=float(nr.p_value), null_mean=float(nr.null_mean), n_rows=int(n),
+                       metric=metric, eval_rows=int(sub.size))
 
 
 
@@ -345,14 +360,22 @@ def fit_block(
             raise SpaceError("groups must have one entry per aligned row")
         g = np.asarray(groups)
 
-    # participation-ratio bound the block must come in under
-    pr = {m: float(participation_ratio(_impute(aligned[m].X))) for m in members}
-    pr_sum = float(sum(pr.values()))
-    # The walk runs up to the concatenation's own rank (sum of whitened ranks);
-    # the summed participation ratio is REPORTED as the Settles-when bound,
-    # not used as a cap: PR under-counts a space's rank whenever its
-    # eigenvalues are unequal, so a cap at PR can make a fit infeasible by
-    # construction (a 4-latent member alone has PR ~3.7).
+    # The walk runs up to the concatenation's own rank (sum of whitened ranks).
+    # The summed participation ratio is REPORTED as the Settles-when bound, not
+    # used as a cap: PR under-counts a space's rank whenever its eigenvalues are
+    # unequal, so a cap at PR can make a fit infeasible by construction (a
+    # 4-latent member alone has PR ~3.7).
+    #
+    # PR BASIS (DECIDED 2026-09-12). The bound is summed over the SAME
+    # participation ratios the whiteners use -- computed on the z-scored
+    # (correlation) matrix in `fit_whitener` -- not over raw-covariance PRs.
+    # Before this, `fit_block` measured raw X while `fit_whitener` measured Z,
+    # so `k` counted correlation-basis directions and the bound counted
+    # covariance-basis ones. For a scale-skewed member the two differ wildly
+    # (V's `places`: 5.07 raw vs 90.37 z-scored), which made the verdict depend
+    # on which key a reader opened. The whitening is what is frozen into the
+    # weights, so the bound follows it. Raw-covariance PR remains the basis of
+    # the Contract B section 4.4 space manifest; `pr_basis` names which is which.
     folds = _folds(n, n_splits, g, random_state)
     fold_maps = [fit_block_map(aligned, members, train) for train, _ in folds]
     k_top = min(fm.k_max for fm in fold_maps)
@@ -373,7 +396,8 @@ def fit_block(
                     progress(step, n_steps, f"k={k} fold={fi} {m}")
                 mc = check_member(S, aligned[m].X[test], member=m, k=k, fold=fi, groups=gt,
                                   k_nn=k_nn, n_perm=n_perm, eval_n=eval_n, block_size=block_size,
-                                  random_state=random_state)
+                                  random_state=random_state,
+                                  metric=metric_for_rank(fold_maps[fi].whiteners[m].rank))
                 row = asdict(mc)
                 row["passed"] = mc.passes(r2_min, alpha)
                 curve.append(row)
@@ -390,12 +414,18 @@ def fit_block(
 
     final = fit_block_map(aligned, members, np.arange(n), k_max=chosen)
     chosen = min(chosen, final.k_max)  # the concatenation may have fewer directions than k
+    pr = {m: float(final.whiteners[m].participation_ratio) for m in members}
+    pr_sum = float(sum(pr.values()))
+    lam = np.asarray(final.block_eigenvalues, dtype=float)
+    block_pr = float(lam.sum() ** 2 / (lam ** 2).sum()) if lam.size and lam.sum() > 0 else 0.0
     per_member = {}
     for m in members:
         rows = [r for r in curve if r["member"] == m and r["k"] == chosen]
         per_member[m] = {
             "participation_ratio": pr[m],
             "whitened_rank": final.whiteners[m].rank,
+            "metric": metric_for_rank(final.whiteners[m].rank),
+            "eval_rows": [r["eval_rows"] for r in rows],
             "dim": aligned[m].dim,
             "dropped_columns": dropped_columns.get(m, []),
             "nan_fraction_kept": float(np.isnan(aligned[m].X).mean()),
@@ -413,7 +443,17 @@ def fit_block(
         "k": chosen,
         "subsumes_all_members": subsumed,
         "pr_sum_bound": pr_sum,
+        "pr_basis": "correlation",
         "k_below_pr_bound": chosen < pr_sum,
+        # Reported because the bound above has little teeth once it is on the
+        # same basis as the ranks: sum(PR) is within the ceiling rounding of
+        # sum(ceil(PR)), which IS the concatenation's rank, so "k < sum(PR)"
+        # is close to "k < full rank". These two are the compression the block
+        # actually achieves, and are what the Contract B section 4.4 row and any
+        # methods section should quote.
+        "block_pr": block_pr,
+        "n_raw_columns": int(sum(aligned[m].dim for m in members)),
+        "concat_rank": int(final.k_max),
         "n_rows": n,
         "n_splits": n_splits,
         "grouped": g is not None,
@@ -504,7 +544,8 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
     out = []
     for m in fit.members:
         mc = check_member(S, aligned[m].X, member=m, k=fit.k, fold=0, groups=groups, k_nn=k_nn,
-                          n_perm=n_perm, eval_n=eval_n, block_size=block_size, random_state=random_state)
+                          n_perm=n_perm, eval_n=eval_n, block_size=block_size, random_state=random_state,
+                          metric=metric_for_rank(fit.map.whiteners[m].rank))
         row = asdict(mc)
         row["passed"] = mc.passes(r2_min, alpha)
         out.append(row)
