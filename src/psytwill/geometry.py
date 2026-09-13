@@ -89,6 +89,7 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "dim",
     "n",
     "participation_ratio",
+    "pr_basis",
     "pr_fraction",
     "modality",
     "extractor",
@@ -297,6 +298,15 @@ def compare_spaces(
                 "dim": spaces[n].dim,
                 "n": spaces[n].n,
                 "participation_ratio": participation_ratio(spaces[n].X),
+                # Contract B section 4.4: a participation ratio must name its
+                # basis. compare.participation_ratio centers columns without
+                # scaling them, so this manifest is the COVARIANCE basis -- the
+                # space as stored. A psytwill block fit publishes the
+                # CORRELATION basis instead (space.py), because its bound has to
+                # follow the whitening the fit applies. The same space can read
+                # 5.07 here and 90.37 there; without this field a consumer has
+                # no way to know the two were never comparable.
+                "pr_basis": "covariance",
                 "pr_fraction": participation_ratio(spaces[n].X) / spaces[n].dim,
                 "modality": spaces[n].modality,
                 "extractor": spaces[n].extractor,

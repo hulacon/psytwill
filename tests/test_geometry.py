@@ -85,6 +85,35 @@ def test_manifest_reports_effective_not_nominal_dimensionality(rng):
     assert m.loc["flat", "pr_fraction"] == pytest.approx(0.2, abs=1e-6)
 
 
+def test_manifest_names_its_participation_ratio_basis(rng):
+    """Contract B section 4.4: a published participation ratio names its basis.
+
+    The manifest is the covariance basis (columns centered, not scaled); a
+    psytwill block fit publishes the correlation basis. The same space reads
+    5.07 one way and 90.37 the other, so a consumer that cannot tell them
+    apart can silently compare or average two incomparable numbers. Pinning
+    the literal, not just the column, is what makes the field load-bearing.
+    """
+    from psytwill.space import fit_block
+
+    scaled = rng.randn(60, 4) * np.array([100.0, 1.0, 1.0, 1.0])
+    res = compare_spaces({"a": space("a", scaled), "b": space("b", rng.randn(60, 4))},
+                         n_permutations=0)
+    assert set(res.manifest["pr_basis"]) == {"covariance"}
+
+    # The column scaling above makes the two bases disagree, which is the whole
+    # reason the field exists: a covariance PR is dragged toward 1 by one loud
+    # column, a correlation PR is not.
+    m = res.manifest.set_index("space")
+    assert m.loc["a", "participation_ratio"] < 2.0
+    assert m.loc["b", "participation_ratio"] > 3.0
+
+    # And the other surface says the other word, so the two never collide.
+    fit = fit_block({"a": space("a", scaled)}, ["a"], n_splits=3, n_perm=150,
+                    eval_n=None, k_nn=10, k_schedule=(2, 4))
+    assert fit.manifest["pr_basis"] == "correlation"
+
+
 # --- the cached neighbour graph is the same measure ------------------------
 
 
