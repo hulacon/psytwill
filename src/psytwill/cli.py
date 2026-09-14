@@ -360,6 +360,7 @@ def _run_decompose(args: argparse.Namespace) -> None:
 
 def _run_viz_movies(args: argparse.Namespace) -> None:
     from psytwill.viz.build import build_movies_bundle
+    from psytwill.viz.movies import parse_projection_spec
 
     page = build_movies_bundle(
         features_dir=args.features_dir,
@@ -367,6 +368,7 @@ def _run_viz_movies(args: argparse.Namespace) -> None:
         out_dir=args.output,
         registry=args.registry,
         slugs=args.slugs.split(",") if args.slugs else None,
+        projections=parse_projection_spec(args.projections),
     )
     print(f"psytwill viz movies -> {page}")
 
@@ -868,6 +870,12 @@ def build_parser() -> argparse.ArgumentParser:
         "titles and durations",
     )
     vm.add_argument("--slugs", help="comma-separated film subset (default all)")
+    vm.add_argument(
+        "--projections",
+        help="per-modality embedding model for the 2D MDS trajectories, "
+        "e.g. 'visual=clip,audio=clap,text=fasttext' (the default); "
+        "'none' disables them",
+    )
     vm.add_argument(
         "-o",
         "--output",

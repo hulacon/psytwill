@@ -38,14 +38,21 @@ def _relative_media_root(out_dir: Path, films_dir: Path) -> str:
 def build_movies_bundle(features_dir: Path, films_dir: Path,
                         out_dir: Path | None = None,
                         registry: Path | None = None,
-                        slugs: list[str] | None = None) -> Path:
-    """Build the bundle; returns the path of the written page."""
+                        slugs: list[str] | None = None,
+                        projections: dict[str, str] | None = None) -> Path:
+    """Build the bundle; returns the path of the written page.
+
+    ``projections`` maps modality -> embedding model for the per-film 2D
+    trajectories (default ``movies.PROJECTION_DEFAULTS``; ``{}`` disables).
+    """
     features_dir = Path(features_dir)
     films_dir = Path(films_dir)
     if not films_dir.is_dir():
         raise InputError(f"{films_dir} does not exist — pass the directory "
                          "holding the per-film feature folders (movies/<slug>/)")
     out_dir = Path(out_dir) if out_dir else films_dir / "viz" / "timeline"
+    if projections is None:
+        projections = dict(movies_mod.PROJECTION_DEFAULTS)
 
     tables = movies_mod.load_tables(features_dir)
     available = movies_mod.film_slugs(tables)
@@ -58,16 +65,26 @@ def build_movies_bundle(features_dir: Path, films_dir: Path,
 
     registry_rows = movies_mod.load_registry(registry) if registry else {}
 
-    data_dir = out_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    index: list[dict] = []
+    slug_media: dict[str, dict] = {}
     for slug in available:
         if not (films_dir / slug).is_dir():
             warnings.warn(f"{films_dir / slug} missing — {slug} is in the "
                           "features tables but has no film directory; skipped")
             continue
+        slug_media[slug] = movies_mod.film_media(films_dir / slug)
+
+    proj_by_slug = (movies_mod.compute_projections(features_dir, projections,
+                                                   slug_media)
+                    if projections else {})
+
+    data_dir = out_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    index: list[dict] = []
+    for slug, media in slug_media.items():
         payload = movies_mod.film_payload(slug, tables, films_dir,
-                                          registry_rows.get(slug))
+                                          registry_rows.get(slug),
+                                          media=media,
+                                          projections=proj_by_slug.get(slug))
         (data_dir / f"{slug}.js").write_text(movies_mod.payload_js(payload),
                                              encoding="utf-8")
         index.append({"slug": slug, "title": payload["title"],

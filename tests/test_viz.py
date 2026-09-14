@@ -52,6 +52,7 @@ def features_dir(tmp_path):
                 [(0.0, None), (0.5, None), (1.0, None)],
                 value_str=["a scene", "a scene", "another scene"])
         + _rows("film-b", "motion", "motion_energy", grid)
+        + _rows("film-b", "clip", "clip_000", grid)
     )
     pd.DataFrame(frames, columns=COLUMNS).to_parquet(
         d / "movies_frames_features.parquet")
@@ -64,11 +65,14 @@ def features_dir(tmp_path):
 
     # word grain: word2psy-style GLOBAL chunk_idx (film-a starts at 100)
     # and global word_idx, one extra token vs the transcript CSV in chunk 0
-    words = _rows("film-a", "surprise", "surprise_bits",
-                  [(None, 1.0), (None, 2.0), (None, 3.0), (None, 4.0)],
-                  modality="text",
-                  chunk_idx=[100, 100, 100, 101],
-                  word_idx=[40, 41, 42, 43])
+    word_points = [(None, 1.0), (None, 2.0), (None, 3.0), (None, 4.0)]
+    chunk_idx, word_idx = [100, 100, 100, 101], [40, 41, 42, 43]
+    words = _rows("film-a", "surprise", "surprise_bits", word_points,
+                  modality="text", chunk_idx=chunk_idx, word_idx=word_idx)
+    for dim in ("minilm_000", "minilm_001"):
+        words += _rows("film-a", "minilm", dim,
+                       [(None, float(i)) for i in range(4)],
+                       modality="text", chunk_idx=chunk_idx, word_idx=word_idx)
     pd.DataFrame(words, columns=COLUMNS).to_parquet(
         d / "movies_transcript_words_features.parquet")
     return d
@@ -179,6 +183,57 @@ def test_build_bundle_slug_subset_and_unknown(features_dir, films_dir, tmp_path)
     assert not (out / "data" / "film-a.js").exists()
     with pytest.raises(InputError, match="film-zz"):
         build_movies_bundle(features_dir, films_dir, out_dir=out, slugs=["film-zz"])
+
+
+def test_parse_projection_spec():
+    assert M.parse_projection_spec(None) == M.PROJECTION_DEFAULTS
+    assert M.parse_projection_spec("none") == {}
+    assert M.parse_projection_spec("visual=dinov2") == {"visual": "dinov2"}
+    with pytest.raises(InputError, match="haptic"):
+        M.parse_projection_spec("haptic=touch2psy")
+    with pytest.raises(InputError, match="not"):
+        M.parse_projection_spec("clip")
+
+
+def test_projections_time_and_word_grain(features_dir, films_dir):
+    media = {s: M.film_media(films_dir / s) for s in ("film-a", "film-b")}
+    proj = M.compute_projections(
+        features_dir, {"visual": "clip", "text": "minilm"}, media)
+
+    vis = next(e for e in proj["film-a"] if e["m"] == "visual")
+    assert vis["align"] == "times" and vis["model"] == "clip"
+    assert vis["t"] == [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    assert len(vis["xy"]) == 6 and len(vis["xy"][0]) == 2
+
+    txt = next(e for e in proj["film-a"] if e["m"] == "text")
+    assert txt["align"] == "word"
+    # 3 CSV words, all reached through the global-index rebase (the extra
+    # word2psy token in chunk 0 is dropped)
+    assert len(txt["xy"]) == 3 and all(c is not None for c in txt["xy"])
+
+    # film-b has no transcript: only the visual trajectory
+    assert [e["m"] for e in proj["film-b"]] == ["visual"]
+
+
+def test_projections_missing_model_warns_not_raises(features_dir, films_dir):
+    media = {"film-a": M.film_media(films_dir / "film-a")}
+    with pytest.warns(UserWarning, match="dinov2"):
+        proj = M.compute_projections(features_dir, {"visual": "dinov2"}, media)
+    assert proj["film-a"] == []
+
+
+def test_build_bundle_ships_projections(features_dir, films_dir, tmp_path):
+    out = tmp_path / "bundle"
+    build_movies_bundle(features_dir, films_dir, out_dir=out,
+                        projections={"visual": "clip"})
+    body = json.loads(re.search(
+        r"= (\{.*\});", (out / "data" / "film-a.js").read_text(), re.S).group(1))
+    assert [e["model"] for e in body["proj"]] == ["clip"]
+
+    build_movies_bundle(features_dir, films_dir, out_dir=out, projections={})
+    body = json.loads(re.search(
+        r"= (\{.*\});", (out / "data" / "film-a.js").read_text(), re.S).group(1))
+    assert body["proj"] == []
 
 
 def test_registry_titles(features_dir, films_dir, tmp_path):

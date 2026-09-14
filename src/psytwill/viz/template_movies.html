@@ -14,6 +14,7 @@
   --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
   --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
   --word-fill: #e1e0d9; --word-hot: #0b0b0b;
+  --seq-lo: #b7d3f6; --seq-hi: #104281;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -25,6 +26,7 @@
     --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
     --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
     --word-fill: #2c2c2a; --word-hot: #ffffff;
+    --seq-lo: #184f95; --seq-hi: #86b6ef;
   }
 }
 :root[data-theme="dark"] {
@@ -36,6 +38,7 @@
   --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
   --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
   --word-fill: #2c2c2a; --word-hot: #ffffff;
+  --seq-lo: #184f95; --seq-hi: #86b6ef;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -98,6 +101,19 @@ canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
 #capBox { color: var(--ink-2); font-size: 13px; min-height: 2.6em; margin: 8px 0; }
 #capBox .lbl { color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; display:block; }
 audio { width: 100%; margin: 4px 0 10px; }
+#projBox[hidden] { display: none; }
+#projHead { display: flex; align-items: center; gap: 8px; margin: 12px 0 6px; }
+#projHead .lbl {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--ink-3); font-weight: 600;
+}
+#projHead select { font-size: 12px; padding: 2px 6px; }
+#projT { margin-left: auto; font-size: 12px; color: var(--ink-2);
+  font-variant-numeric: tabular-nums; }
+#projCv {
+  width: 100%; height: 280px; background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
 #transcript { font-size: 13.5px; color: var(--ink-2); }
 #transcript h2, #capH { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
   color: var(--ink-3); margin: 12px 0 6px; font-weight: 600; }
@@ -138,6 +154,14 @@ audio { width: 100%; margin: 4px 0 10px; }
     <div id="frameBox"><img id="frameImg" alt="film frame"><span class="t" id="curT">0.0 s</span></div>
     <audio id="audio" controls preload="auto"></audio>
     <div id="capBox"><span class="lbl">frame caption (viz2psy)</span><span id="capText">—</span></div>
+    <div id="projBox" hidden>
+      <div id="projHead">
+        <span class="lbl">trajectory (mds)</span>
+        <select id="projSel" aria-label="projection model"></select>
+        <span id="projT"></span>
+      </div>
+      <canvas id="projCv"></canvas>
+    </div>
     <div id="transcript"><h2>transcript (aud2psy)</h2><div id="chunks"></div></div>
   </aside>
 </main>
@@ -201,7 +225,7 @@ function onFilm(slug) {
   state.sel = keep;
   if (!state.sel.length)
     DEFAULTS.forEach(([m, f]) => { const s = byKey[m + "/" + f]; if (s) addSeries(s, true); });
-  buildTranscript(p);
+  buildTranscript(p); setupProj(p);
   renderChips(); layout(); update(true);
 }
 
@@ -468,6 +492,125 @@ function buildTranscript(p) {
   });
 }
 
+/* ---------- trajectory (MDS) pane ---------- */
+const projCv = $("projCv"), projCtx = projCv.getContext("2d");
+let projHover = null;
+
+function setupProj(p) {
+  const sel = $("projSel"); sel.innerHTML = "";
+  $("projBox").hidden = !p.proj.length;
+  p.proj.forEach((e, i) => {
+    const o = document.createElement("option");
+    o.value = i; o.textContent = MODGLYPH[e.m] + " " + e.model;
+    sel.appendChild(o);
+  });
+  state.projIdx = 0; projHover = null;
+  drawProj();
+}
+
+function projPoints() {
+  const p = state.payload;
+  if (!p || !p.proj.length) return null;
+  const e = p.proj[state.projIdx || 0];
+  if (e._pts) return e._pts;
+  const t = [], xy = [];
+  if (e.align === "word") {
+    e.xy.forEach((c, i) => {
+      const w = p.media.words[i];
+      if (c && w) { t.push((w[0] + w[1]) / 2); xy.push(c); }
+    });
+  } else {
+    e.t.forEach((tt, i) => { t.push(tt); xy.push(e.xy[i]); });
+  }
+  e._pts = {t, xy};
+  return e._pts;
+}
+
+function lerpColor(a, b, f) {
+  const pa = [1, 3, 5].map(i => parseInt(a.slice(i, i + 2), 16));
+  const pb = [1, 3, 5].map(i => parseInt(b.slice(i, i + 2), 16));
+  return "rgb(" + pa.map((v, i) => Math.round(v + (pb[i] - v) * f)).join(",") + ")";
+}
+
+function drawProj() {
+  const pts = projPoints();
+  if (!pts) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = projCv.clientWidth, H = projCv.clientHeight;
+  if (!W) return;
+  projCv.width = W * dpr; projCv.height = H * dpr;
+  projCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  projCtx.clearRect(0, 0, W, H);
+  const {t, xy} = pts;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  xy.forEach(([x, y]) => {
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+  });
+  const PAD = 14;
+  const sx = x => PAD + (x - x0) / (x1 - x0 || 1) * (W - 2 * PAD);
+  const sy = y => H - PAD - (y - y0) / (y1 - y0 || 1) * (H - 2 * PAD);
+
+  // the path through embedding space, in time order
+  projCtx.strokeStyle = css("--grid"); projCtx.lineWidth = 1;
+  projCtx.beginPath();
+  xy.forEach(([x, y], i) =>
+    i ? projCtx.lineTo(sx(x), sy(y)) : projCtx.moveTo(sx(x), sy(y)));
+  projCtx.stroke();
+
+  // points, sequential ramp by time
+  const lo = css("--seq-lo"), hi = css("--seq-hi");
+  const n = xy.length;
+  xy.forEach(([x, y], i) => {
+    projCtx.fillStyle = lerpColor(lo, hi, n > 1 ? i / (n - 1) : 0);
+    projCtx.beginPath(); projCtx.arc(sx(x), sy(y), 2.5, 0, 7); projCtx.fill();
+  });
+
+  // hovered point, then the playhead's point on top
+  const mark = (idx, r, w) => {
+    const [x, y] = xy[idx];
+    projCtx.strokeStyle = css("--ink-1"); projCtx.lineWidth = w;
+    projCtx.beginPath(); projCtx.arc(sx(x), sy(y), r, 0, 7); projCtx.stroke();
+  };
+  if (projHover != null) mark(projHover, 5, 1);
+  mark(nearestProjIndex(state.cursor), 5.5, 2);
+  $("projT").textContent = projHover != null
+    ? fmtT(t[projHover]) + " (click to seek)" : fmtT(t[nearestProjIndex(state.cursor)]);
+  projCv._scale = {sx, sy};
+}
+
+function nearestProjIndex(tt) {
+  const pts = projPoints();
+  if (!pts) return 0;
+  const t = pts.t;
+  let lo = 0, hi = t.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; (t[m] <= tt ? lo = m : hi = m); }
+  return Math.abs(t[lo] - tt) <= Math.abs(t[hi] - tt) ? lo : hi;
+}
+
+function projPointAt(ev) {
+  const pts = projPoints();
+  if (!pts || !projCv._scale) return null;
+  const r = projCv.getBoundingClientRect();
+  const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const {sx, sy} = projCv._scale;
+  let best = null, bestD = 12 * 12;
+  pts.xy.forEach(([x, y], i) => {
+    const d = (sx(x) - mx) ** 2 + (sy(y) - my) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+projCv.addEventListener("mousemove", ev => { projHover = projPointAt(ev); drawProj(); });
+projCv.addEventListener("mouseleave", () => { projHover = null; drawProj(); });
+projCv.addEventListener("click", ev => {
+  const i = projPointAt(ev);
+  if (i != null) seek(projPoints().t[i]);
+});
+$("projSel").addEventListener("change", ev => {
+  state.projIdx = +ev.target.value; projHover = null; drawProj();
+});
+
 /* ---------- interaction ---------- */
 function seek(t) {
   t = Math.max(0, Math.min(state.payload.duration, t));
@@ -476,7 +619,7 @@ function seek(t) {
   update();
 }
 function update(full) {
-  draw(); updateDetail();
+  draw(); updateDetail(); drawProj();
   if (full) refreshPicker();
 }
 
@@ -543,7 +686,7 @@ function tick() {
 
 window.addEventListener("resize", () => { layout(); draw(); });
 const mq = window.matchMedia("(prefers-color-scheme: dark)");
-if (mq.addEventListener) mq.addEventListener("change", () => { renderChips(); draw(); });
+if (mq.addEventListener) mq.addEventListener("change", () => { renderChips(); draw(); drawProj(); });
 
 /* ---------- boot ---------- */
 const sel = $("filmSel");

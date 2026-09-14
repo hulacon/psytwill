@@ -63,6 +63,13 @@ TABLES = {
 CAPTION_MODEL = "caption"
 GRID_TOLERANCE = 1e-6
 
+#: modality -> (table stem, default embedding model) for the 2D trajectory
+#: projections. One model per modality; override via --projections.
+PROJECTION_STEMS = {"visual": "movies_frames",
+                    "audio": "movies_audio_frames",
+                    "text": "movies_transcript_words"}
+PROJECTION_DEFAULTS = {"visual": "clip", "audio": "clap", "text": "fasttext"}
+
 
 def _round5(x: float) -> float:
     """5 significant digits — plenty for a pixel plot, much smaller JSON."""
@@ -188,6 +195,115 @@ def _captions(sub: pd.DataFrame) -> list[list]:
     return out
 
 
+def _mds_2d(matrix: np.ndarray) -> np.ndarray:
+    """viz2psy-parity projection: StandardScaler -> metric MDS, seed 42."""
+    from sklearn.manifold import MDS
+    from sklearn.preprocessing import StandardScaler
+
+    scaled = StandardScaler().fit_transform(matrix)
+    return MDS(n_components=2, metric_mds=True, random_state=42, n_init=1,
+               init="random", normalized_stress="auto").fit_transform(scaled)
+
+
+def compute_projections(features_dir: Path, spec: dict[str, str],
+                        slug_media: dict[str, dict]) -> dict[str, list[dict]]:
+    """Per-film 2D MDS trajectories of one embedding model per modality.
+
+    Raw embedding dimensions never reach the page (the payload rule); this
+    is where they become the derived artifact that does — per-film 2D
+    coordinates, time-aligned like any other series. Returns
+    ``{slug: [proj entries]}``. A modality whose table or model is absent
+    is skipped with a warning, not an error.
+    """
+    import pyarrow.parquet as pq
+
+    features_dir = Path(features_dir)
+    out: dict[str, list[dict]] = {slug: [] for slug in slug_media}
+    for modality, model in spec.items():
+        stem = PROJECTION_STEMS[modality]
+        path = features_dir / f"{stem}_features.parquet"
+        if not path.exists():
+            warnings.warn(f"no {path.name} — {modality} projection skipped")
+            continue
+        names = pq.read_table(path, columns=["feature"])["feature"].unique().to_pylist()
+        dims = sorted(n for n in names
+                      if re.fullmatch(re.escape(model) + r"_\d{3,4}", n))
+        if not dims:
+            warnings.warn(f"{path.name} has no {model}_NNN embedding columns "
+                          f"— {modality} projection skipped")
+            continue
+        word_grain = stem == "movies_transcript_words"
+        cols = ["stimulus_id", "time", "chunk_idx", "word_idx", "feature", "value"]
+        df = pd.read_parquet(path, columns=cols, filters=[("feature", "in", dims)])
+        for slug, media in slug_media.items():
+            sub = df[df["stimulus_id"] == slug]
+            if sub.empty:
+                continue
+            if word_grain:
+                entry = _project_words(sub, modality, model, media)
+            else:
+                entry = _project_times(sub, modality, model)
+            if entry is not None:
+                out[slug].append(entry)
+                print(f"{slug}: {modality}/{model} trajectory "
+                      f"({len(entry['xy'])} points)")
+        del df
+    return out
+
+
+def _project_times(sub: pd.DataFrame, modality: str, model: str) -> dict | None:
+    wide = sub.pivot_table(index="time", columns="feature", values="value",
+                           sort=True).dropna()
+    if len(wide) < 3:
+        return None
+    xy = _mds_2d(wide.to_numpy(dtype=float))
+    return {"m": modality, "model": model, "align": "times",
+            "t": [_round5(float(t)) for t in wide.index],
+            "xy": [[_round5(x), _round5(y)] for x, y in xy]}
+
+
+def _project_words(sub: pd.DataFrame, modality: str, model: str,
+                   media: dict) -> dict | None:
+    """Word-grain trajectory, aligned to the payload's words like any
+    word series (same corpus-global chunk/word rebase)."""
+    sub = sub.assign(chunk_idx=sub["chunk_idx"].astype(int)
+                     - int(sub["chunk_idx"].min()))
+    chunk_base = sub.groupby("chunk_idx")["word_idx"].min().astype(int).to_dict()
+    wide = sub.pivot_table(index=["chunk_idx", "word_idx"], columns="feature",
+                           values="value", sort=True).dropna()
+    if len(wide) < 3:
+        return None
+    xy = _mds_2d(wide.to_numpy(dtype=float))
+    index = {(w[2], w[3]): i for i, w in enumerate(media["words"])}
+    aligned: list[list[float] | None] = [None] * len(media["words"])
+    for (chunk, word), (x, y) in zip(wide.index, xy):
+        pos = index.get((chunk, word - chunk_base.get(chunk, 0)))
+        if pos is not None:
+            aligned[pos] = [_round5(float(x)), _round5(float(y))]
+    if not any(p is not None for p in aligned):
+        return None
+    return {"m": modality, "model": model, "align": "word", "xy": aligned}
+
+
+def parse_projection_spec(arg: str | None) -> dict[str, str]:
+    """--projections 'visual=clip,audio=clap' / 'none' -> {modality: model}."""
+    if arg is None:
+        return dict(PROJECTION_DEFAULTS)
+    if arg.strip().lower() == "none":
+        return {}
+    spec: dict[str, str] = {}
+    for part in arg.split(","):
+        if "=" not in part:
+            raise InputError(f"--projections part {part!r} is not "
+                             "modality=model (or the word 'none')")
+        modality, model = (s.strip() for s in part.split("=", 1))
+        if modality not in PROJECTION_STEMS:
+            raise InputError(f"--projections modality {modality!r} not one of "
+                             f"{sorted(PROJECTION_STEMS)}")
+        spec[modality] = model
+    return spec
+
+
 def _read_csv(path: Path, required: list[str]) -> pd.DataFrame | None:
     if not path.exists():
         return None
@@ -252,14 +368,17 @@ def film_media(film_dir: Path) -> dict:
 
 
 def film_payload(slug: str, tables: dict[str, pd.DataFrame],
-                 films_dir: Path, registry_row: dict | None = None) -> dict:
+                 films_dir: Path, registry_row: dict | None = None,
+                 media: dict | None = None,
+                 projections: list[dict] | None = None) -> dict:
     """The complete viewer payload for one film."""
     film_dir = Path(films_dir) / slug
     if not film_dir.is_dir():
         raise InputError(f"{film_dir} does not exist — features tables name "
                          f"stimulus_id {slug!r} but the films directory has "
                          "no matching folder")
-    media = film_media(film_dir)
+    if media is None:
+        media = film_media(film_dir)
 
     word_index = {(w[2], w[3]): i for i, w in enumerate(media["words"])}
     chunk_index = {c[2]: i for i, c in enumerate(media["chunks"])}
@@ -316,6 +435,7 @@ def film_payload(slug: str, tables: dict[str, pd.DataFrame],
         "media": media,
         "captions": captions,
         "series": series,
+        "proj": projections or [],
     }
     if registry_row:
         payload["title"] = registry_row.get("movie_name") or slug
