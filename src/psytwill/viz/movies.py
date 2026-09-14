@@ -197,12 +197,21 @@ def _captions(sub: pd.DataFrame) -> list[list]:
 
 def _mds_2d(matrix: np.ndarray) -> np.ndarray:
     """viz2psy-parity projection: StandardScaler -> metric MDS, seed 42."""
+    import inspect
+
     from sklearn.manifold import MDS
     from sklearn.preprocessing import StandardScaler
 
     scaled = StandardScaler().fit_transform(matrix)
-    return MDS(n_components=2, metric_mds=True, random_state=42, n_init=1,
-               init="random", normalized_stress="auto").fit_transform(scaled)
+    # scikit-learn 1.8 renamed `metric` to `metric_mds` and added `init`;
+    # 1.8+ dropped Python 3.10, so on 3.10 we get <=1.7 and the old names.
+    params = inspect.signature(MDS.__init__).parameters
+    if "metric_mds" in params:
+        extra = {"metric_mds": True, "init": "random"}
+    else:
+        extra = {"metric": True}
+    return MDS(n_components=2, random_state=42, n_init=1,
+               normalized_stress="auto", **extra).fit_transform(scaled)
 
 
 def compute_projections(features_dir: Path, spec: dict[str, str],
