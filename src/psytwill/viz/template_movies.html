@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>psytwill · movies timeline</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb; --page: #f9f9f7;
+  --ink-1: #0b0b0b; --ink-2: #52514e; --ink-3: #898781;
+  --grid: #e1e0d9; --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+  --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
+  --word-fill: #e1e0d9; --word-hot: #0b0b0b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --ink-1: #ffffff; --ink-2: #c3c2b7; --ink-3: #898781;
+    --grid: #2c2c2a; --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+    --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+    --word-fill: #2c2c2a; --word-hot: #ffffff;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --page: #0d0d0d;
+  --ink-1: #ffffff; --ink-2: #c3c2b7; --ink-3: #898781;
+  --grid: #2c2c2a; --baseline: #383835;
+  --border: rgba(255,255,255,0.10);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+  --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+  --word-fill: #2c2c2a; --word-hot: #ffffff;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--page); color: var(--ink-1);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex; flex-direction: column;
+}
+header {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+}
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+header .sub { color: var(--ink-3); font-size: 12px; }
+select, input[type="search"] {
+  font: inherit; color: var(--ink-1); background: var(--surface-1);
+  border: 1px solid var(--baseline); border-radius: 6px; padding: 4px 8px;
+}
+main { flex: 1; display: flex; min-height: 0; }
+#left { flex: 1 1 62%; display: flex; flex-direction: column; min-width: 0; padding: 10px 0 10px 16px; }
+#detail {
+  flex: 0 0 36%; max-width: 480px; min-width: 300px; overflow-y: auto;
+  padding: 10px 16px; border-left: 1px solid var(--border);
+  background: var(--surface-1);
+}
+#pickerRow { display: flex; gap: 8px; align-items: center; position: relative; margin-bottom: 6px; }
+#chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 2px 8px 2px 6px; font-size: 12px; color: var(--ink-2);
+  background: var(--surface-1);
+}
+.chip .sw { width: 10px; height: 10px; border-radius: 3px; }
+.chip button {
+  all: unset; cursor: pointer; color: var(--ink-3); font-size: 13px;
+  line-height: 1; padding: 0 2px;
+}
+.chip button:hover { color: var(--ink-1); }
+#pickList {
+  position: absolute; top: 100%; left: 0; z-index: 5; width: min(420px, 90%);
+  max-height: 300px; overflow-y: auto; background: var(--surface-1);
+  border: 1px solid var(--baseline); border-radius: 8px; margin-top: 4px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.15); display: none;
+}
+#pickList div { padding: 5px 10px; cursor: pointer; font-size: 13px; }
+#pickList div:hover { background: var(--page); }
+#pickList .mod { color: var(--ink-3); font-size: 11px; margin-left: 6px; }
+#canvasWrap { flex: 1; min-height: 0; position: relative; }
+canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+#hint { color: var(--ink-3); font-size: 12px; padding: 4px 0; }
+#frameBox { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+#frameBox img { display: block; width: 100%; max-width: 100%; }
+#frameBox .t {
+  position: absolute; right: 8px; bottom: 8px; font-size: 12px;
+  color: #fff; background: rgba(0,0,0,0.55); padding: 1px 7px;
+  border-radius: 999px; font-variant-numeric: tabular-nums;
+}
+#capBox { color: var(--ink-2); font-size: 13px; min-height: 2.6em; margin: 8px 0; }
+#capBox .lbl { color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; display:block; }
+audio { width: 100%; margin: 4px 0 10px; }
+#transcript { font-size: 13.5px; color: var(--ink-2); }
+#transcript h2, #capH { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--ink-3); margin: 12px 0 6px; font-weight: 600; }
+#transcript p { margin: 0 0 10px; }
+#transcript .spk { color: var(--ink-3); font-size: 11px; margin-right: 6px; }
+#transcript span.w { cursor: pointer; border-radius: 3px; padding: 0 1px; }
+#transcript span.w:hover { background: var(--grid); }
+#transcript span.w.hot { background: var(--word-hot); color: var(--surface-1); }
+#noSeries {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; color: var(--ink-3); pointer-events: none;
+}
+#noSeries[hidden] { display: none; }
+.err { color: var(--ink-2); padding: 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>movies · feature timeline</h1>
+  <select id="filmSel" aria-label="film"></select>
+  <span class="sub" id="filmInfo"></span>
+  <span class="sub" style="margin-left:auto">psytwill __PSYTWILL_VERSION__</span>
+</header>
+<main>
+  <div id="left">
+    <div id="chips"></div>
+    <div id="pickerRow">
+      <input id="pickInput" type="search" placeholder="add feature — type to search (model or feature name)" style="flex:1" autocomplete="off">
+      <div id="pickList" role="listbox"></div>
+    </div>
+    <div id="canvasWrap">
+      <canvas id="cv"></canvas>
+      <div id="noSeries" hidden>select features above to plot lanes</div>
+    </div>
+    <div id="hint">click seeks · drag pans · wheel zooms · space plays · ←/→ step frames</div>
+  </div>
+  <aside id="detail">
+    <div id="frameBox"><img id="frameImg" alt="film frame"><span class="t" id="curT">0.0 s</span></div>
+    <audio id="audio" controls preload="auto"></audio>
+    <div id="capBox"><span class="lbl">frame caption (viz2psy)</span><span id="capText">—</span></div>
+    <div id="transcript"><h2>transcript (aud2psy)</h2><div id="chunks"></div></div>
+  </aside>
+</main>
+<script>
+"use strict";
+const INDEX = __PSYTWILL_INDEX__;
+const MEDIA_ROOT = "__MEDIA_ROOT__";
+const SLOTS = ["--s1","--s2","--s3","--s4","--s5","--s6","--s7","--s8"];
+const DEFAULTS = [["motion","motion_energy"],["loudness","loudness_db"],
+                  ["gpt2_surprisal","gpt2_surprisal"],["music_emotion","music_emotion_valence"]];
+const MODGLYPH = {visual:"V", audio:"A", text:"T"};
+
+window.PSYTWILL_VIZ = window.PSYTWILL_VIZ || {films:{}};
+const state = {
+  film: null, payload: null,
+  sel: [],            // [{key, series, slot}]
+  view: [0, 1],       // visible [t0, t1]
+  cursor: 0, hover: null,
+  playing: false, raf: 0,
+};
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+const audio = $("audio");
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmt = v => v == null ? "–" : (Math.abs(v) >= 1000 ? v.toFixed(0) : v.toPrecision(3));
+const fmtT = t => t.toFixed(1) + " s";
+
+function seriesKey(s) { return s.model + "/" + s.f; }
+function seriesLabel(s) {
+  const f = s.f.startsWith(s.model) ? s.f.slice(s.model.length).replace(/^_/, "") : s.f;
+  return s.model + (f ? " · " + f : "");
+}
+
+/* ---------- film loading ---------- */
+function loadFilm(slug) {
+  if (window.PSYTWILL_VIZ.films[slug]) { onFilm(slug); return; }
+  const el = document.createElement("script");
+  el.src = "data/" + slug + ".js";
+  el.onload = () => onFilm(slug);
+  el.onerror = () => { $("filmInfo").textContent = "failed to load data/" + slug + ".js"; };
+  $("filmInfo").textContent = "loading…";
+  document.head.appendChild(el);
+}
+
+function onFilm(slug) {
+  const p = window.PSYTWILL_VIZ.films[slug];
+  state.film = slug; state.payload = p;
+  state.view = [0, p.duration || 1];
+  state.cursor = 0; state.playing = false;
+  location.hash = slug;
+  const info = [p.style, fmtT(p.duration), p.series.length + " series"].filter(Boolean);
+  $("filmInfo").textContent = info.join(" · ");
+  audio.pause();
+  if (p.media.audio) { audio.src = MEDIA_ROOT + "/" + p.media.audio; audio.hidden = false; }
+  else { audio.removeAttribute("src"); audio.hidden = true; }
+  // carry selection across films where the same model/feature exists
+  const byKey = {}; p.series.forEach(s => byKey[seriesKey(s)] = s);
+  const keep = state.sel.filter(e => byKey[e.key]);
+  keep.forEach(e => e.series = byKey[e.key]);
+  state.sel = keep;
+  if (!state.sel.length)
+    DEFAULTS.forEach(([m, f]) => { const s = byKey[m + "/" + f]; if (s) addSeries(s, true); });
+  buildTranscript(p);
+  renderChips(); layout(); update(true);
+}
+
+/* ---------- series selection ---------- */
+function freeSlot() {
+  const used = new Set(state.sel.map(e => e.slot));
+  for (let i = 0; i < SLOTS.length; i++) if (!used.has(i)) return i;
+  return -1;
+}
+function addSeries(s, quiet) {
+  const key = seriesKey(s);
+  if (state.sel.some(e => e.key === key)) return;
+  const slot = freeSlot();
+  if (slot < 0) { if (!quiet) alert("8 lanes is the palette's limit — remove one first."); return; }
+  state.sel.push({key, series: s, slot});
+  renderChips(); layout(); draw();
+}
+function removeSeries(key) {
+  state.sel = state.sel.filter(e => e.key !== key);
+  renderChips(); layout(); draw();
+}
+function renderChips() {
+  const box = $("chips"); box.innerHTML = "";
+  state.sel.forEach(e => {
+    const c = document.createElement("span"); c.className = "chip";
+    const sw = document.createElement("span"); sw.className = "sw";
+    sw.style.background = css(SLOTS[e.slot]);
+    const t = document.createElement("span");
+    t.textContent = MODGLYPH[e.series.m] + " " + seriesLabel(e.series);
+    const x = document.createElement("button"); x.textContent = "×";
+    x.setAttribute("aria-label", "remove " + e.key);
+    x.onclick = () => removeSeries(e.key);
+    c.append(sw, t, x); box.appendChild(c);
+  });
+  $("noSeries").hidden = state.sel.length > 0;
+}
+
+/* picker */
+const pickInput = $("pickInput"), pickList = $("pickList");
+function refreshPicker() {
+  const q = pickInput.value.trim().toLowerCase();
+  pickList.innerHTML = "";
+  if (!q || !state.payload) { pickList.style.display = "none"; return; }
+  const selKeys = new Set(state.sel.map(e => e.key));
+  const hits = state.payload.series.filter(s =>
+    !selKeys.has(seriesKey(s)) && seriesKey(s).toLowerCase().includes(q)).slice(0, 40);
+  hits.forEach(s => {
+    const d = document.createElement("div");
+    d.textContent = seriesLabel(s);
+    const m = document.createElement("span"); m.className = "mod";
+    m.textContent = s.m + " · " + s.align;
+    d.appendChild(m);
+    d.onmousedown = ev => { ev.preventDefault(); addSeries(s); pickInput.value = ""; refreshPicker(); };
+    pickList.appendChild(d);
+  });
+  pickList.style.display = hits.length ? "block" : "none";
+}
+pickInput.addEventListener("input", refreshPicker);
+pickInput.addEventListener("blur", () => setTimeout(() => pickList.style.display = "none", 150));
+pickInput.addEventListener("focus", refreshPicker);
+
+/* ---------- layout & drawing ---------- */
+const PAD_L = 8, PAD_R = 8, AXIS_H = 26, WORDS_H = 34, GAP = 6;
+let laneBoxes = [];   // [{e, y, h}]
+function layout() {
+  const wrap = $("canvasWrap");
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = wrap.clientWidth * dpr; cv.height = wrap.clientHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  const hasWords = state.payload && state.payload.media.words.length;
+  const top = AXIS_H + (hasWords ? WORDS_H + GAP : 0);
+  const n = state.sel.length;
+  const laneH = n ? Math.max(44, Math.min(96, (H - top - GAP * n) / n)) : 0;
+  laneBoxes = state.sel.map((e, i) => ({e, y: top + i * (laneH + GAP), h: laneH}));
+  cv._W = W; cv._H = H; cv._top = top; cv._hasWords = hasWords;
+}
+const xOf = t => PAD_L + (t - state.view[0]) / (state.view[1] - state.view[0]) * (cv._W - PAD_L - PAD_R);
+const tOf = x => state.view[0] + (x - PAD_L) / (cv._W - PAD_L - PAD_R) * (state.view[1] - state.view[0]);
+
+function seriesPoints(s) {
+  // -> [t[], v[]] in stimulus time, for any alignment
+  const p = state.payload;
+  if (s.align === "grid") {
+    const t = s.v.map((_, i) => s.t0 + i * s.dt); return [t, s.v];
+  }
+  if (s.align === "times") return [s.t, s.v];
+  const src = s.align === "word" ? p.media.words : p.media.chunks;
+  const t = [], v = [];
+  s.v.forEach((val, i) => { if (val != null && src[i]) { t.push((src[i][0] + src[i][1]) / 2); v.push(val); } });
+  return [t, v];
+}
+function seriesSpans(s) {
+  // word/chunk series render as interval bars: [{on, off, v}]
+  const src = s.align === "word" ? state.payload.media.words : state.payload.media.chunks;
+  const out = [];
+  s.v.forEach((val, i) => { if (val != null && src[i]) out.push({on: src[i][0], off: src[i][1], v: val}); });
+  return out;
+}
+
+function niceStep(span) {
+  const raw = span / 8, pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 5, 10]) if (raw <= m * pow) return m * pow;
+  return 10 * pow;
+}
+
+function draw() {
+  if (!state.payload) return;
+  const W = cv._W, H = cv._H;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = css("--page"); ctx.fillRect(0, 0, W, H);
+  const [v0, v1] = state.view;
+
+  // time axis + gridlines
+  ctx.font = "11px system-ui, sans-serif";
+  const step = niceStep(v1 - v0);
+  ctx.textBaseline = "top";
+  for (let t = Math.ceil(v0 / step) * step; t <= v1; t += step) {
+    const x = xOf(t);
+    ctx.strokeStyle = css("--grid"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, AXIS_H - 6); ctx.lineTo(x, H); ctx.stroke();
+    ctx.fillStyle = css("--ink-3");
+    ctx.fillText((step < 1 ? t.toFixed(1) : Math.round(t)) + "s", x + 3, 4);
+  }
+
+  // words lane
+  if (cv._hasWords) {
+    const y = AXIS_H, h = WORDS_H - 8;
+    ctx.fillStyle = css("--ink-3"); ctx.fillText("words", PAD_L, y + 1);
+    const cur = currentWordIndex(state.cursor);
+    state.payload.media.words.forEach((w, i) => {
+      const x0 = xOf(w[0]), x1 = xOf(w[1]);
+      if (x1 < PAD_L || x0 > W - PAD_R) return;
+      ctx.fillStyle = i === cur ? css("--word-hot") : css("--word-fill");
+      ctx.beginPath(); ctx.roundRect(x0, y + 13, Math.max(1.5, x1 - x0 - 1), h - 13, 2); ctx.fill();
+    });
+  }
+
+  // lanes
+  laneBoxes.forEach(({e, y, h}) => {
+    const s = e.series, color = css(SLOTS[e.slot]);
+    ctx.fillStyle = css("--surface-1");
+    ctx.beginPath(); ctx.roundRect(PAD_L, y, W - PAD_L - PAD_R, h, 6); ctx.fill();
+    ctx.strokeStyle = css("--border"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(PAD_L + .5, y + .5, W - PAD_L - PAD_R - 1, h - 1, 6); ctx.stroke();
+
+    const [ts, vs] = seriesPoints(s);
+    let lo = Infinity, hi = -Infinity;
+    vs.forEach(v => { if (v < lo) lo = v; if (v > hi) hi = v; });
+    if (!isFinite(lo)) return;
+    if (hi === lo) { hi = lo + 1; }
+    const pad = 0.08 * (hi - lo);
+    const yOf = v => y + h - 16 - (v - (lo - pad)) / ((hi + pad) - (lo - pad)) * (h - 30);
+
+    if (s.align === "word" || s.align === "chunk") {
+      const base = yOf(Math.max(0, lo));
+      seriesSpans(s).forEach(sp => {
+        const x0 = xOf(sp.on), x1 = xOf(sp.off);
+        if (x1 < PAD_L || x0 > W - PAD_R) return;
+        const yv = yOf(sp.v);
+        ctx.fillStyle = color;
+        const top = Math.min(base, yv), hh = Math.max(1.5, Math.abs(base - yv));
+        ctx.beginPath(); ctx.roundRect(x0, top, Math.max(1.5, x1 - x0 - 1), hh, 1.5); ctx.fill();
+      });
+    } else {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < ts.length; i++) {
+        if (ts[i] < v0 - 1 || ts[i] > v1 + 1) { continue; }
+        const x = xOf(ts[i]), yy = yOf(vs[i]);
+        if (!started) { ctx.moveTo(x, yy); started = true; } else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+    }
+
+    // lane label + min/max + cursor value (ink tokens, never series color)
+    ctx.textBaseline = "top";
+    ctx.fillStyle = color; ctx.beginPath(); ctx.roundRect(PAD_L + 8, y + 7, 10, 10, 3); ctx.fill();
+    ctx.fillStyle = css("--ink-1"); ctx.font = "600 12px system-ui, sans-serif";
+    ctx.fillText(seriesLabel(s), PAD_L + 24, y + 6);
+    const labelW = ctx.measureText(seriesLabel(s)).width;
+    ctx.font = "11px system-ui, sans-serif"; ctx.fillStyle = css("--ink-3");
+    ctx.fillText(MODGLYPH[s.m], PAD_L + 24 + labelW + 8, y + 7);
+    ctx.fillText(fmt(hi), PAD_L + 8, y + 20);
+    ctx.textBaseline = "bottom"; ctx.fillText(fmt(lo), PAD_L + 8, y + h - 4);
+    const cval = valueAt(s, state.hover != null ? state.hover : state.cursor);
+    ctx.textAlign = "right"; ctx.textBaseline = "top";
+    ctx.font = "600 12px system-ui, sans-serif"; ctx.fillStyle = css("--ink-2");
+    ctx.fillText(fmt(cval), W - PAD_R - 10, y + 6);
+    ctx.textAlign = "left";
+  });
+
+  // hover crosshair
+  if (state.hover != null) {
+    const x = xOf(state.hover);
+    ctx.strokeStyle = css("--baseline"); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x, AXIS_H - 4); ctx.lineTo(x, H); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // playhead
+  const px = xOf(state.cursor);
+  if (px >= PAD_L && px <= W - PAD_R) {
+    ctx.strokeStyle = css("--ink-1"); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(px, AXIS_H - 6); ctx.lineTo(px, H); ctx.stroke();
+  }
+}
+
+function valueAt(s, t) {
+  const [ts, vs] = seriesPoints(s);
+  if (!ts.length) return null;
+  let lo = 0, hi = ts.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; (ts[m] <= t ? lo = m : hi = m); }
+  return Math.abs(ts[lo] - t) <= Math.abs(ts[hi] - t) ? vs[lo] : vs[hi];
+}
+function currentWordIndex(t) {
+  const w = state.payload.media.words;
+  for (let i = 0; i < w.length; i++) if (t >= w[i][0] && t < w[i][1]) return i;
+  return -1;
+}
+
+/* ---------- detail panel ---------- */
+let lastFrameSrc = "";
+function updateDetail() {
+  const p = state.payload, t = state.cursor;
+  $("curT").textContent = fmtT(t);
+  const fr = p.media.frames;
+  if (fr.length && p.media.frames_dir) {
+    let lo = 0, hi = fr.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; (fr[m] <= t ? lo = m : hi = m); }
+    const ft = fr[hi] <= t ? fr[hi] : fr[lo];
+    const src = MEDIA_ROOT + "/" + p.media.frames_dir + "/frame_" + ft.toFixed(3) + ".jpg";
+    if (src !== lastFrameSrc) { $("frameImg").src = src; lastFrameSrc = src; }
+  }
+  let cap = "—";
+  for (const [ct, text] of p.captions) { if (ct <= t) cap = text; else break; }
+  $("capText").textContent = cap;
+  const cur = currentWordIndex(t);
+  const prev = document.querySelector("#chunks span.hot");
+  if (prev) prev.classList.remove("hot");
+  if (cur >= 0) {
+    const el = document.querySelector('#chunks span[data-i="' + cur + '"]');
+    if (el) { el.classList.add("hot"); el.scrollIntoView({block: "nearest"}); }
+  }
+}
+
+function buildTranscript(p) {
+  const box = $("chunks"); box.innerHTML = "";
+  if (!p.media.words.length) { box.innerHTML = "<p style='color:var(--ink-3)'>no speech transcript for this film</p>"; return; }
+  const spkAt = t => { for (const s of p.media.speakers) if (t >= s[0] && t < s[1]) return s[2]; return null; };
+  let para = null, lastChunk = -1;
+  p.media.words.forEach((w, i) => {
+    if (w[2] !== lastChunk) {
+      para = document.createElement("p"); lastChunk = w[2];
+      const spk = spkAt(w[0]);
+      if (spk) { const s = document.createElement("span"); s.className = "spk";
+        s.textContent = spk.replace("SPEAKER_", "S"); para.appendChild(s); }
+      box.appendChild(para);
+    }
+    const el = document.createElement("span");
+    el.className = "w"; el.dataset.i = i; el.textContent = w[4];
+    el.onclick = () => seek(w[0]);
+    para.appendChild(el); para.appendChild(document.createTextNode(" "));
+  });
+}
+
+/* ---------- interaction ---------- */
+function seek(t) {
+  t = Math.max(0, Math.min(state.payload.duration, t));
+  state.cursor = t;
+  if (audio.src && Math.abs(audio.currentTime - t) > 0.05) audio.currentTime = t;
+  update();
+}
+function update(full) {
+  draw(); updateDetail();
+  if (full) refreshPicker();
+}
+
+let drag = null;
+cv.addEventListener("mousedown", ev => { drag = {x: ev.offsetX, v0: state.view[0], v1: state.view[1], moved: false}; });
+window.addEventListener("mousemove", ev => {
+  if (drag && ev.target === cv) {
+    const dx = ev.offsetX - drag.x;
+    if (Math.abs(dx) > 3) drag.moved = true;
+    if (drag.moved) {
+      const span = drag.v1 - drag.v0;
+      const dt = -dx / (cv._W - PAD_L - PAD_R) * span;
+      const d = state.payload.duration;
+      let a = drag.v0 + dt, b = drag.v1 + dt;
+      if (a < 0) { b -= a; a = 0; } if (b > d) { a -= b - d; b = d; a = Math.max(0, a); }
+      state.view = [a, b]; draw();
+    }
+  }
+});
+window.addEventListener("mouseup", ev => {
+  if (drag && !drag.moved && ev.target === cv) seek(tOf(ev.offsetX));
+  drag = null;
+});
+cv.addEventListener("mousemove", ev => {
+  if (!state.payload || drag) return;
+  state.hover = tOf(ev.offsetX); draw();
+});
+cv.addEventListener("mouseleave", () => { state.hover = null; draw(); });
+cv.addEventListener("wheel", ev => {
+  if (!state.payload) return;
+  ev.preventDefault();
+  const [a, b] = state.view, span = b - a;
+  const f = Math.exp(ev.deltaY * 0.0015);
+  const pivot = tOf(ev.offsetX);
+  let na = pivot - (pivot - a) * f, nb = pivot + (b - pivot) * f;
+  const d = state.payload.duration;
+  na = Math.max(0, na); nb = Math.min(d, nb);
+  if (nb - na < 1) return;
+  state.view = [na, nb]; draw();
+}, {passive: false});
+
+window.addEventListener("keydown", ev => {
+  if (!state.payload || ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
+  if (ev.code === "Space") { ev.preventDefault();
+    if (audio.src) { audio.paused ? audio.play() : audio.pause(); }
+  } else if (ev.key === "ArrowRight") { seek(state.cursor + 0.5); }
+  else if (ev.key === "ArrowLeft") { seek(state.cursor - 0.5); }
+});
+
+audio.addEventListener("play", () => { state.playing = true; tick(); });
+audio.addEventListener("pause", () => { state.playing = false; cancelAnimationFrame(state.raf); });
+audio.addEventListener("seeked", () => { state.cursor = audio.currentTime; update(); });
+function tick() {
+  if (!state.playing) return;
+  state.cursor = audio.currentTime;
+  const [a, b] = state.view;
+  if (state.cursor > b || state.cursor < a) {   // auto-follow
+    const span = b - a;
+    state.view = [state.cursor, Math.min(state.payload.duration, state.cursor + span)];
+  }
+  update();
+  state.raf = requestAnimationFrame(tick);
+}
+
+window.addEventListener("resize", () => { layout(); draw(); });
+const mq = window.matchMedia("(prefers-color-scheme: dark)");
+if (mq.addEventListener) mq.addEventListener("change", () => { renderChips(); draw(); });
+
+/* ---------- boot ---------- */
+const sel = $("filmSel");
+INDEX.forEach(f => {
+  const o = document.createElement("option");
+  o.value = f.slug; o.textContent = f.title + (f.audio ? "" : " (no audio)");
+  sel.appendChild(o);
+});
+sel.onchange = () => loadFilm(sel.value);
+const start = INDEX.find(f => "#" + f.slug === location.hash) || INDEX[0];
+if (start) { sel.value = start.slug; loadFilm(start.slug); }
+else document.body.innerHTML = "<p class='err'>no films in this bundle</p>";
+</script>
+</body>
+</html>

@@ -358,6 +358,19 @@ def _run_decompose(args: argparse.Namespace) -> None:
         print(f"  {paths[kind]}")
 
 
+def _run_viz_movies(args: argparse.Namespace) -> None:
+    from psytwill.viz.build import build_movies_bundle
+
+    page = build_movies_bundle(
+        features_dir=args.features_dir,
+        films_dir=args.films_dir,
+        out_dir=args.output,
+        registry=args.registry,
+        slugs=args.slugs.split(",") if args.slugs else None,
+    )
+    print(f"psytwill viz movies -> {page}")
+
+
 def _run_battery(args: argparse.Namespace) -> None:
     from psytwill.battery import (
         BATTERY,
@@ -825,6 +838,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output table (.parquet preferred, .csv/.tsv); <stem>.meta.json alongside",
     )
     tl.set_defaults(func=_run_timelines)
+
+    vz = sub.add_parser(
+        "viz",
+        help="Static feature viewers: self-contained HTML over the features "
+        "tables plus the stimuli themselves (works over file://)",
+    )
+    vzsub = vz.add_subparsers(dest="viz_verb", required=True)
+    vm = vzsub.add_parser(
+        "movies",
+        help="timeline viewer for the movies set: every modality's scalar "
+        "features on one time axis, with frames, audio and transcript",
+    )
+    vm.add_argument(
+        "--features-dir",
+        required=True,
+        help="directory holding the `psytwill features` movie tables "
+        "(movies_*_features.parquet)",
+    )
+    vm.add_argument(
+        "--films-dir",
+        required=True,
+        help="stimuli_features movies/ directory (per-film folders with "
+        "frames/, audio, transcript CSVs)",
+    )
+    vm.add_argument(
+        "--registry",
+        help="stimuli/stimulus_registry/ directory or movies.tsv, for film "
+        "titles and durations",
+    )
+    vm.add_argument("--slugs", help="comma-separated film subset (default all)")
+    vm.add_argument(
+        "-o",
+        "--output",
+        help="bundle directory (default <films-dir>/viz/timeline/)",
+    )
+    vm.set_defaults(func=_run_viz_movies)
 
     sp = sub.add_parser(
         "space",

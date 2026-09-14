@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "psytwill"
-version = "0.16.0"
+version = "0.17.0"
 description = "Chunk-by-chunk relational matrices (RDMs, coherence curves) from word2psy and viz2psy feature CSVs"
 readme = "README.md"
 license = "MIT"
@@ -54,3 +54,6 @@ Issues = "https://github.com/hulacon/psytwill/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"psytwill.viz" = ["*.html"]
