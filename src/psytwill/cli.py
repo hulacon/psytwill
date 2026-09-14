@@ -480,21 +480,35 @@ def _run_space_fit(args: argparse.Namespace) -> None:
 
     spaces, members, n_excl, rep = _space_load(args)
     groups = None
+    corpora = None
     schedule = tuple(int(k) for k in args.k_schedule.split(",")) if args.k_schedule else DEFAULT_K_SCHEDULE
-    if args.groups_from_label:
+    if args.groups_from_label or args.corpora_from_label:
         from psytwill.store import align_spaces
 
         _, labels = align_spaces({m: spaces[m] for m in members})
-        groups = [lab.split("|")[0] for lab in labels]
+        if args.groups_from_label:
+            groups = [lab.split("|")[0] for lab in labels]
+        if args.corpora_from_label:
+            from psytwill.fitcorpus import is_external, parse_ext_id
+
+            ids = [lab.split("|")[0] for lab in labels]
+            corpora = [parse_ext_id(i)[0] if is_external(i) else "internal" for i in ids]
+            print(f"  structural rule on: {len(set(corpora))} corpora "
+                  f"({', '.join(sorted(set(corpora)))})")
 
     def progress(i, n, what):
         if i == 1 or i % 25 == 0 or i == n:
             print(f"  [{i}/{n}] {what}", flush=True)
 
     fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
-                    groups=groups, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
+                    groups=groups, corpora=corpora, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                     n_perm=args.n_perm, eval_n=args.eval_n, block_size=args.block_size,
                     random_state=args.seed, progress=progress)
+    if corpora is not None:
+        for m in members:
+            sc = fit.manifest["per_member"][m]["structural_columns"]
+            if sc:
+                print(f"  {m}: {len(sc)} structural column(s) filled: {', '.join(sc)}")
     fit.manifest["inputs"] = [str(p) for p in args.features]
     fit.manifest["key"] = args.key
     fit.manifest["window"] = args.window
@@ -841,6 +855,11 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--members", help="comma-separated member spaces (default: the block's battery members present)")
     f.add_argument("--k-schedule", help="comma-separated k candidates (default 8,16,...,256 below the PR bound)")
     f.add_argument("--n-splits", type=int, default=5)
+    f.add_argument("--corpora-from-label", action="store_true",
+                   help="structural-missingness rule: read the corpus from each row's "
+                        "ext-<corpus>-* stimulus_id (non-external ids group as 'internal') "
+                        "and fill columns null under a per-corpus gate with a frozen "
+                        "sentinel instead of mean-imputing them")
     _space_criterion(f)
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")

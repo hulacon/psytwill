@@ -68,7 +68,7 @@ EUCLIDEAN_RANK_BELOW: int = 3
 def metric_for_rank(rank: int) -> str:
     """Neighbour metric for a member whitened to ``rank`` directions."""
     return "euclidean" if int(rank) < EUCLIDEAN_RANK_BELOW else "cosine"
-SPACE_SCHEMA_VERSION = "1.1"
+SPACE_SCHEMA_VERSION = "1.2"
 
 
 # --------------------------------------------------------------------------
@@ -87,19 +87,32 @@ class SpaceWhitener:
     components: np.ndarray  # (rank, dim)
     scales: np.ndarray  # (rank,) 1/sqrt(eigenvalue)
     participation_ratio: float
+    #: feature -> raw fill value for structurally-conditional columns
+    #: (frozen at fit time; see the NaN policy section)
+    structural_fill: dict = field(default_factory=dict)
 
     @property
     def rank(self) -> int:
         return int(self.components.shape[0])
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        Z = (np.asarray(X, dtype=float) - self.mean) / self.std
+        X = np.asarray(X, dtype=float)
+        if self.structural_fill:
+            X = X.copy()
+            idx = {f: i for i, f in enumerate(self.features)}
+            for f, v in self.structural_fill.items():
+                j = idx.get(f)
+                if j is not None:
+                    col = X[:, j]
+                    col[np.isnan(col)] = v
+        Z = (X - self.mean) / self.std
         Z = np.where(np.isnan(Z), 0.0, Z)  # mean imputation of undefined entries
         return (Z @ self.components.T) * self.scales
 
 
 def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
-                 rel_tol: float = 1e-8) -> SpaceWhitener:
+                 rel_tol: float = 1e-8,
+                 structural_fill: dict | None = None) -> SpaceWhitener:
     """Fit a whitener on ``X`` (training rows of ``space``).
 
     ``rank`` defaults to ``ceil(participation_ratio)`` of the training rows,
@@ -131,6 +144,7 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
         components=vt[:r],
         scales=1.0 / np.sqrt(eig[:r]),
         participation_ratio=pr,
+        structural_fill=dict(structural_fill or {}),
     )
 
 
@@ -168,8 +182,11 @@ class BlockMap:
 
 
 def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: np.ndarray,
-                  *, k_max: int | None = None) -> BlockMap:
-    whiteners = {m: fit_whitener(spaces[m], spaces[m].X[rows]) for m in members}
+                  *, k_max: int | None = None,
+                  structural_fill: dict[str, dict] | None = None) -> BlockMap:
+    sf = structural_fill or {}
+    whiteners = {m: fit_whitener(spaces[m], spaces[m].X[rows], structural_fill=sf.get(m))
+                 for m in members}
     parts = [whiteners[m].transform(spaces[m].X[rows]) for m in members]
     W = np.concatenate(parts, axis=1)
     mean = W.mean(axis=0)
@@ -191,6 +208,85 @@ def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: 
 # --------------------------------------------------------------------------
 
 DEFAULT_MAX_NAN_FRAC = 0.5
+
+# Structurally-conditional columns (DECIDED 2026-09-13, psytwill-space
+# workbench): some columns have *no value* when their condition is absent --
+# a formant frequency on a frame with no voice, a mean turn duration in
+# instrumental music. The extractors encode this correctly (null, where a
+# genuine absence-of-events is 0), and mean-imputing those nulls fabricates
+# a mid-range measurement on every such frame. The rule:
+#
+# 1. DETECT the conditional set from the data, per column, by per-corpus
+#    contrast: null in > STRUCTURAL_NULL_HIGH of one corpus's rows and
+#    < STRUCTURAL_NULL_LOW of another's. The split is bimodal (measured
+#    2026-09-13 across eight corpora: 0-2 of 1,635 columns in the 0.1-0.9
+#    band), so the thresholds are not delicate. A hardcoded column list
+#    would go stale silently when an extractor changes.
+# 2. FILL those entries with one frozen constant per column, placed at
+#    STRUCTURAL_FILL_Z defined-entry standard deviations below the
+#    defined-entry mean. "Undefined" becomes a single point outside the
+#    bulk of the measured values -- a label, not a measurement -- so the
+#    member represents "no value here" as a direction instead of
+#    inheriting a fabricated mean. The whitener re-standardizes over the
+#    filled matrix, so the sentinel's magnitude does not dominate variance.
+#    The gate itself is already visible to the block through columns that
+#    are always defined (the rule adds no columns).
+#
+# Detection needs a per-row corpus label and runs only when the caller
+# provides one (`fit_block(..., corpora=...)`); without it the policy is
+# unchanged (max_nan_frac drop + mean-impute). Filled columns are exempt
+# from the max_nan_frac drop by construction: the fill runs first.
+STRUCTURAL_NULL_HIGH = 0.9
+STRUCTURAL_NULL_LOW = 0.2
+STRUCTURAL_FILL_Z = -3.0
+
+
+def detect_structural_columns(space: SpaceMatrix, corpora: Sequence, *,
+                              high: float = STRUCTURAL_NULL_HIGH,
+                              low: float = STRUCTURAL_NULL_LOW) -> list[str]:
+    """Columns whose null fraction is > ``high`` in some corpus and < ``low``
+    in another. Returns [] when fewer than two corpora are represented."""
+    X = np.asarray(space.X, dtype=float)
+    g = np.asarray(corpora)
+    if len(g) != X.shape[0]:
+        raise SpaceError(f"'{space.name}': corpora must have one entry per row "
+                         f"({len(g)} != {X.shape[0]})")
+    keys = np.unique(g)
+    if keys.size < 2:
+        return []
+    frac = np.stack([np.isnan(X[g == c]).mean(axis=0) for c in keys])
+    hit = (frac.max(axis=0) > high) & (frac.min(axis=0) < low)
+    return [f for f, h in zip(space.features, hit) if h]
+
+
+def structural_fill_values(space: SpaceMatrix, columns: Sequence[str], *,
+                           fill_z: float = STRUCTURAL_FILL_Z) -> dict[str, float]:
+    """Frozen raw fill value per column: defined-entry mean + ``fill_z`` sd."""
+    X = np.asarray(space.X, dtype=float)
+    idx = {f: i for i, f in enumerate(space.features)}
+    out: dict[str, float] = {}
+    for f in columns:
+        col = X[:, idx[f]]
+        mean = float(np.nanmean(col)) if np.isfinite(col).any() else 0.0
+        std = float(np.nanstd(col))
+        out[f] = mean + fill_z * (std if std > 0 else 1.0)
+    return out
+
+
+def apply_structural_fill(space: SpaceMatrix, fills: dict | None) -> SpaceMatrix:
+    """Replace nulls in the named columns with their frozen fill values."""
+    if not fills:
+        return space
+    X = np.asarray(space.X, dtype=float).copy()
+    idx = {f: i for i, f in enumerate(space.features)}
+    for f, v in fills.items():
+        j = idx.get(f)
+        if j is not None:
+            col = X[:, j]
+            col[np.isnan(col)] = v
+    return SpaceMatrix(name=space.name, labels=list(space.labels), X=X,
+                       features=list(space.features), modality=space.modality,
+                       extractor=space.extractor, n_replicates=space.n_replicates)
 
 
 def prepare_member(space: SpaceMatrix, *, max_nan_frac: float = DEFAULT_MAX_NAN_FRAC) -> tuple[SpaceMatrix, list[str]]:
@@ -335,9 +431,19 @@ def fit_block(
     block_size: int | None = None,
     random_state: int = 0,
     max_nan_frac: float = DEFAULT_MAX_NAN_FRAC,
+    corpora: Sequence | None = None,
+    structural_null_high: float = STRUCTURAL_NULL_HIGH,
+    structural_null_low: float = STRUCTURAL_NULL_LOW,
+    structural_fill_z: float = STRUCTURAL_FILL_Z,
     progress=None,
 ) -> BlockFit:
-    """Fit one private block; see the module docstring for the pipeline."""
+    """Fit one private block; see the module docstring for the pipeline.
+
+    ``corpora`` (one label per aligned row) turns on the structural-
+    missingness rule: columns null under a per-corpus gate are detected by
+    corpus contrast and filled with a frozen sentinel instead of falling
+    through to the mean-impute policy (see the NaN policy section).
+    """
     _check_perm_floor(n_perm, alpha)
     members = list(members)
     missing = [m for m in members if m not in spaces]
@@ -346,6 +452,19 @@ def fit_block(
     if len(members) < 1:
         raise SpaceError("a block needs at least one member space")
     aligned, labels = align_spaces({m: spaces[m] for m in members})
+    structural_fill: dict[str, dict[str, float]] = {}
+    if corpora is not None:
+        if len(corpora) != len(labels):
+            raise SpaceError(f"corpora must have one entry per aligned row "
+                             f"({len(corpora)} != {len(labels)})")
+        for m in members:
+            cols = detect_structural_columns(aligned[m], corpora,
+                                             high=structural_null_high,
+                                             low=structural_null_low)
+            if cols:
+                structural_fill[m] = structural_fill_values(
+                    aligned[m], cols, fill_z=structural_fill_z)
+                aligned[m] = apply_structural_fill(aligned[m], structural_fill[m])
     dropped_columns: dict[str, list[str]] = {}
     for m in members:
         aligned[m], dropped = prepare_member(aligned[m], max_nan_frac=max_nan_frac)
@@ -377,7 +496,8 @@ def fit_block(
     # weights, so the bound follows it. Raw-covariance PR remains the basis of
     # the Contract B section 4.4 space manifest; `pr_basis` names which is which.
     folds = _folds(n, n_splits, g, random_state)
-    fold_maps = [fit_block_map(aligned, members, train) for train, _ in folds]
+    fold_maps = [fit_block_map(aligned, members, train, structural_fill=structural_fill)
+                 for train, _ in folds]
     k_top = min(fm.k_max for fm in fold_maps)
     schedule = sorted({int(k) for k in k_schedule if 1 <= int(k) < k_top} | {k_top})
     curve: list[dict] = []
@@ -412,7 +532,8 @@ def fit_block(
     else:
         subsumed = True
 
-    final = fit_block_map(aligned, members, np.arange(n), k_max=chosen)
+    final = fit_block_map(aligned, members, np.arange(n), k_max=chosen,
+                          structural_fill=structural_fill)
     chosen = min(chosen, final.k_max)  # the concatenation may have fewer directions than k
     pr = {m: float(final.whiteners[m].participation_ratio) for m in members}
     pr_sum = float(sum(pr.values()))
@@ -428,6 +549,7 @@ def fit_block(
             "eval_rows": [r["eval_rows"] for r in rows],
             "dim": aligned[m].dim,
             "dropped_columns": dropped_columns.get(m, []),
+            "structural_columns": sorted(structural_fill.get(m, {})),
             "nan_fraction_kept": float(np.isnan(aligned[m].X).mean()),
             "r2_per_fold": [r["r2"] for r in rows],
             "overlap_per_fold": [r["overlap"] for r in rows],
@@ -460,6 +582,13 @@ def fit_block(
         "criterion": {"r2_min": r2_min, "alpha": alpha, "k_nn": k_nn, "n_perm": n_perm,
                       "eval_n": eval_n, "block_size": block_size, "random_state": random_state},
         "max_nan_frac": max_nan_frac,
+        "structural_rule": None if corpora is None else {
+            "null_high": structural_null_high,
+            "null_low": structural_null_low,
+            "fill_z": structural_fill_z,
+            "n_corpora": int(len(set(corpora))),
+            "n_structural_columns": int(sum(len(v) for v in structural_fill.values())),
+        },
         "k_schedule": schedule,
         "block_eigenvalues": [float(v) for v in final.block_eigenvalues],
         "per_member": per_member,
@@ -494,6 +623,7 @@ def save_fit(fit: BlockFit, out_dir: str | Path, *, stem: str | None = None) -> 
     meta["weights"] = npz.name
     meta["member_features"] = {m: fit.map.whiteners[m].features for m in fit.members}
     meta["member_pr"] = {m: fit.map.whiteners[m].participation_ratio for m in fit.members}
+    meta["member_structural_fill"] = {m: fit.map.whiteners[m].structural_fill for m in fit.members}
     manifest = out / f"{stem}.json"
     manifest.write_text(json.dumps(meta, indent=2))
     import pandas as pd
@@ -517,6 +647,7 @@ def load_fit(manifest_path: str | Path) -> BlockFit:
             components=data[f"w::{m}::components"],
             scales=data[f"w::{m}::scales"],
             participation_ratio=float(meta["member_pr"][m]),
+            structural_fill=dict(meta.get("member_structural_fill", {}).get(m, {})),
         )
     bm = BlockMap(
         members=list(meta["members"]),
@@ -538,7 +669,13 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
     for m in fit.members:
         if m not in spaces:
             raise SpaceError(f"member '{m}' missing from the table; have {sorted(spaces)}")
-    picked = {m: select_features(spaces[m], fit.map.whiteners[m].features) for m in fit.members}
+    # The frozen structural fill applies to the criterion target too:
+    # without it the ridge/overlap row-drop silently removes exactly the
+    # rows where the member's condition is absent (the music arm, for a
+    # speech-gated member), and the check no longer covers the table.
+    picked = {m: apply_structural_fill(select_features(spaces[m], fit.map.whiteners[m].features),
+                                       fit.map.whiteners[m].structural_fill)
+              for m in fit.members}
     aligned, labels = align_spaces(picked)
     S = fit.map.scores(aligned, k=fit.k)
     out = []
