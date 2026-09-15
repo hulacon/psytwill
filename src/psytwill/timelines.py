@@ -19,12 +19,27 @@ once items are placed in time:
 * optionally, cosine distance of the item's embedding in one chosen space to
   the mean of the preceding *k* items in the run (``--context-model``).
 
-The join uses §4.2's verified events→id rules, with the registry README
-authoritative: TB/FIN image trials by ``mmmId``; TB/FIN word trials by
-``(word, voice)``; NAT movie trials by case-insensitive ``movie_name`` against
-``movie_name`` and the closed ``movie_name_variants`` set. An events row that
-should resolve and does not is an error naming the reference — a dropped
-presentation is exactly the silent failure the registry exists to prevent.
+Resolution is a three-step ladder, so datasets without an mmmdata-style
+registry work too:
+
+1. a non-null ``stimulus_id`` column on the events row is taken directly —
+   it is §4.1's canonical name, and an events file that already speaks it
+   needs no indirection (``stimulus_set`` is the trial-type mapping when it
+   applies, else ``"events"``);
+2. the registry rules, when a registry is given — §4.2's verified events→id
+   mapping, with the registry README authoritative: TB/FIN image trials by
+   ``mmmId``; TB/FIN word trials by ``(word, voice)``; NAT movie trials by
+   case-insensitive ``movie_name`` against ``movie_name`` and the closed
+   ``movie_name_variants`` set;
+3. a non-null BIDS ``stim_file`` column: the file's stem becomes the id
+   (``stimulus_set`` ``"stim_file"``) — the convention BIDS itself provides,
+   so any spec-conforming events file resolves against a feature table whose
+   ``stimulus_id`` values are stimulus file stems.
+
+An events row that should resolve and does not is an error naming the
+reference — a dropped presentation is exactly the silent failure the
+registry exists to prevent. A row whose trial type references a registry set
+when no registry was given is such an error, not a generic fallback.
 
 **The boundary is unchanged.** Time here is experimental time — onsets as the
 events file records them. HRF convolution, TR resampling and anything with a
@@ -76,7 +91,10 @@ TIMELINE_COLUMNS = [
 KEY_COLUMNS = ["subject", "session", "task", "run", "row_idx"]
 
 #: events columns the join consumes; everything else passes through.
-_CONSUMED = {"onset", "duration", "trial_type", "mmmId", "word", "voice", "movie_name"}
+_CONSUMED = {
+    "onset", "duration", "trial_type", "mmmId", "word", "voice", "movie_name",
+    "stimulus_id", "stim_file",
+}
 
 _ENTITY_RE = re.compile(
     r"sub-(?P<subject>[^_]+)_ses-(?P<session>[^_]+)_task-(?P<task>[^_]+)"
@@ -181,13 +199,29 @@ def _isna(v: Any) -> bool:
 # --------------------------------------------------------------------------
 
 def parse_entities(path: str | Path) -> dict[str, Optional[str]]:
-    m = _ENTITY_RE.search(Path(path).name)
-    if not m:
+    """BIDS entities from the file name, or a per-file fallback for non-BIDS names.
+
+    A name that mentions ``sub-`` but does not parse is refused — it is far
+    more likely a malformed BIDS name than a deliberate convention. Any other
+    name gets no subject/session/run and its stem (minus ``_events``) as the
+    task, so two generic files never look like the same scan: ``lag_seconds``
+    and context windows treat files that share no parsed entities as sharing
+    no clock, which is the safe reading.
+    """
+    name = Path(path).name
+    m = _ENTITY_RE.search(name)
+    if m:
+        return m.groupdict()
+    if "sub-" in name:
         raise InputError(
-            f"{Path(path).name} is not a BIDS events file name "
-            "(sub-XX_ses-YY_task-T[_run-RR]_events.tsv); entities are read from the name."
+            f"{name} mentions 'sub-' but is not a BIDS events file name "
+            "(sub-XX_ses-YY_task-T[_run-RR]_events.tsv); fix the name — a "
+            "typo here would silently get generic per-file treatment."
         )
-    return m.groupdict()
+    stem = Path(path).stem
+    if stem.endswith("_events"):
+        stem = stem[: -len("_events")]
+    return {"subject": None, "session": None, "task": stem, "run": None}
 
 
 def _stimulus_set_for(row: pd.Series) -> Optional[str]:
@@ -204,8 +238,16 @@ def _stimulus_set_for(row: pd.Series) -> Optional[str]:
     return None
 
 
-def read_events(paths: Sequence[str | Path], registry: Registry) -> pd.DataFrame:
+def read_events(
+    paths: Sequence[str | Path], registry: Optional[Registry] = None
+) -> pd.DataFrame:
     """Every row of every events file, resolved, in presentation order.
+
+    Resolution follows the module-docstring ladder: an explicit
+    ``stimulus_id`` column wins, the registry rules apply when a registry is
+    given, and a BIDS ``stim_file`` stem is the no-registry fallback. A row
+    whose trial type names a registry set is an error without a registry —
+    not a silent non-stimulus row.
 
     Order is (session, run, onset, file row). Session and run sort as
     integers when they are digits, so ``ses-10`` follows ``ses-09``.
@@ -222,15 +264,47 @@ def read_events(paths: Sequence[str | Path], registry: Registry) -> pd.DataFrame
     for p in paths:
         p = Path(p)
         ents = parse_entities(p)
-        ev = pd.read_csv(p, sep="\t", na_values=["n/a"], dtype={"word": str, "voice": str, "movie_name": str})
+        ev = pd.read_csv(
+            p, sep="\t", na_values=["n/a"],
+            dtype={"word": str, "voice": str, "movie_name": str,
+                   "stimulus_id": str, "stim_file": str},
+        )
         for col in ("onset", "duration"):
             if col not in ev.columns:
                 raise InputError(f"{p.name} lacks required BIDS column {col!r}")
+        if "trial_type" not in ev.columns:
+            ev["trial_type"] = None  # optional in BIDS; generic files may omit it
         sets, sids, voices = [], [], []
         for i, row in ev.iterrows():
+            direct = row.get("stimulus_id")
+            if not _isna(direct):
+                sset = _stimulus_set_for(row) or "events"
+                voice = row.get("voice")
+                sets.append(sset); sids.append(str(direct))
+                voices.append(None if _isna(voice) else str(voice))
+                continue
             sset = _stimulus_set_for(row)
+            stim_file = row.get("stim_file")
             if sset is None:
-                sets.append(None); sids.append(None); voices.append(None)
+                if _isna(stim_file):
+                    sets.append(None); sids.append(None); voices.append(None)
+                    continue
+                voice = row.get("voice")
+                sets.append("stim_file"); sids.append(Path(str(stim_file)).stem)
+                voices.append(None if _isna(voice) else str(voice))
+                continue
+            if registry is None:
+                if not _isna(stim_file):
+                    voice = row.get("voice")
+                    sets.append("stim_file"); sids.append(Path(str(stim_file)).stem)
+                    voices.append(None if _isna(voice) else str(voice))
+                    continue
+                unresolved.append(
+                    f"{p.name} row {i} ({sset}): references the {sset!r} registry "
+                    "set but no registry was given; pass --registry, or carry a "
+                    "stimulus_id or stim_file column"
+                )
+                sets.append(sset); sids.append(None); voices.append(None)
                 continue
             try:
                 sid, voice = registry.resolve(sset, row)
@@ -446,15 +520,19 @@ def add_context_distance(tl: pd.DataFrame, model: str, cols: Sequence[str], k: i
 
 def build_timeline(
     events: Sequence[str | Path],
-    registry_dir: str | Path,
+    registry_dir: Optional[str | Path],
     output: str | Path,
     features: Optional[str | Path] = None,
     models: Optional[Sequence[str]] = None,
     context_model: Optional[str] = None,
     context_k: int = 5,
 ) -> dict[str, Any]:
-    """The ``timelines`` verb: events + registry [+ features] -> one table + sidecar."""
-    registry = Registry.from_dir(registry_dir)
+    """The ``timelines`` verb: events [+ registry] [+ features] -> one table + sidecar.
+
+    ``registry_dir`` is optional: events that carry their own ``stimulus_id``
+    (or BIDS ``stim_file``) column resolve without one.
+    """
+    registry = None if registry_dir is None else Registry.from_dir(registry_dir)
     tl = add_lags(read_events(events, registry))
 
     model_cols: dict[str, list[str]] = {}
@@ -506,7 +584,8 @@ def build_timeline(
         },
         "inputs": {
             "events": [str(Path(p).resolve()) for p in events],
-            "registry": {"path": str(Path(registry_dir).resolve()), "rows": registry.rows},
+            "registry": None if registry is None else
+            {"path": str(Path(registry_dir).resolve()), "rows": registry.rows},
             "features": None if features is None else str(Path(features).resolve()),
             "models": sorted(model_cols),
         },

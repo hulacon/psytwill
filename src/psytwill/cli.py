@@ -24,6 +24,10 @@ Examples
     # Long-form feature table from N extractor CSVs (Contract B surface)
     psytwill features clip.csv ebind.csv caption.csv -o features.parquet
 
+    # Compose sparse runs onto the movie grid from item stores
+    psytwill compose sub-01_..._events.tsv --stores image.parquet word.parquet \\
+        --registry stimulus_registry/ -o composed/run_root/
+
     # How the spaces in N feature tables relate to each other
     psytwill compare image.parquet:image caption.parquet:cap -o geometry/
 
@@ -175,6 +179,98 @@ def _run_timelines(args: argparse.Namespace) -> None:
     if summary["models"]:
         print(f"  features attached: {', '.join(summary['models'])}")
     print(f"  {summary['meta_path']}")
+
+
+def _run_compose(args: argparse.Namespace) -> None:
+    from psytwill.compose import build_composed
+
+    modality_map = None
+    if args.modality_map:
+        modality_map = dict(
+            item.split("=", 1) for item in args.modality_map.split(",") if item
+        )
+    summary = build_composed(
+        args.events,
+        args.stores,
+        args.output,
+        registry_dir=args.registry,
+        window=args.window,
+        onset_column=args.onset_column,
+        lead_out=args.lead_out,
+        models=args.models.split(",") if args.models else None,
+        modality_map=modality_map,
+        sparse=args.sparse,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+
+    # Media renders even when the tables are up to date: adding media to an
+    # existing compose is a normal second invocation, not a change of inputs.
+    if args.media and not args.dry_run:
+        summary["media"] = _compose_media(args)
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return
+    note = " [dry run]" if summary.get("dry_run") else (
+        " [up to date]" if summary.get("up_to_date") else "")
+    print(f"psytwill compose -> {summary['output_dir']}  "
+          f"({len(summary['runs'])} run(s)){note}")
+    for stem, info in sorted(summary["streams"].items()):
+        if info.get("skipped"):
+            print(f"  {stem}: up to date ({info['output']})")
+        elif summary.get("dry_run"):
+            print(f"  {stem}: ~{info['estimated_rows_lower_bound']:,} rows "
+                  f"({len(info['models'])} models) -> {info['output']}")
+        else:
+            print(f"  {stem}: {info['rows']:,} rows "
+                  f"({len(info['models'])} models) -> {info['output']}")
+    for slug, m in (summary.get("media") or {}).items():
+        print(f"  media {slug}: {m['frames']} frames, {m['audio_items']} "
+              f"audio items ({m['unmapped']} unmapped)")
+
+
+def _compose_media(args: argparse.Namespace) -> dict:
+    from psytwill.compose import read_runs
+    from psytwill.media import (
+        media_map_from_registry,
+        media_map_from_tsv,
+        render_run_media,
+    )
+    from psytwill.timelines import Registry
+
+    media_map: dict = {}
+    if args.registry and args.stimuli_root:
+        media_map.update(media_map_from_registry(args.registry, args.stimuli_root))
+    if args.media_map:
+        media_map.update(media_map_from_tsv(args.media_map))
+    if not media_map:
+        raise InputError(
+            "--media needs a file source: --media-map map.tsv, or --registry "
+            "plus --stimuli-root for registry-declared media columns."
+        )
+    try:
+        w, h = (int(v) for v in args.screen.lower().split("x"))
+    except ValueError:
+        raise InputError(f"--screen must be WxH pixels, got {args.screen!r}")
+    registry = Registry.from_dir(args.registry) if args.registry else None
+    pres, runs = read_runs(args.events, registry,
+                           onset_column=args.onset_column,
+                           lead_out=args.lead_out)
+    out = {}
+    for slug, info in runs.items():
+        out[slug] = render_run_media(
+            Path(args.output) / "movies" / slug,
+            pres[pres["_slug"] == slug],
+            media_map,
+            info["run_end"],
+            window=args.window,
+            screen=(w, h),
+            image_frac=args.image_frac,
+            bg_gray=args.bg_gray,
+            scale=args.media_scale,
+        )
+    return out
 
 
 def _run_project(args: argparse.Namespace) -> None:
@@ -818,8 +914,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tl.add_argument(
         "--registry",
-        required=True,
-        help="stimuli/stimulus_registry/ directory (shared1000.tsv, twp1000.tsv, movies.tsv)",
+        help="stimuli/stimulus_registry/ directory (shared1000.tsv, twp1000.tsv, "
+        "movies.tsv). Optional: events that carry their own stimulus_id (or "
+        "BIDS stim_file) column resolve without one",
     )
     tl.add_argument(
         "--features",
@@ -840,6 +937,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output table (.parquet preferred, .csv/.tsv); <stem>.meta.json alongside",
     )
     tl.set_defaults(func=_run_timelines)
+
+    cp = sub.add_parser(
+        "compose",
+        help="Compose sparse runs onto a dense movie-style grid: events.tsv + "
+        "item feature stores -> movie-schema tables a movie consumer loads "
+        "with no special case (the dense half of contracts §4.3 item 5)",
+    )
+    cp.add_argument(
+        "events",
+        nargs="+",
+        help="events.tsv files, one composed run each; BIDS names give "
+        "entities, any other name composes under its stem",
+    )
+    cp.add_argument(
+        "--stores",
+        nargs="+",
+        required=True,
+        metavar="TABLE",
+        help="`psytwill features` parquet tables holding the presented items; "
+        "each model's temporal grain (untimed/gridded/chunk) picks its "
+        "composition rule and target stream",
+    )
+    cp.add_argument(
+        "--registry",
+        help="stimulus_registry/ directory for events -> id resolution; "
+        "optional when events carry stimulus_id or stim_file",
+    )
+    cp.add_argument("-o", "--output", required=True,
+                    help="composed-run root; tables land in <output>/features/, "
+                    "media (with --media) in <output>/movies/<slug>/")
+    cp.add_argument("--window", type=float, default=0.5,
+                    help="grid width in seconds (default 0.5, the movie grid)")
+    cp.add_argument("--onset-column", default="onset",
+                    help="events column presentations are timed by (default "
+                    "onset; e.g. onset_actual where recorded)")
+    cp.add_argument("--lead-out", type=float, default=0.0,
+                    help="seconds the run continues past the last event "
+                    "(default 0; task programs often hold the screen)")
+    cp.add_argument("--models", help="comma-separated model subset to compose")
+    cp.add_argument("--modality-map",
+                    help="model=visual|audio|text overrides for stores whose "
+                    "rows carry no usable modality, e.g. 'clip=visual'")
+    cp.add_argument("--sparse", action="store_true",
+                    help="emit rows only where a stimulus is on; default is "
+                    "the full grid with explicit NaN rows in empty bins")
+    cp.add_argument("--dry-run", action="store_true",
+                    help="report the plan (runs, streams, models, row "
+                    "estimates) without reading values or writing")
+    cp.add_argument("--force", action="store_true",
+                    help="recompose even when outputs match this input "
+                    "signature")
+    cp.add_argument("--json", action="store_true",
+                    help="print the machine-readable summary instead of prose")
+    cp.add_argument("--media", action="store_true",
+                    help="also render viewer media per run (frames/, "
+                    "audio.m4a, transcript CSVs); needs Pillow, soundfile, "
+                    "ffmpeg")
+    cp.add_argument("--media-map",
+                    help="TSV mapping stimulus_id[, voice] -> media file "
+                    "(paths relative to the TSV)")
+    cp.add_argument("--stimuli-root",
+                    help="root the registry's media columns resolve under "
+                    "(<root>/<set>/<file>)")
+    cp.add_argument("--screen", default="2048x1280",
+                    help="display geometry in pixels WxH (default 2048x1280)")
+    cp.add_argument("--image-frac", type=float, default=0.6,
+                    help="image height as a fraction of screen height "
+                    "(default 0.6)")
+    cp.add_argument("--bg-gray", type=int, default=191,
+                    help="background gray 0-255 (default 191, PsychoPy "
+                    "[.5,.5,.5])")
+    cp.add_argument("--media-scale", type=float, default=0.5,
+                    help="render scale vs the true screen (default 0.5)")
+    cp.set_defaults(func=_run_compose)
 
     vz = sub.add_parser(
         "viz",

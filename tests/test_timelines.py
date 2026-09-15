@@ -137,8 +137,12 @@ def test_parse_entities_with_and_without_run():
     e = parse_entities("sub-03_ses-04_task-TBencoding_run-01_events.tsv")
     assert e == {"subject": "03", "session": "04", "task": "TBencoding", "run": "01"}
     assert parse_entities("sub-03_ses-30_task-motor_events.tsv")["run"] is None
-    with pytest.raises(InputError, match="not a BIDS events file name"):
-        parse_entities("motor_timing.csv")
+    # Non-BIDS names get per-file generic entities: no subject, stem as task.
+    g = parse_entities("story_listening_events.tsv")
+    assert g == {"subject": None, "session": None, "task": "story_listening", "run": None}
+    # A malformed BIDS-looking name is still refused, not silently generic.
+    with pytest.raises(InputError, match="mentions 'sub-'"):
+        parse_entities("sub-03_ses04_task-motor_events.tsv")
 
 
 def test_resolution_follows_the_three_rules(events, registry_dir):
@@ -176,6 +180,74 @@ def test_order_is_session_run_onset(events, registry_dir):
     key = list(zip(tl["session"], tl["run"]))
     assert key == sorted(key, key=lambda k: (int(k[0]), int(k[1])))
     assert tl["row_idx"].tolist() == list(range(len(tl)))
+
+
+def test_direct_stimulus_id_resolves_without_registry(tmp_path):
+    f = tmp_path / "story_listening_events.tsv"
+    pd.DataFrame([
+        {"onset": 1.0, "duration": 2.0, "stimulus_id": "storyA", "trial_type": "story"},
+        {"onset": 4.0, "duration": 1.0, "stimulus_id": "n/a", "trial_type": "rest"},
+        {"onset": 6.0, "duration": 2.0, "stimulus_id": "storyB", "trial_type": "story"},
+    ]).to_csv(f, sep="\t", index=False)
+    tl = read_events([f])
+    assert tl.loc[tl["is_stimulus"], "stimulus_id"].tolist() == ["storyA", "storyB"]
+    assert tl["stimulus_id"].isna().tolist() == [False, True, False]
+    assert tl.loc[tl["is_stimulus"], "stimulus_set"].tolist() == ["events", "events"]
+    assert tl["task"].iloc[0] == "story_listening"
+
+
+def test_stim_file_stem_is_the_fallback_id(tmp_path):
+    f = tmp_path / "localizer_events.tsv"
+    pd.DataFrame([
+        {"onset": 1.0, "duration": 2.0, "stim_file": "images/face_01.png"},
+        {"onset": 4.0, "duration": 2.0, "stim_file": "n/a"},
+    ]).to_csv(f, sep="\t", index=False)
+    tl = read_events([f])
+    assert tl["stimulus_id"].iloc[0] == "face_01" and tl["stimulus_id"].isna().iloc[1]
+    assert tl["stimulus_set"].iloc[0] == "stim_file" and tl["stimulus_set"].isna().iloc[1]
+
+
+def test_explicit_stimulus_id_wins_over_registry(tmp_path, registry_dir):
+    f = tmp_path / "sub-01_ses-04_task-TBencoding_run-01_events.tsv"
+    pd.DataFrame([
+        {"onset": 9.0, "duration": 3.0, "trial_type": "image", "mmmId": 1,
+         "stimulus_id": "override-id"},
+    ]).to_csv(f, sep="\t", index=False)
+    tl = read_events([f], Registry.from_dir(registry_dir))
+    assert tl["stimulus_id"].tolist() == ["override-id"]
+
+
+def test_registry_set_reference_without_registry_is_an_error(tmp_path):
+    f = tmp_path / "sub-01_ses-04_task-TBencoding_run-01_events.tsv"
+    _tb_events(f, [(1, "cabin", "nova", 1)])
+    with pytest.raises(InputError, match="no registry was given.*--registry"):
+        read_events([f])
+
+
+def test_generic_files_share_no_clock(tmp_path):
+    # Two non-BIDS files: lag_trials spans them, lag_seconds must not —
+    # each file is its own scan under the fallback entities.
+    a, b = tmp_path / "block1_events.tsv", tmp_path / "block2_events.tsv"
+    for f in (a, b):
+        pd.DataFrame([
+            {"onset": 1.0, "duration": 2.0, "stimulus_id": "itemX"},
+        ]).to_csv(f, sep="\t", index=False)
+    tl = add_lags(read_events([a, b]))
+    again = tl.iloc[1]
+    assert again["lag_trials"] == 1
+    assert np.isnan(again["lag_seconds"])
+
+
+def test_build_timeline_without_registry(tmp_path):
+    f = tmp_path / "story_listening_events.tsv"
+    pd.DataFrame([
+        {"onset": 1.0, "duration": 2.0, "stimulus_id": "storyA"},
+    ]).to_csv(f, sep="\t", index=False)
+    out = tmp_path / "t.parquet"
+    summary = build_timeline([f], None, out)
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["inputs"]["registry"] is None
+    assert summary["presentations"] == 1
 
 
 # --------------------------------------------------------------------------

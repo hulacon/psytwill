@@ -130,20 +130,52 @@ Ben works in explicitly approved phases: propose, wait for go-ahead at design
 checkpoints, summarize finished work with concrete validation numbers.
 Commit/push only when asked.
 
-- **`timelines.py`** (0.10.0) — the third input class: BIDS `events.tsv`.
-  Resolves every presentation to a registry `stimulus_id` by §4.2's rules
-  (image trials by `mmmId`, word trials by `(word, voice)`, movie trials by
-  case-insensitive `movie_name` incl. variants; unresolved = error), orders
-  a subject's presentations across sessions, and adds the contextual
-  features that exist only once embedded: `lag_trials` (across everything
-  given), `lag_seconds` (same run only — runs share no clock),
-  `prev_session`/`prev_run`, and optionally `ctx_<model>_k<k>_cosdist`
-  (cosine distance to the mean of the preceding k items in the run, in one
-  chosen space). Item-level rows of a `features` table attach wide. Own
-  `schema_version` (`TIMELINES_SCHEMA_VERSION`) in `<stem>.meta.json`.
-  Experimental time only — HRF/TR belong to braintwill (contracts §4.3
-  item 5). The dense movie half (frame grid shifted by movie onset) is not
-  built; movies resolve and get lags like any item.
+- **`timelines.py`** (0.10.0; resolution generalized 0.18.0) — the third
+  input class: BIDS `events.tsv`. Resolution is a three-step ladder so
+  non-mmmdata datasets work without a registry: (1) an explicit
+  `stimulus_id` column on the events row wins (§4.1's canonical name);
+  (2) the registry rules when `--registry` is given — §4.2: image trials by
+  `mmmId`, word trials by `(word, voice)`, movie trials by case-insensitive
+  `movie_name` incl. variants; (3) the BIDS `stim_file` stem. Unresolved =
+  error, including a registry-set reference with no registry. Non-BIDS file
+  names get generic per-file entities (stem as task, so two generic files
+  never share a clock); a name mentioning `sub-` that doesn't parse is
+  refused as a likely typo. Orders a subject's presentations across
+  sessions and adds the contextual features that exist only once embedded:
+  `lag_trials` (across everything given), `lag_seconds` (same run only —
+  runs share no clock), `prev_session`/`prev_run`, and optionally
+  `ctx_<model>_k<k>_cosdist` (cosine distance to the mean of the preceding
+  k items in the run, in one chosen space). Item-level rows of a `features`
+  table attach wide. Own `schema_version` (`TIMELINES_SCHEMA_VERSION`) in
+  `<stem>.meta.json`. Experimental time only — HRF/TR belong to braintwill
+  (contracts §4.3 item 5).
+- **`compose.py`** (0.18.0) — the dense half of contracts §4.3 item 5 and
+  the interval→grid direction `project.py` defers: `psytwill compose`
+  expands sparse runs onto the movie grid from item feature stores,
+  emitting movie-schema tables (`movies_frames` / `movies_audio_frames` /
+  `movies_transcript_words` stems) that load through `store.load_spaces`
+  and the movies viewer beside real films with zero special-casing. The
+  composition rule is driven by the store row's temporal grain, not any
+  dataset's trial vocabulary: untimed rows repeat per bin of the
+  presentation window; gridded rows (word audio, a movie's frame grid)
+  shift to the presentation onset preserving their stamping convention
+  (visual stamps bin starts, audio bin centers); chunk-grain rows become
+  transcript rows with `chunk_idx` by presentation order. Empty bins
+  (fixation, rest) get explicit NaN rows by default (`--sparse` opts out) —
+  the fit-time structural fill needs a row to act on. Sidecars carry
+  `COMPOSE_SCHEMA_VERSION`, per-model checkpoints read from the store
+  sidecars, and a per-model `comparable: null` flag reserved for the render
+  falsifier — a composed table is not an extractor readout until that
+  measurement writes a verdict. Idempotent on an input signature
+  (paths+sizes+params; `--force` overrides), `--dry-run`, `--json`.
+- **`media.py`** (0.18.0) — optional viewer media for composed runs
+  (`compose --media`): rendered display frames, onset-muxed `audio.m4a`,
+  transcript CSVs. Lazy Pillow/soundfile imports + subprocess ffmpeg, all
+  named in the error when absent — deliberately outside the core dep
+  policy, and no measured number depends on it. Display geometry fully
+  parameterized (`--screen`/`--image-frac`/`--bg-gray`); media files
+  resolve from a generic `--media-map` TSV or mmmdata-style registry
+  columns (`image_file`, `audio_file_<voice>`) under `--stimuli-root`.
 
 ## Roadmap
 
