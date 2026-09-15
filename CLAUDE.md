@@ -179,6 +179,14 @@ Commit/push only when asked.
 
 ## Roadmap
 
+### Aspirational research and design surveys
+
+- [Event structure from multimodal stimulus features](docs/event-structure-notes.md): segmentation, recurring event types, predictive dynamics, and hierarchy.
+- [Event-structure data resources](docs/event-structure-data-resources.md): candidate datasets and human validation resources.
+- [Neuroscientific models and receptive-field scaffolding](docs/neuroscientific-models-and-receptive-fields.md): pRF estimation requirements, coordinate-aware sensory representations, temporal integration, and a proposed path toward optional neural fitting.
+
+These are future-facing research notes, not approved implementation specifications.
+
 1. **Phase 1 — matrices + transitions + CLI** (built Aug 2026, skeleton
    approved; options/ergonomics still open for iteration). 49 offline tests
    pass in ~0.1 s. Validated end-to-end against real sibling outputs
