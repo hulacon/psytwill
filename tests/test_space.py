@@ -14,12 +14,16 @@ from psytwill.space import (
     detect_structural_columns,
     prepare_member,
     check_fit,
+    check_member,
+    eval_subsample,
     fit_block,
     fit_whitener,
     load_fit,
     save_fit,
     structural_fill_values,
 )
+from psytwill.compare import neighbor_overlap_null
+from psytwill.exceptions import SpaceError
 from psytwill.store import SpaceMatrix
 
 N, LATENT = 600, 4
@@ -354,3 +358,78 @@ class TestStructuralRule:
                    for m in fit.members)
         _, manifest, _ = save_fit(fit, tmp_path)
         assert load_fit(manifest).map.whiteners["a"].structural_fill == {}
+
+
+class TestContiguousEvalBlocks:
+    """With ``block_size`` set, the overlap subsample is whole grid blocks.
+
+    Before 0.18.2 the subsample was drawn row-wise and then cut into blocks,
+    so a "block" held rows from unrelated clips and the block null was a row
+    null in disguise (MEASURED on the A v0.1 fit: overlap p at the permutation
+    floor in all 680 criterion rows).
+    """
+
+    @staticmethod
+    def _smooth(rng, n, dim, width):
+        kernel = np.ones(width) / width
+        noise = rng.normal(size=(n + width - 1, dim))
+        return np.stack([np.convolve(noise[:, j], kernel, mode="valid") for j in range(dim)], axis=1)
+
+    def test_draws_whole_blocks_on_the_grid(self):
+        sub, how = eval_subsample(1000, 250, 20, np.random.default_rng(0))
+        assert how == "blocks"
+        blocks = sub.reshape(-1, 20)
+        assert blocks.shape[0] == 250 // 20
+        assert (blocks[:, 0] % 20 == 0).all()
+        np.testing.assert_array_equal(blocks - blocks[:, :1], np.tile(np.arange(20), (len(blocks), 1)))
+        assert len(np.unique(blocks[:, 0])) == len(blocks)
+
+    def test_trailing_partial_block_is_never_drawn(self):
+        sub, _ = eval_subsample(1010, 1000, 20, np.random.default_rng(0))
+        assert sub.size == 1000 and sub.max() < 1000
+
+    def test_row_path_is_unchanged(self):
+        sub, how = eval_subsample(1000, 250, None, np.random.default_rng(7))
+        expected = np.sort(np.random.default_rng(7).choice(1000, size=250, replace=False))
+        assert how == "rows"
+        np.testing.assert_array_equal(sub, expected)
+        assert eval_subsample(100, 250, 20, np.random.default_rng(0))[1] == "all"
+
+    def test_too_few_blocks_is_refused_before_fitting(self, members, tmp_path):
+        sp, _ = members
+        kw = {**_fit_kwargs(), "eval_n": 100, "block_size": 20}
+        with pytest.raises(SpaceError, match="only 5 blocks"):
+            fit_block(sp, list(sp), **kw)
+        fit = fit_block(sp, list(sp), **_fit_kwargs())
+        with pytest.raises(SpaceError, match="only 5 blocks"):
+            check_fit(fit, sp, n_perm=150, eval_n=100, block_size=20)
+
+    def test_independent_smooth_spaces_fail_the_block_null(self):
+        rng = np.random.default_rng(1)
+        X, Y = self._smooth(rng, 6000, 8, 20), self._smooth(rng, 6000, 8, 20)
+        mc = check_member(X, Y, member="y", k=8, fold=0, k_nn=10, n_perm=200,
+                          eval_n=1200, block_size=40, random_state=0)
+        assert mc.eval_sampling == "blocks"
+        assert not mc.overlap_p < 0.01
+        # the same contiguous rows against a ROW null: temporal adjacency alone "passes"
+        sub, _ = eval_subsample(6000, 1200, 40, np.random.default_rng(0))
+        row = neighbor_overlap_null(X[sub], Y[sub], k=10, n_perm=200, block_size=None)
+        assert row.p_value < 0.01
+
+    def test_shared_signal_still_passes_the_block_null(self):
+        rng = np.random.default_rng(2)
+        # a latent that revisits similar states in unrelated blocks
+        Z = np.repeat(rng.normal(size=(6000 // 5, 3)), 5, axis=0)
+        X = Z @ rng.normal(size=(3, 8)) + 0.05 * rng.normal(size=(6000, 8))
+        Y = Z @ rng.normal(size=(3, 6)) + 0.05 * rng.normal(size=(6000, 6))
+        mc = check_member(X, Y, member="y", k=8, fold=0, k_nn=10, n_perm=200,
+                          eval_n=1200, block_size=40, random_state=0)
+        assert mc.eval_sampling == "blocks"
+        assert mc.overlap_p < 0.01
+
+    def test_sampling_is_recorded_in_manifest_and_curve(self, members):
+        sp, _ = members
+        fit = fit_block(sp, list(sp), **{**_fit_kwargs(), "eval_n": 150, "block_size": 10})
+        assert fit.manifest["criterion"]["eval_sampling"] == "blocks"
+        assert {r["eval_sampling"] for r in fit.curve} == {"blocks"}
+        assert fit_block(sp, list(sp), **_fit_kwargs()).manifest["criterion"]["eval_sampling"] == "all"

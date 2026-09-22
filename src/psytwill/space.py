@@ -340,9 +340,57 @@ class MemberCheck:
     n_rows: int
     metric: str = "cosine"
     eval_rows: int = 0
+    eval_sampling: str = "all"
 
     def passes(self, r2_min: float, alpha: float) -> bool:
         return bool(self.r2 >= r2_min and self.overlap_p < alpha)
+
+
+# A block null over m blocks has only m! distinct orderings, and a draw that
+# leaves most blocks in place scores like the observed graph. Below ~10 blocks
+# the null is too coarse to reach alpha = .01 honestly, so it is refused.
+MIN_EVAL_BLOCKS = 10
+
+
+def _eval_sampling(eval_n: int | None, block_size: int | None) -> str:
+    if eval_n is None:
+        return "all"
+    return "blocks" if block_size is not None and block_size > 1 else "rows"
+
+
+def _check_eval_blocks(eval_n: int | None, block_size: int | None) -> None:
+    """Refuse a subsample too small to hold a usable block null, up front."""
+    if _eval_sampling(eval_n, block_size) != "blocks":
+        return
+    n_take = eval_n // block_size
+    if n_take < MIN_EVAL_BLOCKS:
+        raise SpaceError(
+            f"eval_n={eval_n} holds only {n_take} blocks of block_size={block_size}; the block "
+            f"null needs at least {MIN_EVAL_BLOCKS}. Raise eval_n to >= "
+            f"{MIN_EVAL_BLOCKS * block_size}, or pass eval_n=None (all rows)."
+        )
+
+
+def eval_subsample(n: int, eval_n: int | None, block_size: int | None,
+                   rng: np.random.Generator) -> tuple[np.ndarray, str]:
+    """Row positions for the kNN overlap, and how they were drawn.
+
+    With ``block_size`` set, the subsample is ``eval_n // block_size`` whole
+    blocks from a fixed grid of ``block_size`` positions (a trailing partial
+    block is never drawn), so the block null permutes exactly the sampled
+    blocks and each block keeps its temporal adjacency. Drawing rows at random
+    and then blocking the subsample -- the behaviour before 0.18.2 -- puts
+    rows from different clips in one "block" and turns the block null into a
+    row null, which any temporally smooth pair of spaces beats.
+    """
+    if eval_n is None or n <= eval_n:
+        return np.arange(n), "all"
+    if block_size is None or block_size <= 1:
+        return np.sort(rng.choice(n, size=eval_n, replace=False)), "rows"
+    _check_eval_blocks(eval_n, block_size)
+    n_take = eval_n // block_size
+    starts = np.sort(rng.choice(n // block_size, size=n_take, replace=False)) * block_size
+    return (starts[:, None] + np.arange(block_size)).ravel(), "blocks"
 
 
 def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int, fold: int,
@@ -355,19 +403,18 @@ def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int
     ``metric`` applies to BOTH sides of the neighbour comparison. The mixed
     form (block cosine, member Euclidean) was measured to pass a member the
     block recovers at R^2 = 0.10, so it is not offered.
+
+    Rows must be in temporal order when ``block_size`` is set; the overlap
+    subsample is then drawn as whole blocks (see :func:`eval_subsample`).
     """
-    rr = ridge_predictivity(scores, space_X, groups=groups, alphas=alphas, random_state=random_state)
     n = scores.shape[0]
-    if eval_n is not None and n > eval_n:
-        rng = np.random.default_rng(random_state + fold)
-        sub = np.sort(rng.choice(n, size=eval_n, replace=False))
-    else:
-        sub = np.arange(n)
+    sub, sampling = eval_subsample(n, eval_n, block_size, np.random.default_rng(random_state + fold))
+    rr = ridge_predictivity(scores, space_X, groups=groups, alphas=alphas, random_state=random_state)
     nr = neighbor_overlap_null(scores[sub], space_X[sub], k=k_nn, n_perm=n_perm,
                                metric=metric, block_size=block_size, random_state=random_state)
     return MemberCheck(member=member, k=k, fold=fold, r2=float(rr.r2), overlap=float(nr.observed),
                        overlap_p=float(nr.p_value), null_mean=float(nr.null_mean), n_rows=int(n),
-                       metric=metric, eval_rows=int(sub.size))
+                       metric=metric, eval_rows=int(sub.size), eval_sampling=sampling)
 
 
 
@@ -445,6 +492,7 @@ def fit_block(
     through to the mean-impute policy (see the NaN policy section).
     """
     _check_perm_floor(n_perm, alpha)
+    _check_eval_blocks(eval_n, block_size)
     members = list(members)
     missing = [m for m in members if m not in spaces]
     if missing:
@@ -580,7 +628,8 @@ def fit_block(
         "n_splits": n_splits,
         "grouped": g is not None,
         "criterion": {"r2_min": r2_min, "alpha": alpha, "k_nn": k_nn, "n_perm": n_perm,
-                      "eval_n": eval_n, "block_size": block_size, "random_state": random_state},
+                      "eval_n": eval_n, "block_size": block_size, "random_state": random_state,
+                      "eval_sampling": _eval_sampling(eval_n, block_size)},
         "max_nan_frac": max_nan_frac,
         "structural_rule": None if corpora is None else {
             "null_high": structural_null_high,
@@ -666,6 +715,7 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
               random_state: int = 0) -> list[dict]:
     """The subsumption criterion for every member on an arbitrary table (no refit)."""
     _check_perm_floor(n_perm, alpha)
+    _check_eval_blocks(eval_n, block_size)
     for m in fit.members:
         if m not in spaces:
             raise SpaceError(f"member '{m}' missing from the table; have {sorted(spaces)}")

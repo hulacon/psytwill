@@ -1106,7 +1106,7 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("--alpha", type=float, default=0.01)
         q.add_argument("--k-nn", type=int, default=20)
         q.add_argument("--n-perm", type=int, default=250)
-        q.add_argument("--eval-n", type=int, default=5000, help="rows per fold for the kNN overlap (0 = all)")
+        q.add_argument("--eval-n", type=int, default=5000, help="rows per fold for the kNN overlap (0 = all); with --block-size, drawn as whole contiguous blocks")
         q.add_argument("--block-size", type=int, help="block-permutation width for temporal grids")
         q.add_argument("--seed", type=int, default=0)
 
