@@ -552,15 +552,26 @@ def _space_members(args: argparse.Namespace, available: list[str]) -> list[str]:
 def _space_load(args: argparse.Namespace, members: list[str] | None = None):
     """Load member spaces one model at a time (a 300 M-row group table does
     not fit in pandas whole), dropping --exclude-ids rows. Returns
-    (spaces, members, n_excluded, report)."""
+    (spaces, members, n_excluded, report).
+
+    A member is read from EVERY table that carries it and the rows are
+    stacked, so a fit over several corpora (one group table per corpus) sees
+    all of them. Before 0.18.1 the first table holding a model won and the
+    rest were silently ignored, which would have fit the A block on one
+    corpus while reporting seven. Two tables contributing the same row label
+    is refused rather than pooled: on a multi-corpus fit a duplicate key
+    means the same stimulus was extracted twice, not a replicate.
+    """
+    import numpy as np
+
     from psytwill.store import LoadReport, SpaceMatrix, load_spaces, model_inventory
 
     key = tuple(args.key.split(","))
     rep = LoadReport()
-    where: dict[str, str] = {}
+    where: dict[str, list[str]] = {}
     for path in args.features:
         for m in model_inventory(path)["model"].dropna().unique():
-            where.setdefault(str(m), str(path))
+            where.setdefault(str(m), []).append(str(path))
     if members is None:
         members = _space_members(args, list(where))
     missing = [m for m in members if m not in where]
@@ -571,10 +582,31 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
         ids = {line.strip() for line in Path(args.exclude_ids).read_text().splitlines() if line.strip()}
     spaces: dict = {}
     for m in members:
-        got = load_spaces(where[m], key=key, models=[m], window=args.window, report=rep)
-        if m not in got:
-            raise SpaceError(f"model {m!r} loaded as none of {sorted(got)} (string-valued or empty?)")
-        sm = got[m]
+        parts: list[SpaceMatrix] = []
+        for path in where[m]:
+            got = load_spaces(path, key=key, models=[m], window=args.window, report=rep)
+            if m not in got:
+                raise SpaceError(f"model {m!r} in {path} loaded as none of {sorted(got)} "
+                                 "(string-valued or empty?)")
+            parts.append(got[m])
+        sm = parts[0]
+        if len(parts) > 1:
+            feats = parts[0].features
+            for part, path in zip(parts[1:], where[m][1:]):
+                if part.features != feats:
+                    raise SpaceError(
+                        f"model {m!r} has {len(part.features)} feature columns in {path} but "
+                        f"{len(feats)} in {where[m][0]}; a member must carry the same columns "
+                        "in every table it is stacked from")
+            labels = [lab for part in parts for lab in part.labels]
+            if len(set(labels)) != len(labels):
+                dup = sorted({lab for lab in labels if labels.count(lab) > 1})[:5]
+                raise SpaceError(
+                    f"model {m!r} has {len(labels) - len(set(labels))} row label(s) present in more "
+                    f"than one table (e.g. {dup}); each table must hold distinct stimuli")
+            sm = SpaceMatrix(name=sm.name, labels=labels, X=np.vstack([part.X for part in parts]),
+                             features=feats, modality=sm.modality, extractor=sm.extractor,
+                             n_replicates=max(part.n_replicates for part in parts))
         if ids:
             keep = [i for i, lab in enumerate(sm.labels) if lab.split("|")[0] not in ids]
             if len(keep) != sm.n:
@@ -582,7 +614,8 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
                                  features=sm.features, modality=sm.modality, extractor=sm.extractor,
                                  n_replicates=sm.n_replicates)
         spaces[m] = sm
-        print(f"  loaded {m}: {sm.n} rows x {sm.dim} features", flush=True)
+        src = f" from {len(parts)} tables" if len(parts) > 1 else ""
+        print(f"  loaded {m}: {sm.n} rows x {sm.dim} features{src}", flush=True)
     return spaces, members, len(ids), rep
 
 
@@ -613,7 +646,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
 
     fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
                     groups=groups, corpora=corpora, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
-                    n_perm=args.n_perm, eval_n=args.eval_n, block_size=args.block_size,
+                    n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
                     random_state=args.seed, progress=progress)
     if corpora is not None:
         for m in members:
@@ -676,7 +709,7 @@ def _run_space_check(args: argparse.Namespace) -> None:
         _, labels = align_spaces({m: spaces[m] for m in fit.members})
         groups = [lab.split("|")[0] for lab in labels]
     rows = check_fit(fit, spaces, groups=groups, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
-                     n_perm=args.n_perm, eval_n=args.eval_n, block_size=args.block_size, random_state=args.seed)
+                     n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size, random_state=args.seed)
     n_pass = sum(r["passed"] for r in rows)
     print(f"psytwill space check [{fit.block}, k={fit.k}] on {rows[0]['n_rows']} rows: {n_pass}/{len(rows)} members pass")
     for r in rows:
