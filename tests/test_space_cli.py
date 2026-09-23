@@ -55,7 +55,7 @@ def test_member_is_stacked_across_tables(two_corpora, tmp_path, capsys):
     assert main(argv) == 0
     manifest = json.loads((out / "T_test.json").read_text())
     assert manifest["n_rows"] == 2 * N_STIM * N_BINS
-    assert manifest["structural_rule"]["n_corpora"] == 2
+    assert manifest["null_policy"]["gated_missing_detector"]["n_corpora"] == 2
     assert [p.split("/")[-1] for p in manifest["inputs"]] == [p.name for p in two_corpora]
     text = capsys.readouterr().out
     assert f"loaded a: {2 * N_STIM * N_BINS} rows x 6 features from 2 tables" in text
@@ -79,3 +79,48 @@ def test_same_stimulus_in_two_tables_is_refused(two_corpora, tmp_path, capsys):
             "--window", "0.5", "-o", str(out), "--stem", "T_dup", *FIT_ARGS]
     assert main(argv) == 1
     assert "more than one table" in capsys.readouterr().err
+
+
+def _with_trailing_nulls(path, nulls):
+    """Blank member b's last bin in every stimulus; optionally declare it."""
+    df = pd.read_parquet(path)
+    last = (df["model"] == "b") & (df["time"] == 0.25 + 0.5 * (N_BINS - 1))
+    df.loc[last, "value"] = np.nan
+    df.to_parquet(path, index=False)
+    if nulls is not None:
+        meta = {"schema_version": "1.1", "table": "features", "models": ["a", "b"],
+                "model_nulls": {"a": {}, "b": nulls}}
+        path.with_suffix(".meta.json").write_text(json.dumps(meta))
+    return path
+
+
+def test_undeclared_nan_refuses_the_fit(two_corpora, tmp_path, capsys):
+    table = _with_trailing_nulls(two_corpora[0], None)
+    argv = ["space", "fit", "--features", str(table), "--key", "stimulus_id,time",
+            "--window", "0.5", "-o", str(tmp_path / "space"), "--stem", "T_ref", *FIT_ARGS]
+    with pytest.warns(UserWarning, match="no sidecar"):
+        assert main(argv) == 1
+    assert "no Contract B `nulls` entry" in capsys.readouterr().err
+
+
+def test_declared_undefinable_rows_are_dropped(two_corpora, tmp_path, capsys):
+    pos = {"means": "undefinable", "when": "trailing window"}
+    tables = [_with_trailing_nulls(p, {"b_00": pos, "b_01": pos, "b_02": pos}) for p in two_corpora]
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", *map(str, tables), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "-o", str(out), "--stem", "T_def", *FIT_ARGS]
+    assert main(argv) == 0
+    manifest = json.loads((out / "T_def.json").read_text())
+    assert manifest["n_rows"] == 2 * N_STIM * (N_BINS - 1)
+    assert manifest["per_member"]["b"]["undefinable_rows_dropped"] == 2 * N_STIM
+    assert "b: 48 undefinable row(s) dropped" in capsys.readouterr().out
+
+
+def test_tables_that_disagree_on_nulls_are_refused(two_corpora, tmp_path, capsys):
+    pos = {"means": "undefinable", "when": "trailing window"}
+    _with_trailing_nulls(two_corpora[0], {"b_00": pos, "b_01": pos, "b_02": pos})
+    _with_trailing_nulls(two_corpora[1], {"b_00": pos})
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "-o", str(tmp_path / "space"), "--stem", "T_dis", *FIT_ARGS]
+    assert main(argv) == 1
+    assert "different `nulls` declarations" in capsys.readouterr().err

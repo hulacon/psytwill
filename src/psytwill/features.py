@@ -34,10 +34,13 @@ import pandas as pd
 from psytwill import __version__
 from psytwill.exceptions import EmptyInputError, InputError, SpaceError
 from psytwill.matrices import resolve_labels
-from psytwill.sidecar import load_sidecar, model_checkpoint
+from psytwill.sidecar import load_sidecar, model_checkpoint, model_nulls
 from psytwill.spaces import INDEX_COLUMNS, detect_embedding_spaces
 
-FEATURES_SCHEMA_VERSION = "1.0"
+# 1.1 (psytwill 0.20.0): each input's model entries carry the producer's
+# Contract B 1.1 `nulls` map, and the sidecar consolidates them as
+# `model_nulls` (additive; 1.0 readers ignore both).
+FEATURES_SCHEMA_VERSION = "1.1"
 
 # Reserved columns that survive as keys in the long table; the remaining
 # INDEX_COLUMNS are row-identity implementation details and are dropped
@@ -198,7 +201,7 @@ def _melt_input(
         "modality": modality,
         "n_feature_columns": len(feature_cols),
         "models": {
-            name: {"checkpoint": model_checkpoint(meta, name)}
+            name: {"checkpoint": model_checkpoint(meta, name), "nulls": model_nulls(meta, name)}
             for name in sorted(set(models.values()))
         },
     }
@@ -224,6 +227,90 @@ def _assert_checkpoints(entries: list[dict[str, Any]]) -> None:
                     "checkpoints or build separate tables."
                 )
             seen.setdefault(model, (checkpoint, entry["path"]))
+
+
+def _assert_nulls(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Refuse one table stacking two inputs of a model whose `nulls` differ.
+
+    Returns the consolidated ``{model: nulls}`` map. A 1.0 input (``None``)
+    stacked with a 1.1 one is refused too: the table would declare nulls for
+    some rows of a model and not others (Contract B §4.1 consumer duties).
+    """
+    seen: dict[str, tuple[Any, str]] = {}  # model -> (nulls, path)
+    for entry in entries:
+        for model, info in entry["models"].items():
+            got = info.get("nulls")
+            if model in seen and seen[model][0] != got:
+                first, path = seen[model]
+                raise SpaceError(
+                    f"`nulls` mismatch for model {model!r}: {path} declares "
+                    f"{_describe_nulls(first)}, {entry['path']} declares {_describe_nulls(got)}. "
+                    "One features table cannot mix them; run `<extractor> sidecar refresh` "
+                    "on every input so they all carry the current declaration."
+                )
+            seen.setdefault(model, (got, entry["path"]))
+    return {model: nulls for model, (nulls, _) in sorted(seen.items())}
+
+
+def _describe_nulls(nulls: Any) -> str:
+    if nulls is None:
+        return "nothing (a 1.0 sidecar)"
+    return f"{len(nulls)} column(s)"
+
+
+def group_nulls(table: str | Path) -> dict[str, Any]:
+    """``{model: nulls-map-or-None}`` recorded in a features table's sidecar.
+
+    A table built before features schema 1.1 has no ``model_nulls``, and a
+    table with no sidecar has nothing at all; every model then reads as
+    ``None`` (declares nothing), which refuses a fit only where a NaN is
+    actually present.
+    """
+    meta_path = Path(table).with_suffix(".meta.json")
+    if not meta_path.exists():
+        warnings.warn(f"{table} has no sidecar ({meta_path}); its models declare no `nulls`.",
+                      stacklevel=2)
+        return {}
+    meta = json.loads(meta_path.read_text())
+    if "model_nulls" in meta:
+        return dict(meta["model_nulls"])
+    return {m: None for m in meta.get("models", [])}
+
+
+def refresh_group_nulls(table: str | Path) -> dict[str, Any]:
+    """Re-read every input's (refreshed) extractor sidecar into a table's sidecar.
+
+    The feature values do not depend on `nulls`, so after `<extractor>
+    sidecar refresh` a group table is brought to features schema 1.1 by
+    rewriting its `.meta.json` only -- not by re-aggregating (librispeech
+    alone is ~1 h and 40 G). Refuses, writing nothing, if an input's sidecar
+    is gone or two inputs of one model disagree.
+    """
+    meta_path = Path(table).with_suffix(".meta.json")
+    meta = json.loads(meta_path.read_text())
+    entries = meta.get("inputs", [])
+    for entry in entries:
+        side = load_sidecar(entry["path"])
+        if side is None and entry.get("extractor"):
+            raise InputError(f"{table}: input {entry['path']} had a sidecar when aggregated but "
+                             "none is found now; cannot refresh its `nulls`.")
+        for name, info in entry["models"].items():
+            info["nulls"] = model_nulls(side, name)
+    consolidated = _assert_nulls(entries)
+    before = (meta.get("schema_version"), meta.get("model_nulls"))
+    meta["model_nulls"] = consolidated
+    meta["schema_version"] = FEATURES_SCHEMA_VERSION
+    if before != (meta["schema_version"], consolidated):
+        meta.setdefault("refreshed", []).append({
+            "by": f"psytwill {__version__}",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "fields": ["schema_version", "inputs.*.models.*.nulls", "model_nulls"],
+            "from_schema_version": before[0],
+        })
+        tmp = meta_path.with_name(meta_path.name + ".tmp")
+        tmp.write_text(json.dumps(meta, indent=2))
+        os.replace(tmp, meta_path)
+    return consolidated
 
 
 def _key_hash(table: pd.DataFrame) -> np.ndarray:
@@ -427,6 +514,7 @@ def build_features(
             # Incremental, so a checkpoint clash is refused at the input that
             # introduces it rather than after every input has been melted.
             _assert_checkpoints(entries)
+            _assert_nulls(entries)
 
             table = _coerce(long)
             del long
@@ -490,6 +578,7 @@ def build_features(
         "skipped_empty": skipped_empty,
         "n_stimuli": len(stimulus_ids),
         "models": sorted(models_seen),
+        "model_nulls": _assert_nulls(entries),
     }
     meta_path = output.with_suffix(".meta.json")
     with open(meta_path, "w") as f:

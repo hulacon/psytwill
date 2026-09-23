@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,7 +69,7 @@ EUCLIDEAN_RANK_BELOW: int = 3
 def metric_for_rank(rank: int) -> str:
     """Neighbour metric for a member whitened to ``rank`` directions."""
     return "euclidean" if int(rank) < EUCLIDEAN_RANK_BELOW else "cosine"
-SPACE_SCHEMA_VERSION = "1.2"
+SPACE_SCHEMA_VERSION = "1.3"
 
 
 # --------------------------------------------------------------------------
@@ -90,6 +91,8 @@ class SpaceWhitener:
     #: feature -> raw fill value for structurally-conditional columns
     #: (frozen at fit time; see the NaN policy section)
     structural_fill: dict = field(default_factory=dict)
+    #: columns declared `undefinable`: a row holding NaN in one is not projected
+    undefinable: list = field(default_factory=list)
 
     @property
     def rank(self) -> int:
@@ -209,8 +212,63 @@ def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: 
 
 DEFAULT_MAX_NAN_FRAC = 0.5
 
-# Structurally-conditional columns (DECIDED 2026-09-13, psytwill-space
-# workbench): some columns have *no value* when their condition is absent --
+# CONTRACT B 1.1 (DECIDED 2026-09-22, constellation-contracts §4.1): the fit
+# acts on what each producer DECLARES a null to mean, and never infers it
+# from data. Per member, from its `nulls` map ({column: {"means", "when"}}):
+#
+#   - a NaN in a column with no entry REFUSES the fit (producer defect; a
+#     1.0 input has no entries, so it refuses exactly where a NaN is present);
+#   - `undefinable` (positional, e.g. a clip's trailing window): every row
+#     where any member holds one is dropped from the fit and the criterion,
+#     and counted per member;
+#   - `undefined` (content, e.g. no voice): the frozen sentinel fill below;
+#   - `missing` (extraction failed, e.g. OOV): the missing-data policy,
+#     max_nan_frac drop then mean-impute, as before.
+#
+# The per-corpus null-contrast detector below survives only as a WARNING on
+# columns declared `missing` whose nulls look gated. It no longer changes a
+# fit: in its first real use it missed three gated columns (graded or rare
+# gates), which is why the decision moved to the producer.
+NULL_KINDS = ("undefined", "undefinable", "missing")
+
+
+def null_kinds(nulls: dict | None) -> dict[str, str]:
+    """``{column: kind}`` from a Contract B ``nulls`` map (None -> {})."""
+    out: dict[str, str] = {}
+    for col, entry in (nulls or {}).items():
+        kind = entry.get("means") if isinstance(entry, dict) else None
+        if kind not in NULL_KINDS:
+            raise SpaceError(f"nulls entry for {col!r} has means={kind!r}; expected one of {NULL_KINDS}")
+        out[col] = kind
+    return out
+
+
+def undeclared_nan_columns(space: SpaceMatrix, kinds: dict[str, str]) -> list[str]:
+    X = np.asarray(space.X, dtype=float)
+    has_nan = np.isnan(X).any(axis=0) if X.size else np.zeros(len(space.features), bool)
+    return [f for f, h in zip(space.features, has_nan) if h and f not in kinds]
+
+
+def undefinable_rows(spaces: dict[str, SpaceMatrix], kinds: dict[str, dict[str, str]]) -> dict[str, np.ndarray]:
+    """Per member, a row mask of NaN in any of its ``undefinable`` columns (aligned rows)."""
+    out = {}
+    for m, sp in spaces.items():
+        cols = [i for i, f in enumerate(sp.features) if kinds.get(m, {}).get(f) == "undefinable"]
+        if cols:
+            out[m] = np.isnan(np.asarray(sp.X, dtype=float)[:, cols]).any(axis=1)
+    return out
+
+
+def _take_rows(space: SpaceMatrix, keep: np.ndarray) -> SpaceMatrix:
+    return SpaceMatrix(name=space.name, labels=[lab for lab, k in zip(space.labels, keep) if k],
+                       X=np.asarray(space.X, dtype=float)[keep], features=list(space.features),
+                       modality=space.modality, extractor=space.extractor,
+                       n_replicates=space.n_replicates)
+
+# HISTORY (superseded 2026-09-23 by the Contract B 1.1 section above; the fill
+# below is still how `undefined` is represented, and the detector is kept only
+# as a warning). Structurally-conditional columns (DECIDED 2026-09-13,
+# psytwill-space workbench): some columns have *no value* when their condition is absent --
 # a formant frequency on a frame with no voice, a mean turn duration in
 # instrumental music. The extractors encode this correctly (null, where a
 # genuine absence-of-events is 0), and mean-imputing those nulls fabricates
@@ -232,10 +290,8 @@ DEFAULT_MAX_NAN_FRAC = 0.5
 #    The gate itself is already visible to the block through columns that
 #    are always defined (the rule adds no columns).
 #
-# Detection needs a per-row corpus label and runs only when the caller
-# provides one (`fit_block(..., corpora=...)`); without it the policy is
-# unchanged (max_nan_frac drop + mean-impute). Filled columns are exempt
-# from the max_nan_frac drop by construction: the fill runs first.
+# Filled (`undefined`) columns are exempt from the max_nan_frac drop by
+# construction: the fill runs first.
 STRUCTURAL_NULL_HIGH = 0.9
 STRUCTURAL_NULL_LOW = 0.2
 STRUCTURAL_FILL_Z = -3.0
@@ -451,9 +507,28 @@ class BlockFit:
     manifest: dict = field(default_factory=dict)
 
     def project(self, spaces: dict[str, SpaceMatrix]) -> tuple[np.ndarray, list[str]]:
+        """Block scores for every aligned row that is not undefinable.
+
+        A row holding NaN in a member's `undefinable` column has no position
+        in the space (it was dropped from the fit), so it is left out rather
+        than mean-filled; the returned labels say which rows were scored.
+        """
         picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
         aligned, labels = align_spaces(picked)
+        aligned, labels, _ = _drop_undefinable(self, aligned, labels)
         return self.map.scores(aligned, k=self.k), labels
+
+
+def _drop_undefinable(fit: "BlockFit", aligned: dict[str, SpaceMatrix], labels: list[str]):
+    kinds = {m: {f: "undefinable" for f in fit.map.whiteners[m].undefinable} for m in fit.members}
+    drop = np.zeros(len(labels), dtype=bool)
+    for mask in undefinable_rows(aligned, kinds).values():
+        drop |= mask
+    if not drop.any():
+        return aligned, labels, drop
+    keep = ~drop
+    return ({m: _take_rows(sp, keep) for m, sp in aligned.items()},
+            [lab for lab, k in zip(labels, keep) if k], drop)
 
 
 def _folds(n: int, n_splits: int, groups: Sequence | None, random_state: int):
@@ -485,6 +560,7 @@ def fit_block(
     random_state: int = 0,
     max_nan_frac: float = DEFAULT_MAX_NAN_FRAC,
     corpora: Sequence | None = None,
+    nulls: dict[str, dict | None] | None = None,
     structural_null_high: float = STRUCTURAL_NULL_HIGH,
     structural_null_low: float = STRUCTURAL_NULL_LOW,
     structural_fill_z: float = STRUCTURAL_FILL_Z,
@@ -492,10 +568,10 @@ def fit_block(
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
-    ``corpora`` (one label per aligned row) turns on the structural-
-    missingness rule: columns null under a per-corpus gate are detected by
-    corpus contrast and filled with a frozen sentinel instead of falling
-    through to the mean-impute policy (see the NaN policy section).
+    ``nulls`` maps each member to its Contract B 1.1 ``nulls`` map (None for
+    a 1.0 input), and decides every null (see the NaN policy section): a NaN
+    without an entry refuses the fit. ``corpora`` (one label per aligned row)
+    only feeds the warning-only gated-`missing` detector.
     """
     _check_perm_floor(n_perm, alpha)
     _check_eval_blocks(eval_n, block_size)
@@ -506,19 +582,65 @@ def fit_block(
     if len(members) < 1:
         raise SpaceError("a block needs at least one member space")
     aligned, labels = align_spaces({m: spaces[m] for m in members})
+    nulls = nulls or {}
+    kinds = {m: null_kinds(nulls.get(m)) for m in members}
+    # 1. refuse any undeclared NaN (per member, on the table being fitted)
+    refused = {m: cols for m in members if (cols := undeclared_nan_columns(aligned[m], kinds[m]))}
+    if refused:
+        detail = "; ".join(f"{m}: {', '.join(c[:6])}{' ...' if len(c) > 6 else ''} ({len(c)})"
+                           for m, c in refused.items())
+        no_map = [m for m in refused if nulls.get(m) is None]
+        raise SpaceError(
+            f"NaN in column(s) with no Contract B `nulls` entry -- {detail}. An undeclared null "
+            "is a producer defect (constellation-contracts §4.1), so the fit is refused rather "
+            "than guessing. Fix: `<extractor> sidecar refresh` the member's producer sidecars, "
+            "then `psytwill features --refresh-nulls` the group tables."
+            + (f" Members with no nulls map at all (1.0 input): {no_map}." if no_map else ""))
+    if corpora is not None and len(corpora) != len(labels):
+        raise SpaceError(f"corpora must have one entry per aligned row "
+                         f"({len(corpora)} != {len(labels)})")
+    if groups is not None and len(groups) != len(labels):
+        raise SpaceError("groups must have one entry per aligned row")
+    # 2. drop rows any member declares undefinable
+    undef_rows = undefinable_rows(aligned, kinds)
+    undefinable_dropped = {m: int(mask.sum()) for m, mask in undef_rows.items()}
+    drop = np.zeros(len(labels), dtype=bool)
+    for mask in undef_rows.values():
+        drop |= mask
+    if drop.any():
+        keep = ~drop
+        aligned = {m: _take_rows(aligned[m], keep) for m in members}
+        labels = [lab for lab, k in zip(labels, keep) if k]
+        if groups is not None:
+            groups = [x for x, k in zip(groups, keep) if k]
+        if corpora is not None:
+            corpora = [x for x, k in zip(corpora, keep) if k]
+    # never-null declarations and the gated-`missing` warning read the table
+    # before any fill
+    declared_never_null: dict[str, list[str]] = {}
+    suspected_gated: dict[str, list[str]] = {}
+    for m in members:
+        X = np.asarray(aligned[m].X, dtype=float)
+        has_nan = dict(zip(aligned[m].features, np.isnan(X).any(axis=0))) if X.size else {}
+        declared_never_null[m] = sorted(c for c in kinds[m] if c in has_nan and not has_nan[c])
+        if corpora is not None:
+            gated = detect_structural_columns(aligned[m], corpora, high=structural_null_high,
+                                              low=structural_null_low)
+            sus = [c for c in gated if kinds[m].get(c) == "missing"]
+            if sus:
+                suspected_gated[m] = sus
+                warnings.warn(f"{m}: column(s) {sus} are declared `missing` but their nulls look "
+                              "gated by corpus (null in bulk in one corpus, rare in another); the "
+                              "declaration may be wrong. The fit is unchanged.", stacklevel=2)
+    # 3. undefined -> the frozen sentinel, for every declared-undefined column
+    #    the member carries (so a projection of new rows fills them too)
     structural_fill: dict[str, dict[str, float]] = {}
-    if corpora is not None:
-        if len(corpora) != len(labels):
-            raise SpaceError(f"corpora must have one entry per aligned row "
-                             f"({len(corpora)} != {len(labels)})")
-        for m in members:
-            cols = detect_structural_columns(aligned[m], corpora,
-                                             high=structural_null_high,
-                                             low=structural_null_low)
-            if cols:
-                structural_fill[m] = structural_fill_values(
-                    aligned[m], cols, fill_z=structural_fill_z)
-                aligned[m] = apply_structural_fill(aligned[m], structural_fill[m])
+    for m in members:
+        cols = [f for f in aligned[m].features if kinds[m].get(f) == "undefined"]
+        if cols:
+            structural_fill[m] = structural_fill_values(aligned[m], cols, fill_z=structural_fill_z)
+            aligned[m] = apply_structural_fill(aligned[m], structural_fill[m])
+    # 4. missing -> max_nan_frac drop + mean-impute (unchanged)
     dropped_columns: dict[str, list[str]] = {}
     for m in members:
         aligned[m], dropped = prepare_member(aligned[m], max_nan_frac=max_nan_frac)
@@ -588,6 +710,9 @@ def fit_block(
 
     final = fit_block_map(aligned, members, np.arange(n), k_max=chosen,
                           structural_fill=structural_fill)
+    for m in members:
+        final.whiteners[m].undefinable = sorted(
+            f for f in final.whiteners[m].features if kinds[m].get(f) == "undefinable")
     chosen = min(chosen, final.k_max)  # the concatenation may have fewer directions than k
     pr = {m: float(final.whiteners[m].participation_ratio) for m in members}
     pr_sum = float(sum(pr.values()))
@@ -604,6 +729,10 @@ def fit_block(
             "dim": aligned[m].dim,
             "dropped_columns": dropped_columns.get(m, []),
             "structural_columns": sorted(structural_fill.get(m, {})),
+            "nulls_declared": nulls.get(m) is not None,
+            "undefinable_rows_dropped": undefinable_dropped.get(m, 0),
+            "declared_never_null": declared_never_null.get(m, []),
+            "suspected_gated_missing": suspected_gated.get(m, []),
             "nan_fraction_kept": float(np.isnan(aligned[m].X).mean()),
             "r2_per_fold": [r["r2"] for r in rows],
             "overlap_per_fold": [r["overlap"] for r in rows],
@@ -637,12 +766,14 @@ def fit_block(
                       "eval_n": eval_n, "block_size": block_size, "random_state": random_state,
                       "eval_sampling": _eval_sampling(eval_n, block_size)},
         "max_nan_frac": max_nan_frac,
-        "structural_rule": None if corpora is None else {
-            "null_high": structural_null_high,
-            "null_low": structural_null_low,
+        "null_policy": {
+            "source": "contract-b-1.1 nulls",
             "fill_z": structural_fill_z,
-            "n_corpora": int(len(set(corpora))),
-            "n_structural_columns": int(sum(len(v) for v in structural_fill.values())),
+            "n_undefined_filled_columns": int(sum(len(v) for v in structural_fill.values())),
+            "n_undefinable_rows_dropped": int(drop.sum()),
+            "gated_missing_detector": None if corpora is None else {
+                "null_high": structural_null_high, "null_low": structural_null_low,
+                "n_corpora": int(len(set(corpora))), "effect": "warning only"},
         },
         "k_schedule": schedule,
         "block_eigenvalues": [float(v) for v in final.block_eigenvalues],
@@ -679,6 +810,7 @@ def save_fit(fit: BlockFit, out_dir: str | Path, *, stem: str | None = None) -> 
     meta["member_features"] = {m: fit.map.whiteners[m].features for m in fit.members}
     meta["member_pr"] = {m: fit.map.whiteners[m].participation_ratio for m in fit.members}
     meta["member_structural_fill"] = {m: fit.map.whiteners[m].structural_fill for m in fit.members}
+    meta["member_undefinable"] = {m: fit.map.whiteners[m].undefinable for m in fit.members}
     manifest = out / f"{stem}.json"
     manifest.write_text(json.dumps(meta, indent=2))
     import pandas as pd
@@ -703,6 +835,7 @@ def load_fit(manifest_path: str | Path) -> BlockFit:
             scales=data[f"w::{m}::scales"],
             participation_ratio=float(meta["member_pr"][m]),
             structural_fill=dict(meta.get("member_structural_fill", {}).get(m, {})),
+            undefinable=list(meta.get("member_undefinable", {}).get(m, [])),
         )
     bm = BlockMap(
         members=list(meta["members"]),
@@ -733,6 +866,11 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
                                        fit.map.whiteners[m].structural_fill)
               for m in fit.members}
     aligned, labels = align_spaces(picked)
+    if groups is not None and len(groups) != len(labels):
+        raise SpaceError("groups must have one entry per aligned row")
+    aligned, labels, drop = _drop_undefinable(fit, aligned, labels)
+    if groups is not None and drop.any():
+        groups = [x for x, d in zip(groups, drop) if not d]
     S = fit.map.scores(aligned, k=fit.k)
     out = []
     for m in fit.members:

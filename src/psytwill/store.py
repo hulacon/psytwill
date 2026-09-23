@@ -97,6 +97,8 @@ class LoadReport:
     """Dropped space -> the identical space it duplicated."""
     dropped_provenance: dict[str, list[str]] = field(default_factory=dict)
     """Space -> prefixed provenance columns excluded from its matrix."""
+    nulls: dict[str, dict | None] = field(default_factory=dict)
+    """Space -> its Contract B 1.1 `nulls` map from the table sidecar(s); None = 1.0."""
 
 
 def _read(

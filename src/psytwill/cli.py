@@ -138,8 +138,16 @@ def _parse_modality_map(arg: str | None) -> dict[str, str] | None:
 
 
 def _run_features(args: argparse.Namespace) -> None:
-    from psytwill.features import build_features
+    from psytwill.features import build_features, refresh_group_nulls
 
+    if args.refresh_nulls:
+        for table in args.inputs:
+            got = refresh_group_nulls(table)
+            n_decl = sum(v is not None for v in got.values())
+            print(f"psytwill features --refresh-nulls {table}: {n_decl}/{len(got)} models declare nulls")
+        return
+    if not args.output:
+        raise SystemExit("psytwill features: -o/--output is required (unless --refresh-nulls)")
     summary = build_features(
         args.inputs,
         output=args.output,
@@ -566,11 +574,13 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
     """
     import numpy as np
 
+    from psytwill.features import group_nulls
     from psytwill.store import LoadReport, SpaceMatrix, load_spaces, model_inventory
 
     key = tuple(args.key.split(","))
     rep = LoadReport()
     where: dict[str, list[str]] = {}
+    table_nulls = {str(path): group_nulls(path) for path in args.features}
     for path in args.features:
         for m in model_inventory(path)["model"].dropna().unique():
             where.setdefault(str(m), []).append(str(path))
@@ -616,6 +626,13 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
                                  features=sm.features, modality=sm.modality, extractor=sm.extractor,
                                  n_replicates=sm.n_replicates)
         spaces[m] = sm
+        declared = [table_nulls[p].get(m) for p in where[m]]
+        if any(d != declared[0] for d in declared[1:]):
+            raise SpaceError(
+                f"model {m!r} carries different `nulls` declarations across its tables "
+                f"({', '.join(where[m])}); refresh every input so they agree "
+                "(`<extractor> sidecar refresh`, then `psytwill features --refresh-nulls`)")
+        rep.nulls[m] = declared[0]
         src = f" from {len(parts)} tables" if len(parts) > 1 else ""
         print(f"  loaded {m}: {sm.n} rows x {sm.dim} features{src}", flush=True)
     return spaces, members, len(ids), rep
@@ -639,7 +656,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
 
             ids = [lab.split("|")[0] for lab in labels]
             corpora = [parse_ext_id(i)[0] if is_external(i) else "internal" for i in ids]
-            print(f"  structural rule on: {len(set(corpora))} corpora "
+            print(f"  gated-missing detector (warning only): {len(set(corpora))} corpora "
                   f"({', '.join(sorted(set(corpora)))})")
 
     def progress(i, n, what):
@@ -647,14 +664,18 @@ def _run_space_fit(args: argparse.Namespace) -> None:
             print(f"  [{i}/{n}] {what}", flush=True)
 
     fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
-                    groups=groups, corpora=corpora, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
+                    groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                     n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
                     random_state=args.seed, progress=progress)
-    if corpora is not None:
-        for m in members:
-            sc = fit.manifest["per_member"][m]["structural_columns"]
-            if sc:
-                print(f"  {m}: {len(sc)} structural column(s) filled: {', '.join(sc)}")
+    for m in members:
+        pm = fit.manifest["per_member"][m]
+        if pm["structural_columns"]:
+            print(f"  {m}: {len(pm['structural_columns'])} undefined column(s) filled: "
+                  f"{', '.join(pm['structural_columns'])}")
+        if pm["undefinable_rows_dropped"]:
+            print(f"  {m}: {pm['undefinable_rows_dropped']} undefinable row(s) dropped")
+        if pm["suspected_gated_missing"]:
+            print(f"  {m}: WARNING declared `missing` but looks gated: {pm['suspected_gated_missing']}")
     fit.manifest["inputs"] = [str(p) for p in args.features]
     fit.manifest["key"] = args.key
     fit.manifest["window"] = args.window
@@ -772,13 +793,19 @@ def build_parser() -> argparse.ArgumentParser:
         "features",
         help="Aggregate N extractor CSVs into one long-form feature table",
     )
-    f.add_argument("inputs", nargs="+", help="Extractor scores CSV/TSV files")
+    f.add_argument("inputs", nargs="+",
+                   help="Extractor scores CSV/TSV files (or, with --refresh-nulls, features tables)")
     f.add_argument(
         "-o",
         "--output",
-        required=True,
         help="Output table (.parquet preferred, or .csv); "
         "<stem>.meta.json is written alongside",
+    )
+    f.add_argument(
+        "--refresh-nulls",
+        action="store_true",
+        help="Instead of aggregating: re-read each input's (refreshed) extractor sidecar into "
+        "the given features tables' sidecars (Contract B 1.1 `nulls`); JSON only, no re-aggregation",
     )
     f.add_argument(
         "--modality-map",
@@ -1127,10 +1154,10 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--k-schedule", help="comma-separated k candidates (default 8,16,...,256 below the PR bound)")
     f.add_argument("--n-splits", type=int, default=5)
     f.add_argument("--corpora-from-label", action="store_true",
-                   help="structural-missingness rule: read the corpus from each row's "
-                        "ext-<corpus>-* stimulus_id (non-external ids group as 'internal') "
-                        "and fill columns null under a per-corpus gate with a frozen "
-                        "sentinel instead of mean-imputing them")
+                   help="read the corpus from each row's ext-<corpus>-* stimulus_id "
+                        "(non-external ids group as 'internal') for the gated-`missing` "
+                        "WARNING only: nulls are handled as the producers declare them "
+                        "(Contract B 1.1 `nulls`), never inferred from corpus contrast")
     _space_criterion(f)
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")

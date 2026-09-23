@@ -87,6 +87,21 @@ def load_sidecar(csv_path: str | Path) -> dict[str, Any] | None:
     return meta
 
 
+def model_nulls(sidecar: dict[str, Any] | None, space_name: str) -> dict[str, Any] | None:
+    """The Contract B 1.1 ``nulls`` map recorded for a space's model.
+
+    ``None`` means the sidecar declares nothing (a 1.0 sidecar, or no
+    sidecar): different from ``{}``, which is a producer's positive claim
+    that the model never emits NaN.
+    """
+    if not sidecar:
+        return None
+    entry = sidecar.get("models", {}).get(space_name)
+    if not isinstance(entry, dict) or not isinstance(entry.get("nulls"), dict):
+        return None
+    return entry["nulls"]
+
+
 def model_checkpoint(sidecar: dict[str, Any] | None, space_name: str) -> str | None:
     """The checkpoint recorded for a space's model, if any.
 

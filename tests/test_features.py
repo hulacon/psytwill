@@ -449,3 +449,65 @@ def test_all_inputs_empty_still_writes_a_schema_correct_table(tmp_path):
         summary = build_features([empty], out)
     assert summary["rows"] == 0
     assert list(pd.read_csv(out).columns) == OUTPUT_COLUMNS
+
+
+# --- Contract B 1.1 `nulls` carry-through -----------------------------------
+
+UNDEF = {"means": "undefined", "when": "no face"}
+
+
+def _declare(csv_path, model, nulls):
+    side = csv_path.with_suffix(".meta.json")
+    meta = json.loads(side.read_text())
+    meta["schema_version"] = "1.1"
+    meta["models"][model]["nulls"] = nulls
+    side.write_text(json.dumps(meta))
+
+
+def test_nulls_are_carried_into_the_table_sidecar(tmp_path):
+    from psytwill.features import group_nulls
+
+    a = image_fixture(tmp_path, name="a.csv")
+    _declare(a, "resmem", {"resmem_memorability": UNDEF})
+    _declare(a, "clip", {})
+    build_features([a], tmp_path / "features.csv")
+    meta = json.loads((tmp_path / "features.meta.json").read_text())
+    assert meta["schema_version"] == FEATURES_SCHEMA_VERSION == "1.1"
+    assert meta["inputs"][0]["models"]["resmem"]["nulls"] == {"resmem_memorability": UNDEF}
+    got = group_nulls(tmp_path / "features.csv")
+    assert got["resmem"] == {"resmem_memorability": UNDEF}
+    assert got["clip"] == {}  # a positive "never null"
+    assert got["caption"] is None  # this input declares nothing for it
+
+
+def test_nulls_mismatch_across_inputs_is_refused(tmp_path):
+    a = image_fixture(tmp_path, name="a.csv")
+    b = image_fixture(tmp_path, name="b.csv")
+    _declare(a, "resmem", {"resmem_memorability": UNDEF})  # b stays 1.0: declares nothing
+    with pytest.raises(SpaceError, match="`nulls` mismatch for model 'resmem'.*1.0 sidecar"):
+        build_features([a, b], tmp_path / "features.csv")
+
+
+def test_refresh_nulls_rewrites_only_the_sidecar(tmp_path, capsys):
+    from psytwill.cli import main
+    from psytwill.features import group_nulls
+
+    a = image_fixture(tmp_path, name="a.csv")
+    out = tmp_path / "features.csv"
+    build_features([a], out)
+    assert group_nulls(out)["resmem"] is None
+    before = out.read_bytes()
+    _declare(a, "resmem", {"resmem_memorability": UNDEF})  # the producer refresh
+    assert main(["features", "--refresh-nulls", str(out)]) == 0
+    assert group_nulls(out)["resmem"] == {"resmem_memorability": UNDEF}
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["refreshed"][0]["fields"][-1] == "model_nulls"
+    assert out.read_bytes() == before  # the table itself is untouched
+    assert "declare nulls" in capsys.readouterr().out
+
+
+def test_table_without_a_sidecar_declares_nothing(tmp_path):
+    from psytwill.features import group_nulls
+
+    with pytest.warns(UserWarning, match="no sidecar"):
+        assert group_nulls(tmp_path / "orphan.parquet") == {}

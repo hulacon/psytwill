@@ -47,6 +47,14 @@ def members():
     }, Z
 
 
+def _undefined():
+    return {"means": "undefined", "when": "gate off"}
+
+
+def _missing():
+    return {"means": "missing", "when": "extraction failed"}
+
+
 def _fit_kwargs():
     # small null / subset so the suite stays fast; the criterion is unchanged
     return dict(n_splits=3, n_perm=150, eval_n=None, k_nn=10, k_schedule=(2, 4, 8, 16))
@@ -164,7 +172,8 @@ class TestNaNPolicy:
         sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=X, features=sp["b"].features)
         kept, dropped = prepare_member(sp["b"])
         assert dropped == ["b_000"] and kept.dim == 11
-        fit = fit_block(sp, ["a", "b"], block="T", r2_min=0.9, **_fit_kwargs())
+        nulls = {"b": {c: _missing() for c in ("b_000", "b_001")}}
+        fit = fit_block(sp, ["a", "b"], block="T", r2_min=0.9, nulls=nulls, **_fit_kwargs())
         assert fit.manifest["per_member"]["b"]["dropped_columns"] == ["b_000"]
         assert fit.manifest["subsumes_all_members"]
         # projecting the original (13-column) table selects the kept columns by name
@@ -241,7 +250,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.2"
+        assert meta["space_schema_version"] == "1.3"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -260,15 +269,13 @@ class TestPRBasisAndReporting:
             assert rows and all(r > 0 for r in rows)
 
 
-class TestStructuralRule:
-    """Structurally-conditional columns (DECIDED 2026-09-13).
+class TestContractBNulls:
+    """Contract B 1.1 (DECIDED 2026-09-22): the fit acts on declared `nulls`.
 
-    A column that is null whenever its condition is absent (a formant on a
-    frame with no voice) has *no value* there, not a missing one. The rule
-    detects such columns by per-corpus null contrast and fills them with a
-    frozen sentinel, so neither branch of the old policy fires: the column
-    is not dropped when the gated corpus dominates the mix, and no mean is
-    fabricated when it does not.
+    `undefined` -> frozen sentinel fill; `undefinable` -> the row is dropped
+    from fit and criterion; `missing` -> max_nan_frac drop + mean-impute; a
+    NaN with no declaration refuses the fit. The corpus-contrast detector only
+    warns about `missing` columns that look gated.
     """
 
     N_ON, N_OFF = 250, 350  # gate-on rows, gate-off rows (off majority)
@@ -286,20 +293,28 @@ class TestStructuralRule:
         # b_000 is gated: null on every gate-off row and 4 % of gate-on rows
         X[self.N_ON:, 0] = np.nan
         X[: self.N_ON : 25, 0] = np.nan
-        # b_001 has sparse incidental gaps everywhere -- not structural
+        # b_001 has sparse incidental gaps everywhere
         X[::20, 1] = np.nan
         sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=X, features=sp["b"].features)
-        return sp, corpora
+        nulls = {"a": {}, "b": {"b_000": _undefined(), "b_001": _missing()}}
+        return sp, corpora, nulls
+
+    def test_undeclared_nan_refuses_the_fit(self, gated):
+        sp, _, nulls = gated
+        with pytest.raises(SpaceError, match=r"b: b_000, b_001 \(2\).*1\.0 input\): \['b'\]"):
+            fit_block(sp, ["a", "b"], block="T", **_fit_kwargs())  # no maps at all
+        with pytest.raises(SpaceError, match=r"b: b_001 \(1\)"):
+            fit_block(sp, ["a", "b"], block="T", nulls={"b": {"b_000": _undefined()}},
+                      **_fit_kwargs())
 
     def test_detection_needs_corpus_contrast(self, gated):
-        sp, corpora = gated
+        sp, corpora, _ = gated
         assert detect_structural_columns(sp["b"], corpora) == ["b_000"]
         assert detect_structural_columns(sp["a"], corpora) == []
-        # one corpus: no contrast to read, nothing detected
         assert detect_structural_columns(sp["b"], ["one"] * sp["b"].n) == []
 
     def test_fill_sits_below_the_defined_range(self, gated):
-        sp, _ = gated
+        sp, _, _ = gated
         fills = structural_fill_values(sp["b"], ["b_000"])
         col = sp["b"].X[:, 0]
         assert fills["b_000"] == pytest.approx(np.nanmean(col) - 3 * np.nanstd(col))
@@ -308,24 +323,33 @@ class TestStructuralRule:
         assert not np.isnan(filled.X[:, 0]).any()
         assert np.isnan(filled.X[:, 1]).any()  # sparse gaps untouched
 
-    def test_gated_column_is_kept_not_dropped_or_mean_imputed(self, gated):
-        sp, corpora = gated
-        # without corpora the old policy drops it: pooled null 0.60 > 0.5
-        fit_old = fit_block(sp, ["a", "b"], block="T", **_fit_kwargs())
-        assert "b_000" in fit_old.manifest["per_member"]["b"]["dropped_columns"]
-        # with corpora it is detected, filled and kept
-        fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, **_fit_kwargs())
+    def test_undefined_is_filled_and_kept_missing_follows_the_old_policy(self, gated):
+        sp, _, nulls = gated
+        fit = fit_block(sp, ["a", "b"], block="T", nulls=nulls, **_fit_kwargs())
         pm = fit.manifest["per_member"]["b"]
-        assert pm["structural_columns"] == ["b_000"]
-        assert "b_000" not in pm["dropped_columns"]
-        assert pm["dim"] == 12
-        rule = fit.manifest["structural_rule"]
-        assert rule["n_corpora"] == 2 and rule["n_structural_columns"] == 1
+        assert pm["structural_columns"] == ["b_000"] and "b_000" not in pm["dropped_columns"]
+        assert pm["dim"] == 12 and pm["nulls_declared"]
+        assert fit.manifest["null_policy"]["n_undefined_filled_columns"] == 1
         assert fit.manifest["subsumes_all_members"]
+        # the same gated column declared `missing` is dropped (pooled null 0.60 > 0.5)
+        as_missing = {"a": {}, "b": {"b_000": _missing(), "b_001": _missing()}}
+        fit2 = fit_block(sp, ["a", "b"], block="T", nulls=as_missing, **_fit_kwargs())
+        assert "b_000" in fit2.manifest["per_member"]["b"]["dropped_columns"]
+
+    def test_gated_missing_declaration_warns_but_does_not_change_the_fit(self, gated):
+        sp, corpora, _ = gated
+        as_missing = {"a": {}, "b": {"b_000": _missing(), "b_001": _missing()}}
+        with pytest.warns(UserWarning, match="declared `missing` but their nulls look gated"):
+            fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, nulls=as_missing,
+                            **_fit_kwargs())
+        pm = fit.manifest["per_member"]["b"]
+        assert pm["suspected_gated_missing"] == ["b_000"]
+        assert "b_000" in pm["dropped_columns"]  # warning only
+        assert fit.manifest["null_policy"]["gated_missing_detector"]["effect"] == "warning only"
 
     def test_undefined_is_distinct_from_the_mean_in_the_whitened_space(self, gated):
-        sp, corpora = gated
-        fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, **_fit_kwargs())
+        sp, _, nulls = gated
+        fit = fit_block(sp, ["a", "b"], block="T", nulls=nulls, **_fit_kwargs())
         w = fit.map.whiteners["b"]
         base = np.nanmean(np.asarray(sp["b"].X, dtype=float), axis=0)[None, :]
         undefined = base.copy()
@@ -335,27 +359,56 @@ class TestStructuralRule:
         assert d > 1.0  # mean imputation would give d == 0
 
     def test_roundtrip_project_and_check_on_a_null_bearing_table(self, gated, tmp_path):
-        sp, corpora = gated
-        fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, **_fit_kwargs())
+        sp, _, nulls = gated
+        fit = fit_block(sp, ["a", "b"], block="T", nulls=nulls, **_fit_kwargs())
         _, manifest, _ = save_fit(fit, tmp_path)
         loaded = load_fit(manifest)
         assert loaded.map.whiteners["b"].structural_fill == fit.map.whiteners["b"].structural_fill
-        # projecting the raw table (nulls and all) matches the fitting-time fill
         S_fit, _ = fit.project(sp)
         S_loaded, _ = loaded.project(sp)
         assert np.isfinite(S_loaded).all()
         np.testing.assert_allclose(S_loaded, S_fit, atol=1e-10)
-        # the check covers the gate-off rows instead of dropping them
         rows = check_fit(loaded, sp, n_perm=150, eval_n=None, k_nn=10)
         assert all(r["passed"] for r in rows)
         assert all(r["n_rows"] == self.N_ON + self.N_OFF for r in rows)
 
-    def test_no_corpora_means_no_behavior_change(self, members, tmp_path):
+    def test_undefinable_rows_are_dropped_from_fit_projection_and_check(self, members, tmp_path):
+        sp, _ = members
+        X = sp["c"].X.copy()
+        trailing = np.arange(59, N, 60)  # one "trailing window" per 60-row clip
+        X[trailing, :] = np.nan
+        sp = dict(sp)
+        sp["c"] = SpaceMatrix(name="c", labels=sp["c"].labels, X=X, features=sp["c"].features)
+        pos = {"means": "undefinable", "when": "trailing window"}
+        nulls = {"a": {}, "b": {}, "c": {f: pos for f in sp["c"].features}}
+        fit = fit_block(sp, list(sp), block="T", nulls=nulls, **_fit_kwargs())
+        assert fit.manifest["n_rows"] == N - trailing.size
+        assert fit.manifest["per_member"]["c"]["undefinable_rows_dropped"] == trailing.size
+        assert fit.manifest["per_member"]["a"]["undefinable_rows_dropped"] == 0
+        assert fit.manifest["null_policy"]["n_undefinable_rows_dropped"] == trailing.size
+        assert fit.manifest["subsumes_all_members"]
+        _, manifest, _ = save_fit(fit, tmp_path)
+        loaded = load_fit(manifest)
+        assert loaded.map.whiteners["c"].undefinable == sorted(sp["c"].features)
+        S, labels = loaded.project(sp)
+        assert S.shape[0] == N - trailing.size and np.isfinite(S).all()
+        assert not ({sp["c"].labels[i] for i in trailing} & set(labels))
+        rows = check_fit(loaded, sp, n_perm=150, eval_n=None, k_nn=10)
+        assert all(r["n_rows"] == N - trailing.size for r in rows)
+
+    def test_declared_never_null_is_recorded(self, members):
+        sp, _ = members
+        nulls = {"a": {"a_000": _undefined()}, "b": {}, "c": {}}
+        fit = fit_block(sp, list(sp), block="V", nulls=nulls, **_fit_kwargs())
+        assert fit.manifest["per_member"]["a"]["declared_never_null"] == ["a_000"]
+        assert fit.manifest["per_member"]["b"]["nulls_declared"]
+
+    def test_null_free_table_needs_no_declarations(self, members, tmp_path):
         sp, _ = members
         fit = fit_block(sp, list(sp), block="V", **_fit_kwargs())
-        assert fit.manifest["structural_rule"] is None
         assert all(fit.manifest["per_member"][m]["structural_columns"] == []
                    for m in fit.members)
+        assert not fit.manifest["per_member"]["a"]["nulls_declared"]
         _, manifest, _ = save_fit(fit, tmp_path)
         assert load_fit(manifest).map.whiteners["a"].structural_fill == {}
 
