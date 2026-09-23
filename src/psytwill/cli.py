@@ -713,7 +713,7 @@ def _run_space_check(args: argparse.Namespace) -> None:
     n_pass = sum(r["passed"] for r in rows)
     print(f"psytwill space check [{fit.block}, k={fit.k}] on {rows[0]['n_rows']} rows: {n_pass}/{len(rows)} members pass")
     for r in rows:
-        print(f"  {r['member']:<18} R2 {r['r2']:.3f}  overlap {r['overlap']:.3f} (null {r['null_mean']:.3f}, p={r['overlap_p']:.3f})  "
+        print(f"  {r['member']:<18} R2 {r['r2']:.3f}  overlap {r['overlap']:.3f} (null {r['null_mean']:.3f}, q99 {r['null_q99']:.3f}, p={r['overlap_p']:.3f})  "
               f"{'pass' if r['passed'] else 'FAIL'}")
     if args.output:
         import pandas as pd

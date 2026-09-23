@@ -427,6 +427,23 @@ class TestContiguousEvalBlocks:
         assert mc.eval_sampling == "blocks"
         assert mc.overlap_p < 0.01
 
+    def test_null_spread_is_carried_through(self, members):
+        rng = np.random.default_rng(2)
+        Z = np.repeat(rng.normal(size=(6000 // 5, 3)), 5, axis=0)
+        X = Z @ rng.normal(size=(3, 8)) + 0.05 * rng.normal(size=(6000, 8))
+        Y = Z @ rng.normal(size=(3, 6)) + 0.05 * rng.normal(size=(6000, 6))
+        mc = check_member(X, Y, member="y", k=8, fold=0, k_nn=10, n_perm=200,
+                          eval_n=1200, block_size=40, random_state=0)
+        # the same subsample and seed through the null directly
+        sub, _ = eval_subsample(6000, 1200, 40, np.random.default_rng(0))
+        direct = neighbor_overlap_null(X[sub], Y[sub], k=10, n_perm=200, block_size=40, random_state=0)
+        assert mc.null_sd == pytest.approx(direct.null_sd)
+        assert mc.null_q99 == pytest.approx(np.quantile(direct.null, 0.99))
+        assert mc.null_mean <= mc.null_q99 <= max(direct.null)
+        sp, _ = members
+        fit = fit_block(sp, list(sp), **_fit_kwargs())
+        assert all(np.isfinite(r["null_sd"]) and np.isfinite(r["null_q99"]) for r in fit.curve)
+
     def test_sampling_is_recorded_in_manifest_and_curve(self, members):
         sp, _ = members
         fit = fit_block(sp, list(sp), **{**_fit_kwargs(), "eval_n": 150, "block_size": 10})

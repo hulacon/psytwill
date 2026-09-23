@@ -341,6 +341,11 @@ class MemberCheck:
     metric: str = "cosine"
     eval_rows: int = 0
     eval_sampling: str = "all"
+    # The null's spread, so a pass can be read as a margin: at the p floor an
+    # observed/null_mean ratio says nothing about how close the member came to
+    # alpha = .01. null_q99 is the value the observed overlap must exceed.
+    null_sd: float = float("nan")
+    null_q99: float = float("nan")
 
     def passes(self, r2_min: float, alpha: float) -> bool:
         return bool(self.r2 >= r2_min and self.overlap_p < alpha)
@@ -414,7 +419,8 @@ def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int
                                metric=metric, block_size=block_size, random_state=random_state)
     return MemberCheck(member=member, k=k, fold=fold, r2=float(rr.r2), overlap=float(nr.observed),
                        overlap_p=float(nr.p_value), null_mean=float(nr.null_mean), n_rows=int(n),
-                       metric=metric, eval_rows=int(sub.size), eval_sampling=sampling)
+                       metric=metric, eval_rows=int(sub.size), eval_sampling=sampling,
+                       null_sd=float(nr.null_sd), null_q99=float(np.quantile(nr.null, 0.99)))
 
 
 
