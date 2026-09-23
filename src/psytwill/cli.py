@@ -200,6 +200,8 @@ def _run_compose(args: argparse.Namespace) -> None:
         models=args.models.split(",") if args.models else None,
         modality_map=modality_map,
         sparse=args.sparse,
+        min_coverage=args.min_coverage,
+        comparability=args.comparability,
         force=args.force,
         dry_run=args.dry_run,
     )
@@ -1015,6 +1017,14 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--sparse", action="store_true",
                     help="emit rows only where a stimulus is on; default is "
                     "the full grid with explicit NaN rows in empty bins")
+    cp.add_argument("--min-coverage", type=float, default=0.5,
+                    help="fraction of a bin a presentation must cover for its "
+                    "item to land there (default 0.5; a shorter presentation "
+                    "keeps its best-covered bin)")
+    cp.add_argument("--comparability", metavar="TSV",
+                    help="per-model render-falsifier verdicts (columns model, "
+                    "comparable[, note]; labels item, item+offset, window, "
+                    "none) written into each sidecar's models.<m>.comparable")
     cp.add_argument("--dry-run", action="store_true",
                     help="report the plan (runs, streams, models, row "
                     "estimates) without reading values or writing")

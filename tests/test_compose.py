@@ -192,11 +192,14 @@ def test_untimed_expands_onto_the_grid(composed):
 def test_gridded_shifts_and_respects_voice(composed):
     out, _ = composed
     df = pd.read_parquet(out / "features" / "movies_audio_frames_features.parquet")
+    # 0.6 s words: the store's second frame (0.75) lands on a bin the word
+    # covers only 20 % of, so it is left empty (majority-coverage rule)
     cabin = df[df["source_stimulus_id"] == "cabin"]
-    assert sorted(cabin["time"]) == [9.25, 9.75]
+    assert sorted(cabin["time"]) == [9.25]
     assert (cabin["value"] == 0.5).all()  # nova, never the echo 9.9
     river = df[df["source_stimulus_id"] == "river"]
-    assert sorted(river["time"]) == [13.25, 13.75]  # voice-blind rows joined by id
+    assert sorted(river["time"]) == [13.25]  # voice-blind rows joined by id
+    assert df.loc[df["time"] == 9.75, "value"].isna().all()
 
 
 def test_chunked_renumbers_and_takes_the_trial_window(composed):
@@ -237,7 +240,8 @@ def test_sidecar_carries_contract(composed, visual_store):
         (out / "features" / "movies_frames_features.meta.json").read_text())
     assert meta["schema_version"] == COMPOSE_SCHEMA_VERSION
     assert meta["table"] == "composed"
-    assert meta["grid"] == {"window": W, "stamp": "start", "fill": "full"}
+    assert meta["grid"] == {"window": W, "stamp": "start", "fill": "full",
+                            "min_coverage": 0.5}
     assert meta["models"]["clip"]["checkpoint"] == "ViT-test/ckpt"
     assert meta["models"]["clip"]["comparable"] is None
     assert meta["runs"][SLUG]["n_presentations"] == 4
@@ -358,3 +362,117 @@ def test_cli_compose_json(events, visual_store, audio_store, text_store,
     assert set(summary["streams"]) == {"movies_frames", "movies_audio_frames",
                                        "movies_transcript_words"}
     assert (out / "features" / "movies_frames_features.parquet").exists()
+
+
+# --------------------------------------------------------------------------
+# bin coverage
+# --------------------------------------------------------------------------
+
+def _one_run(tmp_path, rows, name="sub-01_ses-06_task-TBencoding_run-01"):
+    f = tmp_path / f"{name}_events.tsv"
+    pd.DataFrame(rows).to_csv(f, sep="\t", index=False)
+    return f
+
+
+def test_untimed_takes_bins_the_item_mostly_covers(visual_store, tmp_path):
+    ev = _one_run(tmp_path, [
+        {"onset": 9.1, "duration": 3.0, "stimulus_id": "imgA"},   # off-grid
+        {"onset": 14.0, "duration": 0.6, "stimulus_id": "imgB"},  # 1.2 bins
+    ])
+    out = tmp_path / "cov_root"
+    build_composed([ev], [visual_store], out, window=W, sparse=True)
+    df = pd.read_parquet(out / "features" / "movies_frames_features.parquet")
+    a = df[(df["source_stimulus_id"] == "imgA") & (df["feature"] == "clip_000")]
+    # 9.0 is 80 % covered (kept), 12.0 only 20 % (dropped)
+    assert a["time"].tolist() == [9.0, 9.5, 10.0, 10.5, 11.0, 11.5]
+    b = df[(df["source_stimulus_id"] == "imgB") & (df["feature"] == "clip_000")]
+    assert b["time"].tolist() == [14.0]
+
+
+def test_short_presentation_keeps_its_best_bin(audio_store, tmp_path):
+    ev = _one_run(tmp_path, [
+        {"onset": 9.1, "duration": 0.2, "stimulus_id": "river"},  # 40 % of one bin
+    ])
+    out = tmp_path / "short_root"
+    build_composed([ev], [audio_store], out, window=W, sparse=True)
+    df = pd.read_parquet(out / "features" / "movies_audio_frames_features.parquet")
+    assert sorted(df["time"]) == [9.25]
+
+
+def test_min_coverage_is_a_parameter_and_is_validated(events, visual_store,
+                                                      audio_store, text_store,
+                                                      tmp_path):
+    out = tmp_path / "loose_root"
+    build_composed([events], [visual_store, audio_store, text_store], out,
+                   window=W, min_coverage=0.1, sparse=True)
+    df = pd.read_parquet(out / "features" / "movies_audio_frames_features.parquet")
+    assert sorted(df.loc[df["source_stimulus_id"] == "cabin", "time"]) == [9.25, 9.75]
+    with pytest.raises(InputError, match="min-coverage"):
+        build_composed([events], [visual_store], tmp_path / "x", window=W,
+                       min_coverage=0.0)
+
+
+# --------------------------------------------------------------------------
+# comparability
+# --------------------------------------------------------------------------
+
+def _comp(tmp_path, rows):
+    p = tmp_path / "comparability.tsv"
+    pd.DataFrame(rows).to_csv(p, sep="\t", index=False)
+    return p
+
+
+def test_comparability_labels_land_in_the_sidecar(img_events, visual_store,
+                                                   tmp_path):
+    comp = _comp(tmp_path, [
+        {"model": "clip", "comparable": "item", "note": "id 1.000"},
+        {"model": "notcomposed", "comparable": "none", "note": ""},
+    ])
+    out = tmp_path / "comp_root"
+    s = build_composed([img_events], [visual_store], out, window=W,
+                       comparability=comp)
+    meta = json.loads(
+        (out / "features" / "movies_frames_features.meta.json").read_text())
+    assert meta["models"]["clip"]["comparable"] == "item"
+    assert meta["models"]["clip"]["comparability_note"] == "id 1.000"
+    assert meta["models"]["caption"]["comparable"] is None
+    assert meta["comparability"]["table"] == str(comp.resolve())
+    assert set(meta["comparability"]["labels"]) == {"item", "item+offset",
+                                                    "window", "none"}
+    assert s["comparability"]["unlabelled"] == ["caption"]
+
+
+def test_relabel_recomposes(img_events, visual_store, tmp_path):
+    comp = _comp(tmp_path, [{"model": "clip", "comparable": "item"}])
+    out = tmp_path / "relabel_root"
+    build_composed([img_events], [visual_store], out, window=W, comparability=comp)
+    s2 = build_composed([img_events], [visual_store], out, window=W,
+                        comparability=comp)
+    assert s2["up_to_date"] is True
+    _comp(tmp_path, [{"model": "clip", "comparable": "none"}])  # same byte count
+    s3 = build_composed([img_events], [visual_store], out, window=W,
+                        comparability=comp)
+    assert "up_to_date" not in s3
+    meta = json.loads(
+        (out / "features" / "movies_frames_features.meta.json").read_text())
+    assert meta["models"]["clip"]["comparable"] == "none"
+
+
+@pytest.mark.parametrize("rows, match", [
+    ([{"model": "clip", "comparable": "maybe"}], "unknown comparable label"),
+    ([{"model": "clip"}], "lacks column"),
+    ([{"model": "clip", "comparable": "item"},
+      {"model": "clip", "comparable": "none"}], "listed twice"),
+])
+def test_comparability_table_is_validated(img_events, visual_store, tmp_path,
+                                          rows, match):
+    comp = _comp(tmp_path, rows)
+    with pytest.raises(InputError, match=match):
+        build_composed([img_events], [visual_store], tmp_path / "x", window=W,
+                       comparability=comp)
+
+
+def test_missing_comparability_table_is_loud(img_events, visual_store, tmp_path):
+    with pytest.raises(InputError, match="comparability table not found"):
+        build_composed([img_events], [visual_store], tmp_path / "x", window=W,
+                       comparability=tmp_path / "nope.tsv")

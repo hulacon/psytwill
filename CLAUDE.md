@@ -149,7 +149,7 @@ Commit/push only when asked.
   table attach wide. Own `schema_version` (`TIMELINES_SCHEMA_VERSION`) in
   `<stem>.meta.json`. Experimental time only — HRF/TR belong to braintwill
   (contracts §4.3 item 5).
-- **`compose.py`** (0.18.0) — the dense half of contracts §4.3 item 5 and
+- **`compose.py`** (0.18.0; coverage + comparability 0.19.0) — the dense half of contracts §4.3 item 5 and
   the interval→grid direction `project.py` defers: `psytwill compose`
   expands sparse runs onto the movie grid from item feature stores,
   emitting movie-schema tables (`movies_frames` / `movies_audio_frames` /
@@ -159,15 +159,20 @@ Commit/push only when asked.
   dataset's trial vocabulary: untimed rows repeat per bin of the
   presentation window; gridded rows (word audio, a movie's frame grid)
   shift to the presentation onset preserving their stamping convention
-  (visual stamps bin starts, audio bin centers); chunk-grain rows become
+  (visual stamps bin starts, audio bin centers), and both land only on
+  bins the presentation covers by `--min-coverage` (default 0.5; a shorter
+  presentation keeps its best bin) — a 0.54 s word does not claim the
+  second 0.5 s bin it spills 40 ms into; chunk-grain rows become
   transcript rows with `chunk_idx` by presentation order. Empty bins
   (fixation, rest) get explicit NaN rows by default (`--sparse` opts out) —
   the fit-time structural fill needs a row to act on. Sidecars carry
   `COMPOSE_SCHEMA_VERSION`, per-model checkpoints read from the store
-  sidecars, and a per-model `comparable: null` flag reserved for the render
-  falsifier — a composed table is not an extractor readout until that
-  measurement writes a verdict. Idempotent on an input signature
-  (paths+sizes+params; `--force` overrides), `--dry-run`, `--json`.
+  sidecars, and a per-model `comparable` label from `--comparability TSV`
+  (`model, comparable[, note]`; vocabulary `COMPARABILITY_LABELS` = item /
+  item+offset / window / none, measured by a render falsifier); unlisted
+  models stay `null` = not an extractor readout. Idempotent on an input
+  signature (paths+sizes+params, the comparability table by content hash;
+  `--force` overrides), `--dry-run`, `--json`.
 - **`media.py`** (0.18.0) — optional viewer media for composed runs
   (`compose --media`): rendered display frames, onset-muxed `audio.m4a`,
   transcript CSVs. Lazy Pillow/soundfile imports + subprocess ffmpeg, all

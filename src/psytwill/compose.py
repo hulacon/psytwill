@@ -27,6 +27,16 @@ table built by ``psytwill features``:
   internal timing), ``chunk_idx`` renumbered by presentation order and
   ``word_idx`` renumbered globally — the movies transcript convention.
 
+**A bin belongs to an item only if the item covers most of it.** Untimed and
+gridded rows both land only on bins the presentation window overlaps by at
+least ``min_coverage`` of the bin (default 0.5); a presentation shorter than
+that keeps its single best-covered bin, so nothing presented disappears. The
+rule exists because an item rarely lasts a whole number of bins: a 0.54 s
+word on a 0.5 s grid spills 40 ms into a second bin, and the store's frame
+for that bin describes the file's tail, while a render of the run has 460 ms
+of silence there. Majority coverage leaves such a bin empty, which is what
+the run actually held.
+
 Streams and their target stems mirror the movie group tables, so every
 existing consumer (``store.load_spaces``, ``psytwill viz movies``, mmmview's
 composed-run dispatch) works unchanged: visual and audio models land on the
@@ -49,11 +59,15 @@ the run as a real movie, run the real extractor battery, compare) writes a
 verdict. Composing is exact by construction only for untimed models with an
 identical checkpoint; anything with a context window over a continuous track
 must be measured before a composed table is treated as what the extractor
-would have emitted.
+would have emitted. The verdict comes in through ``comparability=`` (a TSV
+``model, comparable[, note]``) using the vocabulary in
+:data:`COMPARABILITY_LABELS`, and is written per model into the sidecar, so a
+consumer reads it from the file.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,7 +80,24 @@ from psytwill import __version__
 from psytwill.exceptions import InputError
 from psytwill.timelines import Registry, read_events
 
-COMPOSE_SCHEMA_VERSION = "1.0"
+#: 1.1: bins need majority coverage (``grid.min_coverage``); per-model
+#: ``comparable`` labels from a comparability TSV.
+COMPOSE_SCHEMA_VERSION = "1.1"
+
+#: What a model's composed value is relative to the extractor's readout of a
+#: render of the same run. A consumer pooling composed and real movie tables
+#: decides per label; none of them is "discard".
+COMPARABILITY_LABELS = {
+    "item": "reproduces the render's readout of the item (display context "
+            "such as a canvas around the item aside)",
+    "item+offset": "identifies the item in the render's readout but shifted "
+                   "or rescaled; a joint fit absorbs the shift as an axis",
+    "window": "the model's context window spans more than the presentation; "
+              "the composed value is the item's own readout, a render reads "
+              "the item inside whatever surrounds it",
+    "none": "the extractor emits nothing on a render of the run; composed "
+            "rows have no render counterpart",
+}
 
 #: Full features-table schema (§4.2.4), plus one provenance column: which
 #: item produced a composed row. Extra columns are harmless to every reader
@@ -302,24 +333,43 @@ def _voice_join(pres: pd.DataFrame, store: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def _bin_coverage(bin_start: np.ndarray, onset: np.ndarray, end: np.ndarray,
+                  window: float) -> np.ndarray:
+    """Fraction of each bin ``[bin_start, bin_start + window)`` the
+    presentation ``[onset, end)`` covers."""
+    overlap = np.minimum(bin_start + window, end) - np.maximum(bin_start, onset)
+    return np.clip(overlap, 0.0, None) / window
+
+
+def _keep_covered(cov: pd.Series, key: pd.Series, min_coverage: float) -> np.ndarray:
+    """Bins at or above ``min_coverage``; a presentation with none keeps its
+    best-covered bin(s), so a short presentation is never dropped outright."""
+    best = cov.groupby(key).transform("max")
+    return ((cov >= min_coverage - 1e-9)
+            | ((best < min_coverage - 1e-9) & (cov >= best - 1e-9) & (best > 0))
+            ).to_numpy()
+
+
 def compose_untimed(pres: pd.DataFrame, store: pd.DataFrame,
-                    window: float, stamp: str) -> pd.DataFrame:
+                    window: float, stamp: str,
+                    min_coverage: float = 0.5) -> pd.DataFrame:
     """Repeat each item's untimed rows at every grid bin of its window.
 
-    Bins are the grid times covering ``[onset, onset + duration)``, starting
-    at the first bin boundary at or after the onset (an item is on a bin
-    only once it is actually on), stamped per the target stream.
+    Bins are the grid bins ``[onset, onset + duration)`` covers by at least
+    ``min_coverage`` (module docstring), stamped per the target stream.
     """
     onset = pres["_onset"].to_numpy(dtype=float)
     end = onset + pres["_dur"].to_numpy(dtype=float)
-    t0 = np.ceil(onset / window - 1e-9) * window
-    counts = np.maximum(0, np.ceil((end - t0) / window - 1e-9)).astype(int)
+    first = np.floor(onset / window + 1e-9)
+    counts = np.maximum(0, np.ceil(end / window - 1e-9) - first).astype(int)
     if not counts.sum():
         return store.iloc[0:0].assign(_slug=None, _sid=None, _t=np.nan)
     rep = np.repeat(np.arange(len(pres)), counts)
     within = np.arange(counts.sum()) - np.repeat(np.cumsum(counts) - counts, counts)
     grid = pres.iloc[rep][["_slug", "_sid", "_voice"]].reset_index(drop=True)
-    grid["_t"] = t0[rep] + within * window
+    grid["_t"] = (first[rep] + within) * window
+    cov = pd.Series(_bin_coverage(grid["_t"].to_numpy(), onset[rep], end[rep], window))
+    grid = grid[_keep_covered(cov, pd.Series(rep), min_coverage)].reset_index(drop=True)
     out = _voice_join(grid, store)
     offset = window / 2 if stamp == "center" else 0.0
     out["time"] = out["_t"] + offset
@@ -327,13 +377,26 @@ def compose_untimed(pres: pd.DataFrame, store: pd.DataFrame,
 
 
 def compose_gridded(pres: pd.DataFrame, store: pd.DataFrame,
-                    window: float) -> pd.DataFrame:
-    """Shift each item's internal grid to start at the bin containing its onset."""
+                    window: float, min_coverage: float = 0.5) -> pd.DataFrame:
+    """Shift each item's internal grid to start at the bin containing its
+    onset, keeping only bins the presentation covers by ``min_coverage``.
+
+    A bin is identified by its start whichever way the store stamps it
+    (``floor(time / window)``), so the rule is the same for center- and
+    start-stamped grids.
+    """
     p = pres.copy()
     p["_shift"] = np.floor(p["_onset"].to_numpy() / window + 1e-9) * window
     out = _voice_join(p, store)
     out["time"] = out["time"].astype(float) + out["_shift"]
-    return out
+    if not len(out):
+        return out
+    bin_start = np.floor(out["time"].to_numpy() / window + 1e-9) * window
+    onset = out["_onset"].to_numpy(dtype=float)
+    cov = pd.Series(_bin_coverage(bin_start, onset,
+                                  onset + out["_dur"].to_numpy(dtype=float), window))
+    key = out["_slug"].astype(str) + "\x00" + out["_ord"].astype(str)
+    return out[_keep_covered(cov, key, min_coverage)].reset_index(drop=True)
 
 
 def compose_chunked(pres: pd.DataFrame, store: pd.DataFrame) -> pd.DataFrame:
@@ -426,18 +489,51 @@ def _finalize(frame: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(sort_cols, kind="stable").reset_index(drop=True)
 
 
+def read_comparability(path: str | Path) -> dict[str, dict[str, Optional[str]]]:
+    """``model -> {comparable, note}`` from a TSV with columns
+    ``model, comparable[, note]``; labels must be in :data:`COMPARABILITY_LABELS`."""
+    p = Path(path)
+    if not p.exists():
+        raise InputError(f"comparability table not found: {p}")
+    df = pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False)
+    missing = {"model", "comparable"} - set(df.columns)
+    if missing:
+        raise InputError(
+            f"{p.name} lacks column(s) {sorted(missing)}; expected "
+            "model, comparable[, note]")
+    bad = sorted(set(df["comparable"]) - set(COMPARABILITY_LABELS))
+    if bad:
+        raise InputError(
+            f"{p.name}: unknown comparable label(s) {bad}; use one of "
+            f"{sorted(COMPARABILITY_LABELS)}")
+    dup = sorted(df.loc[df["model"].duplicated(), "model"])
+    if dup:
+        raise InputError(f"{p.name}: model(s) listed twice: {dup}")
+    note = df["note"] if "note" in df.columns else pd.Series("", index=df.index)
+    return {m: {"comparable": c, "note": n or None}
+            for m, c, n in zip(df["model"], df["comparable"], note)}
+
+
 def _signature(events: Sequence[Path], stores: Sequence[Path],
-               registry_dir: Optional[Path], params: dict[str, Any]) -> dict[str, Any]:
+               registry_dir: Optional[Path], params: dict[str, Any],
+               comparability: Optional[Path] = None) -> dict[str, Any]:
     def stat(p: Path) -> dict[str, Any]:
         return {"path": str(p.resolve()), "size": p.stat().st_size}
 
-    return {
+    sig = {
         "compose_schema_version": COMPOSE_SCHEMA_VERSION,
         "events": [stat(Path(p)) for p in events],
         "stores": [stat(Path(p)) for p in stores],
         "registry": None if registry_dir is None else str(Path(registry_dir).resolve()),
         "params": params,
     }
+    if comparability is not None:
+        # content, not size: a relabel can keep the byte count
+        sig["comparability"] = {
+            "path": str(comparability.resolve()),
+            "sha256": hashlib.sha256(comparability.read_bytes()).hexdigest(),
+        }
+    return sig
 
 
 def build_composed(
@@ -452,6 +548,8 @@ def build_composed(
     models: Optional[Sequence[str]] = None,
     modality_map: Optional[dict[str, str]] = None,
     sparse: bool = False,
+    min_coverage: float = 0.5,
+    comparability: Optional[str | Path] = None,
     force: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -462,10 +560,16 @@ def build_composed(
     the movies viewer already dispatch. Idempotent: when every output exists
     and records this exact input signature, nothing is rewritten (``force``
     overrides). ``dry_run`` reports the plan without reading feature values
-    or writing anything.
+    or writing anything. ``comparability`` stamps per-model labels into the
+    sidecars (see :func:`read_comparability`); models it does not list stay
+    ``null`` and are named in the summary.
     """
     if window <= 0:
         raise InputError("--window must be positive seconds")
+    if not 0 < min_coverage <= 1:
+        raise InputError("--min-coverage must be in (0, 1]")
+    comp_path = None if comparability is None else Path(comparability)
+    comp = {} if comp_path is None else read_comparability(comp_path)
     out_root = Path(output_dir)
     feat_dir = out_root / "features"
     registry = None if registry_dir is None else Registry.from_dir(registry_dir)
@@ -509,11 +613,11 @@ def build_composed(
     params = {
         "window": window, "onset_column": onset_column, "lead_out": lead_out,
         "sparse": sparse, "models": sorted(wanted) if wanted else None,
-        "modality_map": modality_map or None,
+        "modality_map": modality_map or None, "min_coverage": min_coverage,
     }
     signature = _signature([Path(p) for p in events], [Path(s) for s in stores],
                            None if registry_dir is None else Path(registry_dir),
-                           params)
+                           params, comp_path)
 
     summary: dict[str, Any] = {
         "output_dir": str(out_root),
@@ -523,6 +627,11 @@ def build_composed(
         "models": {p["model"]: {"stream": p["stream"], "grain": p["grain"],
                                 "store": p["store"].name} for p in plans},
     }
+    if comp_path is not None:
+        summary["comparability"] = {
+            "table": str(comp_path),
+            "unlabelled": sorted(p["model"] for p in plans if p["model"] not in comp),
+        }
 
     if dry_run:
         n_pres = len(pres)
@@ -580,9 +689,10 @@ def build_composed(
                 if not len(sub):
                     continue
                 if grain == "untimed" and stem in STREAM_STAMP:
-                    part = compose_untimed(pres, sub, window, STREAM_STAMP[stem])
+                    part = compose_untimed(pres, sub, window, STREAM_STAMP[stem],
+                                           min_coverage)
                 elif grain == "gridded":
-                    part = compose_gridded(pres, sub, window)
+                    part = compose_gridded(pres, sub, window, min_coverage)
                 else:
                     part = compose_chunked(pres, sub)
                 if len(part):
@@ -617,6 +727,7 @@ def build_composed(
                 "window": window,
                 "stamp": STREAM_STAMP[stem],
                 "fill": "sparse" if sparse else "full",
+                "min_coverage": min_coverage,
             },
             "output": {
                 "path": str(out_path.resolve()),
@@ -639,14 +750,17 @@ def build_composed(
                     "checkpoint": p["checkpoint"],
                     "grain": p["grain"],
                     "source_store": str(p["store"].resolve()),
-                    "comparable": None,
+                    "comparable": (comp.get(p["model"]) or {}).get("comparable"),
+                    "comparability_note": (comp.get(p["model"]) or {}).get("note"),
                 } for p in stem_plans
             },
-            "comparability_note": (
-                "'comparable' is null until a render falsifier measures "
-                "composed-vs-rendered agreement for this model; do not treat "
-                "a composed table as an extractor readout before then."
-            ),
+            "comparability": {
+                "table": None if comp_path is None else str(comp_path.resolve()),
+                "labels": COMPARABILITY_LABELS,
+                "null_means": "no render falsifier verdict for this model; do "
+                              "not treat its composed values as an extractor "
+                              "readout of the run",
+            },
             "inputs_signature": signature,
         }
         meta_path = Path(str(out_path).removesuffix(".parquet") + ".meta.json")
