@@ -17,6 +17,7 @@ from psytwill.space import (
     check_member,
     eval_subsample,
     fit_block,
+    fit_block_map,
     fit_whitener,
     load_fit,
     save_fit,
@@ -167,7 +168,7 @@ class TestNaNPolicy:
         X = sp["b"].X.copy()
         X[:, 0] = np.nan
         X[::50, 0] = 1.0  # defined for 2 % of rows
-        X[::7, 1] = np.nan  # sparse gaps stay, mean-imputed for the fit
+        X[::7, 1] = np.nan  # sparse gaps stay; b is absent from those rows
         sp = dict(sp)
         sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=X, features=sp["b"].features)
         kept, dropped = prepare_member(sp["b"])
@@ -250,7 +251,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.3"
+        assert meta["space_schema_version"] == "1.4"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -272,10 +273,11 @@ class TestPRBasisAndReporting:
 class TestContractBNulls:
     """Contract B 1.1 (DECIDED 2026-09-22): the fit acts on declared `nulls`.
 
-    `undefined` -> frozen sentinel fill; `undefinable` -> the row is dropped
-    from fit and criterion; `missing` -> max_nan_frac drop + mean-impute; a
-    NaN with no declaration refuses the fit. The corpus-contrast detector only
-    warns about `missing` columns that look gated.
+    `undefinable` -> the row is dropped from fit and criterion; a NaN with no
+    declaration refuses the fit; the corpus-contrast detector only warns about
+    `missing` columns that look gated. Since 2026-09-24 (schema 1.4)
+    `undefined` and `missing` cells are MASKED: the member is absent from the
+    row, and no value is ever filled (see TestMasking).
     """
 
     N_ON, N_OFF = 250, 350  # gate-on rows, gate-off rows (off majority)
@@ -323,13 +325,24 @@ class TestContractBNulls:
         assert not np.isnan(filled.X[:, 0]).any()
         assert np.isnan(filled.X[:, 1]).any()  # sparse gaps untouched
 
-    def test_undefined_is_filled_and_kept_missing_follows_the_old_policy(self, gated):
+    def test_undefined_and_missing_are_masked_not_filled(self, gated):
         sp, _, nulls = gated
         fit = fit_block(sp, ["a", "b"], block="T", nulls=nulls, **_fit_kwargs())
         pm = fit.manifest["per_member"]["b"]
-        assert pm["structural_columns"] == ["b_000"] and "b_000" not in pm["dropped_columns"]
+        assert pm["masked_columns"] == ["b_000", "b_001"] and pm["dropped_columns"] == []
         assert pm["dim"] == 12 and pm["nulls_declared"]
-        assert fit.manifest["null_policy"]["n_undefined_filled_columns"] == 1
+        complete = ~np.isnan(sp["b"].X).any(axis=1)
+        assert pm["rows_present"] == int(complete.sum())
+        assert fit.manifest["null_policy"]["n_member_rows_absent"] == {
+            "a": 0, "b": int((~complete).sum())}
+        assert fit.manifest["null_policy"]["block_cov"] == "pairwise"
+        assert fit.map.whiteners["b"].structural_fill == {}
+        assert "fill_z" not in fit.manifest["null_policy"]
+        # b is scored on its present rows only, in every fold
+        n_b = sum(r["n_rows"] + r["n_absent"] + r["n_unplaced"] for r in fit.curve
+                  if r["member"] == "b" and r["k"] == fit.k)
+        assert n_b == self.N_ON + self.N_OFF
+        assert all(r["n_absent"] == 0 for r in fit.curve if r["member"] == "a")
         assert fit.manifest["subsumes_all_members"]
         # the same gated column declared `missing` is dropped (pooled null 0.60 > 0.5)
         as_missing = {"a": {}, "b": {"b_000": _missing(), "b_001": _missing()}}
@@ -347,30 +360,33 @@ class TestContractBNulls:
         assert "b_000" in pm["dropped_columns"]  # warning only
         assert fit.manifest["null_policy"]["gated_missing_detector"]["effect"] == "warning only"
 
-    def test_undefined_is_distinct_from_the_mean_in_the_whitened_space(self, gated):
+    def test_a_row_with_an_undefined_cell_has_no_member_coordinates(self, gated):
         sp, _, nulls = gated
         fit = fit_block(sp, ["a", "b"], block="T", nulls=nulls, **_fit_kwargs())
         w = fit.map.whiteners["b"]
         base = np.nanmean(np.asarray(sp["b"].X, dtype=float), axis=0)[None, :]
         undefined = base.copy()
         undefined[0, 0] = np.nan  # gate off: no value
-        at_mean = base.copy()  # gate on, value happens to sit at the mean
-        d = np.linalg.norm(w.transform(undefined) - w.transform(at_mean))
-        assert d > 1.0  # mean imputation would give d == 0
+        assert np.isnan(w.transform(undefined)).all()  # absent, not the mean
+        assert np.isfinite(w.transform(base)).all()
 
     def test_roundtrip_project_and_check_on_a_null_bearing_table(self, gated, tmp_path):
         sp, _, nulls = gated
         fit = fit_block(sp, ["a", "b"], block="T", nulls=nulls, **_fit_kwargs())
         _, manifest, _ = save_fit(fit, tmp_path)
         loaded = load_fit(manifest)
-        assert loaded.map.whiteners["b"].structural_fill == fit.map.whiteners["b"].structural_fill
-        S_fit, _ = fit.project(sp)
-        S_loaded, _ = loaded.project(sp)
-        assert np.isfinite(S_loaded).all()
+        assert loaded.map.whiteners["b"].structural_fill == {}
+        assert loaded.map.block_cov == "pairwise"
+        S_fit, lab_fit = fit.project(sp)
+        S_loaded, lab_loaded = loaded.project(sp)
+        assert np.isfinite(S_loaded).all() and lab_loaded == lab_fit
         np.testing.assert_allclose(S_loaded, S_fit, atol=1e-10)
-        rows = check_fit(loaded, sp, n_perm=150, eval_n=None, k_nn=10)
-        assert all(r["passed"] for r in rows)
-        assert all(r["n_rows"] == self.N_ON + self.N_OFF for r in rows)
+        rows = {r["member"]: r for r in check_fit(loaded, sp, n_perm=150, eval_n=None, k_nn=10)}
+        assert all(r["passed"] for r in rows.values())
+        complete = ~np.isnan(sp["b"].X).any(axis=1)
+        assert rows["a"]["n_rows"] == self.N_ON + self.N_OFF
+        assert rows["b"]["n_rows"] == int(complete.sum())
+        assert rows["b"]["n_absent"] == int((~complete).sum())
 
     def test_undefinable_rows_are_dropped_from_fit_projection_and_check(self, members, tmp_path):
         sp, _ = members
@@ -406,8 +422,9 @@ class TestContractBNulls:
     def test_null_free_table_needs_no_declarations(self, members, tmp_path):
         sp, _ = members
         fit = fit_block(sp, list(sp), block="V", **_fit_kwargs())
-        assert all(fit.manifest["per_member"][m]["structural_columns"] == []
+        assert all(fit.manifest["per_member"][m]["masked_columns"] == []
                    for m in fit.members)
+        assert fit.manifest["null_policy"]["block_cov"] == "complete"
         assert not fit.manifest["per_member"]["a"]["nulls_declared"]
         _, manifest, _ = save_fit(fit, tmp_path)
         assert load_fit(manifest).map.whiteners["a"].structural_fill == {}
@@ -503,3 +520,104 @@ class TestContiguousEvalBlocks:
         assert fit.manifest["criterion"]["eval_sampling"] == "blocks"
         assert {r["eval_sampling"] for r in fit.curve} == {"blocks"}
         assert fit_block(sp, list(sp), **_fit_kwargs()).manifest["criterion"]["eval_sampling"] == "all"
+
+
+class TestMasking:
+    """No consumer-created values (DECIDED 2026-09-24, schema 1.4).
+
+    A member with a null in a row is absent from that row. The block PCA uses
+    the pairwise-complete covariance, a row is placed by least squares over
+    the members it has, and a row those members cannot place at k is left out
+    rather than given a minimum-norm (block-mean) answer.
+    """
+
+    def test_pairwise_pca_equals_the_svd_on_complete_data(self, members):
+        from psytwill.space import _pairwise_block_pca
+
+        rng = np.random.default_rng(3)
+        W = rng.normal(size=(400, 6)) @ rng.normal(size=(6, 6))
+        mean, comps, eig, n_neg = _pairwise_block_pca(W)
+        _, s, vt = np.linalg.svd(W - W.mean(axis=0), full_matrices=False)
+        np.testing.assert_allclose(mean, W.mean(axis=0), atol=1e-12)
+        np.testing.assert_allclose(eig, s ** 2 / (W.shape[0] - 1), rtol=1e-8)
+        np.testing.assert_allclose(np.abs((comps * vt).sum(axis=1)), 1.0, atol=1e-8)
+        assert n_neg == 0
+
+    def test_never_co_present_columns_refuse(self):
+        from psytwill.space import _pairwise_block_pca
+
+        W = np.ones((10, 2))
+        W[:5, 0] = np.nan
+        W[5:, 1] = np.nan
+        with pytest.raises(SpaceError, match="unidentifiable without filling"):
+            _pairwise_block_pca(W)
+
+    @pytest.fixture
+    def gated_member(self, members):
+        sp, Z = members
+        sp = dict(sp)
+        X = sp["b"].X.copy()
+        off = np.zeros(N, dtype=bool)
+        off[::3] = True  # b wholly undefined on a third of the rows (a gate)
+        X[off] = np.nan
+        sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=X, features=sp["b"].features)
+        nulls = {"a": {}, "b": {f: _undefined() for f in sp["b"].features}, "c": {}}
+        return sp, nulls, off
+
+    def test_absent_rows_are_placed_from_the_present_members_only(self, gated_member):
+        sp, nulls, off = gated_member
+        fit = fit_block(sp, list(sp), block="T", nulls=nulls, **_fit_kwargs())
+        assert fit.manifest["subsumes_all_members"]
+        bm = fit.map
+        W = bm.concat(sp)
+        assert np.isnan(W[off]).any() and not np.isnan(W[~off]).any()
+        S = bm.scores_from_concat(W, fit.k)
+        # an absent row: least squares over the a and c blocks, by hand
+        r = int(np.flatnonzero(off)[0])
+        pat = ~np.isnan(W[r])
+        V = bm.block_components[: fit.k].T[pat]
+        manual = np.linalg.lstsq(V, (W[r] - bm.block_mean)[pat], rcond=None)[0]
+        np.testing.assert_allclose(S[r], manual, atol=1e-10)
+        # a complete row: the plain projection
+        c = int(np.flatnonzero(~off)[0])
+        np.testing.assert_allclose(S[c], (W[c] - bm.block_mean) @ bm.block_components[: fit.k].T,
+                                   atol=1e-10)
+
+    def test_rows_the_present_members_cannot_place_are_left_out(self, members):
+        sp, _ = members
+        sp = {"b": sp["b"], "c": sp["c"]}
+        Xb = sp["b"].X.copy()
+        only_c = np.arange(0, N, 4)
+        Xb[only_c] = np.nan  # c alone on these rows
+        sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=Xb, features=sp["b"].features)
+        nulls = {"b": {f: _undefined() for f in sp["b"].features}, "c": {}}
+        fit = fit_block(sp, ["b", "c"], block="T", nulls=nulls, **_fit_kwargs())
+        rank_c = fit.map.whiteners["c"].rank
+        # the full map (k_max = rank b + rank c) exceeds what c alone can place
+        full = fit_block_map(sp, ["b", "c"], np.arange(N))
+        assert full.k_max > rank_c
+        S = full.scores(sp, k=rank_c + 1)
+        assert np.isnan(S[only_c]).all()  # unplaced, not zero
+        assert np.isfinite(np.delete(S, only_c, axis=0)).all()
+        assert np.isfinite(full.scores(sp, k=rank_c)).all()  # c places rank_c directions
+        # every curve row accounts for all test rows of the member it scores
+        for r in fit.curve:
+            if r["member"] == "c":
+                assert r["n_absent"] == 0
+        S_proj, labels = fit.project(sp)
+        assert np.isfinite(S_proj).all() and len(labels) == S_proj.shape[0]
+
+    def test_nothing_is_filled_anywhere(self, gated_member, tmp_path):
+        sp, nulls, off = gated_member
+        fit = fit_block(sp, list(sp), block="T", nulls=nulls, **_fit_kwargs())
+        assert all(w.structural_fill == {} for w in fit.map.whiteners.values())
+        # b's whitener saw only b's complete rows
+        np.testing.assert_allclose(fit.map.whiteners["b"].mean, sp["b"].X[~off].mean(axis=0),
+                                   atol=1e-12)
+        _, manifest, _ = save_fit(fit, tmp_path)
+        import json
+
+        meta = json.loads(manifest.read_text())
+        assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
+        assert meta["space_schema_version"] == "1.4"
+

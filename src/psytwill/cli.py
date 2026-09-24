@@ -669,9 +669,9 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     random_state=args.seed, progress=progress)
     for m in members:
         pm = fit.manifest["per_member"][m]
-        if pm["structural_columns"]:
-            print(f"  {m}: {len(pm['structural_columns'])} undefined column(s) filled: "
-                  f"{', '.join(pm['structural_columns'])}")
+        if pm["masked_columns"]:
+            n_abs = fit.manifest["null_policy"]["n_member_rows_absent"][m]
+            print(f"  {m}: absent from {n_abs} row(s), masked on {', '.join(pm['masked_columns'])}")
         if pm["undefinable_rows_dropped"]:
             print(f"  {m}: {pm['undefinable_rows_dropped']} undefinable row(s) dropped")
         if pm["suspected_gated_missing"]:
