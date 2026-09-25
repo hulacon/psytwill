@@ -556,7 +556,9 @@ def _space_members(args: argparse.Namespace, available: list[str]) -> list[str]:
         raise SpaceError(
             f"no available model belongs to block {args.block!r} ({modality}); tables hold {sorted(available)}"
         )
-    return members
+    from psytwill.space import split_members
+
+    return split_members(members)
 
 
 def _space_load(args: argparse.Namespace, members: list[str] | None = None):
@@ -586,29 +588,43 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
             where.setdefault(str(m), []).append(str(path))
     if members is None:
         members = _space_members(args, list(where))
-    missing = [m for m in members if m not in where]
+    from psytwill.space import member_source, select_features
+
+    source = {m: member_source(m) for m in members}
+    missing = [m for m in members if source[m][0] not in where]
     if missing:
         raise SpaceError(f"member(s) {missing} not in the given tables; available {sorted(where)}")
     ids: set[str] = set()
     if args.exclude_ids:
         ids = {line.strip() for line in Path(args.exclude_ids).read_text().splitlines() if line.strip()}
     spaces: dict = {}
+    loaded: dict = {}
     for m in members:
-        parts: list[SpaceMatrix] = []
-        for path in where[m]:
-            got = load_spaces(path, key=key, models=[m], window=args.window, report=rep)
-            if m not in got:
-                raise SpaceError(f"model {m!r} in {path} loaded as none of {sorted(got)} "
-                                 "(string-valued or empty?)")
-            parts.append(got[m])
+        model, cols = source[m]
+        if model in loaded:
+            parts = loaded[model]
+        else:
+            parts = []
+            for path in where[model]:
+                got = load_spaces(path, key=key, models=[model], window=args.window, report=rep)
+                if model not in got:
+                    raise SpaceError(f"model {model!r} in {path} loaded as none of {sorted(got)} "
+                                     "(string-valued or empty?)")
+                parts.append(got[model])
+            loaded[model] = parts
+        if cols is not None:
+            # a split member (space.MEMBER_SPLITS): its columns of the model
+            parts = [select_features(part, cols) for part in parts]
+            for part in parts:
+                part.name = m
         sm = parts[0]
         if len(parts) > 1:
             feats = parts[0].features
-            for part, path in zip(parts[1:], where[m][1:]):
+            for part, path in zip(parts[1:], where[model][1:]):
                 if part.features != feats:
                     raise SpaceError(
                         f"model {m!r} has {len(part.features)} feature columns in {path} but "
-                        f"{len(feats)} in {where[m][0]}; a member must carry the same columns "
+                        f"{len(feats)} in {where[model][0]}; a member must carry the same columns "
                         "in every table it is stacked from")
             labels = [lab for part in parts for lab in part.labels]
             if len(set(labels)) != len(labels):
@@ -626,15 +642,19 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
                                  features=sm.features, modality=sm.modality, extractor=sm.extractor,
                                  n_replicates=sm.n_replicates)
         spaces[m] = sm
-        declared = [table_nulls[p].get(m) for p in where[m]]
+        declared = [table_nulls[p].get(model) for p in where[model]]
         if any(d != declared[0] for d in declared[1:]):
             raise SpaceError(
-                f"model {m!r} carries different `nulls` declarations across its tables "
-                f"({', '.join(where[m])}); refresh every input so they agree "
+                f"model {model!r} carries different `nulls` declarations across its tables "
+                f"({', '.join(where[model])}); refresh every input so they agree "
                 "(`<extractor> sidecar refresh`, then `psytwill features --refresh-nulls`)")
-        rep.nulls[m] = declared[0]
+        nulls = declared[0]
+        if cols is not None and nulls is not None:
+            nulls = {c: v for c, v in nulls.items() if c in cols}
+        rep.nulls[m] = nulls
         src = f" from {len(parts)} tables" if len(parts) > 1 else ""
-        print(f"  loaded {m}: {sm.n} rows x {sm.dim} features{src}", flush=True)
+        of = f" (split from {model})" if cols is not None else ""
+        print(f"  loaded {m}: {sm.n} rows x {sm.dim} features{src}{of}", flush=True)
     return spaces, members, len(ids), rep
 
 
@@ -676,6 +696,10 @@ def _run_space_fit(args: argparse.Namespace) -> None:
             print(f"  {m}: {pm['undefinable_rows_dropped']} undefinable row(s) dropped")
         if pm["suspected_gated_missing"]:
             print(f"  {m}: WARNING declared `missing` but looks gated: {pm['suspected_gated_missing']}")
+    from psytwill.space import member_source
+
+    fit.manifest["member_sources"] = {m: member_source(m)[0] for m in members
+                                      if member_source(m)[1] is not None}
     fit.manifest["inputs"] = [str(p) for p in args.features]
     fit.manifest["key"] = args.key
     fit.manifest["window"] = args.window

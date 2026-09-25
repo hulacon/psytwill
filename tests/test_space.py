@@ -251,7 +251,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.4"
+        assert meta["space_schema_version"] == "1.5"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -619,5 +619,15 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.4"
+        assert meta["space_schema_version"] == "1.5"
 
+
+
+def test_member_splits_resolve():
+    from psytwill.space import MEMBER_SPLITS, member_source, split_members
+
+    assert split_members(["clip", "faces", "llstat"]) == ["clip", "faces_extent", "faces_layout", "llstat"]
+    assert member_source("faces_layout") == ("faces", ("faces_center_dist", "faces_mutual_dist"))
+    assert member_source("faces") == ("faces", None)  # a whole-model member still loads whole
+    cols = [c for parts in MEMBER_SPLITS["faces"].values() for c in parts]
+    assert len(cols) == len(set(cols)) == 5

@@ -71,7 +71,47 @@ EUCLIDEAN_RANK_BELOW: int = 3
 def metric_for_rank(rank: int) -> str:
     """Neighbour metric for a member whitened to ``rank`` directions."""
     return "euclidean" if int(rank) < EUCLIDEAN_RANK_BELOW else "cosine"
-SPACE_SCHEMA_VERSION = "1.4"
+
+
+#: MEMBER SPLITS (DECIDED 2026-09-24, Ben). A battery model whose columns are
+#: defined on very different row sets is fitted as several members, one per
+#: definedness pattern, so "absent unless complete" does not discard the
+#: always-defined columns wherever the gated ones are undefined. The battery
+#: pin is unchanged: the split is consumer-side, and a member named after the
+#: model itself still loads whole, so a fit written before the split projects
+#: as it was fitted.
+#:
+#: faces: count and the two areas are defined on every image; the two
+#: configuration distances need one and two faces, and stay together (Ben).
+#: MEASURED on V_v0.4: kept whole, faces was present on 1,735 of 72,000 NSD
+#: rows, so the count/area values of the other 70,265 images never entered V,
+#: and the member sat below the row count at which the pairwise block
+#: covariance holds (mmmdata-agents psytwill-space log, 2026-09-24).
+MEMBER_SPLITS: dict[str, dict[str, tuple[str, ...]]] = {
+    "faces": {
+        "faces_extent": ("faces_count", "faces_max_area", "faces_total_area"),
+        "faces_layout": ("faces_center_dist", "faces_mutual_dist"),
+    },
+}
+
+
+def member_source(member: str) -> tuple[str, tuple[str, ...] | None]:
+    """(model, columns) a member is read from; columns None means the whole model."""
+    for model, parts in MEMBER_SPLITS.items():
+        if member in parts:
+            return model, parts[member]
+    return member, None
+
+
+def split_members(models: Sequence[str]) -> list[str]:
+    """``models`` with each split model replaced by its members, in order."""
+    out: list[str] = []
+    for m in models:
+        out.extend(MEMBER_SPLITS[m] if m in MEMBER_SPLITS else [m])
+    return out
+
+
+SPACE_SCHEMA_VERSION = "1.5"
 
 
 # --------------------------------------------------------------------------
@@ -684,6 +724,15 @@ def _folds(n: int, n_splits: int, groups: Sequence | None, random_state: int):
     return list(KFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(idx))
 
 
+def _captured(bm: BlockMap, member: str, k: int) -> float:
+    """Share of ``member``'s whitened slice spanned by the top-``k`` block components."""
+    ranks = [bm.whiteners[m].rank for m in bm.members]
+    i = bm.members.index(member)
+    off = sum(ranks[:i])
+    V = bm.block_components[:k, off:off + ranks[i]]
+    return float((V ** 2).sum() / ranks[i])
+
+
 def fit_block(
     spaces: dict[str, SpaceMatrix],
     members: Sequence[str],
@@ -865,6 +914,13 @@ def fit_block(
         rows = [r for r in curve if r["member"] == m and r["k"] == chosen]
         per_member[m] = {
             "participation_ratio": pr[m],
+            # share of the member's whitened slice spanned by each fold map's
+            # components (1.0 = none of it lost). Below 1 at k_max means the
+            # block dropped some of the member outright: MEASURED 2026-09-24,
+            # the pairwise covariance put ~53 % of a thin V `faces` into its
+            # negative-eigenvalue directions, which no k can recover.
+            "block_captured_at_k": [_captured(fm, m, chosen) for fm in fold_maps],
+            "block_captured_at_k_max": [_captured(fm, m, fm.k_max) for fm in fold_maps],
             "whitened_rank": final.whiteners[m].rank,
             "metric": metric_for_rank(final.whiteners[m].rank),
             "eval_rows": [r["eval_rows"] for r in rows],
@@ -904,7 +960,9 @@ def fit_block(
         # methods section should quote.
         "block_pr": block_pr,
         "n_raw_columns": int(sum(aligned[m].dim for m in members)),
-        "concat_rank": int(final.k_max),
+        # the fold maps' full rank (the walk's top), not the final map's k_max,
+        # which is truncated to k; before 1.5 this field always equalled k
+        "concat_rank": int(k_top),
         "n_rows": n,
         "n_splits": n_splits,
         "grouped": g is not None,

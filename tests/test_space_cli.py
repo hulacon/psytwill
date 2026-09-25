@@ -124,3 +124,110 @@ def test_tables_that_disagree_on_nulls_are_refused(two_corpora, tmp_path, capsys
             "--window", "0.5", "-o", str(tmp_path / "space"), "--stem", "T_dis", *FIT_ARGS]
     assert main(argv) == 1
     assert "different `nulls` declarations" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# member splits (DECIDED 2026-09-24): faces -> faces_extent + faces_layout
+# --------------------------------------------------------------------------
+
+FACE_COLS = ["faces_center_dist", "faces_count", "faces_max_area", "faces_mutual_dist",
+             "faces_total_area"]
+
+
+@pytest.fixture
+def faces_table(tmp_path):
+    """An image table holding `faces` and `llstat`, with faces' configuration
+    columns undefined (declared) where the image has too few faces."""
+    rng = np.random.default_rng(1)
+    n = 240
+    count = rng.choice([0, 1, 2, 3], size=n, p=[0.3, 0.3, 0.25, 0.15])
+    z = rng.normal(size=(n, 2))
+    vals = {
+        "faces_count": count.astype(float),
+        "faces_max_area": z[:, 0] + 0.1 * rng.normal(size=n),
+        "faces_total_area": z[:, 0] + 0.3 * count + 0.1 * rng.normal(size=n),
+        "faces_center_dist": np.where(count >= 1, z[:, 1] + 0.1 * rng.normal(size=n), np.nan),
+        "faces_mutual_dist": np.where(count >= 2, z[:, 1] + 0.2 * rng.normal(size=n), np.nan),
+    }
+    ll = z @ rng.normal(size=(2, 4)) + 0.05 * rng.normal(size=(n, 4))
+    rows = []
+    for i in range(n):
+        sid = f"img{i:04d}"
+        for c in FACE_COLS:
+            rows.append((sid, "faces", c, float(vals[c][i])))
+        for j in range(4):
+            rows.append((sid, "llstat", f"llstat_{j:02d}", float(ll[i, j])))
+    df = pd.DataFrame(rows, columns=["stimulus_id", "model", "feature", "value"])
+    df["value_str"] = pd.Series([None] * len(df), dtype="string")
+    df["modality"] = "visual"
+    df["extractor"] = "viz2psy"
+    df["extractor_version"] = "0.0"
+    path = tmp_path / "img_features.parquet"
+    df.to_parquet(path, index=False)
+    undef = {"means": "undefined", "when": "too few faces"}
+    meta = {"schema_version": "1.1", "table": "features", "models": ["faces", "llstat"],
+            "model_nulls": {"faces": {"faces_center_dist": undef, "faces_mutual_dist": undef},
+                            "llstat": {}}}
+    path.with_suffix(".meta.json").write_text(json.dumps(meta))
+    return path, int((count >= 2).sum()), n
+
+
+SPLIT_ARGS = ["--block", "V", "--k-schedule", "2,4", "--n-splits", "3", "--n-perm", "150",
+              "--k-nn", "10", "--eval-n", "0", "--seed", "0"]
+
+
+def test_block_default_splits_faces(faces_table, tmp_path, capsys):
+    path, n_layout, n = faces_table
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", str(path), "-o", str(out), "--stem", "V_split", *SPLIT_ARGS]
+    main(argv)
+    manifest = json.loads((out / "V_split.json").read_text())
+    assert manifest["members"] == ["faces_extent", "faces_layout", "llstat"]
+    assert manifest["member_sources"] == {"faces_extent": "faces", "faces_layout": "faces"}
+    assert manifest["member_features"]["faces_extent"] == ["faces_count", "faces_max_area",
+                                                           "faces_total_area"]
+    assert manifest["member_features"]["faces_layout"] == ["faces_center_dist", "faces_mutual_dist"]
+    pm = manifest["per_member"]
+    # "absent unless complete" now costs only the gated columns
+    assert pm["faces_extent"]["rows_present"] == n
+    assert pm["faces_layout"]["rows_present"] == n_layout
+    assert pm["faces_extent"]["masked_columns"] == []
+    assert pm["faces_layout"]["masked_columns"] == ["faces_center_dist", "faces_mutual_dist"]
+    assert "loaded faces_layout: 240 rows x 2 features (split from faces)" in capsys.readouterr().out
+
+
+def test_explicit_model_member_loads_whole(faces_table, tmp_path):
+    path, n_layout, _ = faces_table
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", str(path), "--members", "faces,llstat",
+            "-o", str(out), "--stem", "V_whole", *SPLIT_ARGS]
+    main(argv)
+    manifest = json.loads((out / "V_whole.json").read_text())
+    assert manifest["members"] == ["faces", "llstat"]
+    assert manifest["member_sources"] == {}
+    assert len(manifest["member_features"]["faces"]) == 5
+    assert manifest["per_member"]["faces"]["rows_present"] == n_layout
+
+
+def test_split_fit_projects(faces_table, tmp_path):
+    path, _, n = faces_table
+    out = tmp_path / "space"
+    main(["space", "fit", "--features", str(path), "-o", str(out), "--stem", "V_split", *SPLIT_ARGS])
+    proj = tmp_path / "proj.parquet"
+    assert main(["space", "project", "--space", str(out / "V_split.json"), "--features", str(path),
+                 "-o", str(proj)]) == 0
+    assert len(pd.read_parquet(proj)) == n
+
+
+def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
+    path, _, _ = faces_table
+    out = tmp_path / "space"
+    main(["space", "fit", "--features", str(path), "-o", str(out), "--stem", "V_split", *SPLIT_ARGS])
+    manifest = json.loads((out / "V_split.json").read_text())
+    # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
+    assert manifest["concat_rank"] == max(manifest["k_schedule"])
+    assert manifest["space_schema_version"] == "1.5"
+    for m, pm in manifest["per_member"].items():
+        assert len(pm["block_captured_at_k_max"]) == 3
+        assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
+        assert all(a <= b + 1e-9 for a, b in zip(pm["block_captured_at_k"], pm["block_captured_at_k_max"]))
