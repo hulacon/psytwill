@@ -561,6 +561,31 @@ def _space_members(args: argparse.Namespace, available: list[str]) -> list[str]:
     return split_members(members)
 
 
+def _key_value(x) -> float | str:
+    """One key value in comparable form: numbers as float, everything else as str."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def _row_key(label: str) -> tuple:
+    return tuple(_key_value(x) for x in label.split("|"))
+
+
+def _exclude_rows(path: str | None, key: tuple[str, ...]) -> set[tuple]:
+    """The --exclude-rows file as a set of comparable key tuples (empty without a file)."""
+    if not path:
+        return set()
+    import pandas as pd
+
+    df = pd.read_parquet(path) if str(path).endswith(".parquet") else pd.read_csv(path)
+    missing = [k for k in key if k not in df.columns]
+    if missing:
+        raise SpaceError(f"--exclude-rows {path} lacks key column(s) {missing}; it needs {list(key)}")
+    return {tuple(_key_value(v) for v in row) for row in df[list(key)].itertuples(index=False)}
+
+
 def _space_load(args: argparse.Namespace, members: list[str] | None = None):
     """Load member spaces one model at a time (a 300 M-row group table does
     not fit in pandas whole), dropping --exclude-ids rows. Returns
@@ -597,6 +622,7 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
     ids: set[str] = set()
     if args.exclude_ids:
         ids = {line.strip() for line in Path(args.exclude_ids).read_text().splitlines() if line.strip()}
+    drop_rows = _exclude_rows(getattr(args, "exclude_rows", None), key)
     spaces: dict = {}
     loaded: dict = {}
     for m in members:
@@ -637,6 +663,13 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
                              n_replicates=max(part.n_replicates for part in parts))
         if ids:
             keep = [i for i, lab in enumerate(sm.labels) if lab.split("|")[0] not in ids]
+            if len(keep) != sm.n:
+                sm = SpaceMatrix(name=sm.name, labels=[sm.labels[i] for i in keep], X=sm.X[keep],
+                                 features=sm.features, modality=sm.modality, extractor=sm.extractor,
+                                 n_replicates=sm.n_replicates)
+        if drop_rows:
+            keep = [i for i, lab in enumerate(sm.labels) if _row_key(lab) not in drop_rows]
+            rep.excluded_rows[m] = sm.n - len(keep)
             if len(keep) != sm.n:
                 sm = SpaceMatrix(name=sm.name, labels=[sm.labels[i] for i in keep], X=sm.X[keep],
                                  features=sm.features, modality=sm.modality, extractor=sm.extractor,
@@ -706,6 +739,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit.manifest["window"] = args.window
     fit.manifest["n_excluded_ids"] = n_excl
     fit.manifest["exclude_ids_file"] = args.exclude_ids
+    fit.manifest["exclude_rows_file"] = args.exclude_rows
+    fit.manifest["n_excluded_rows"] = dict(rep.excluded_rows)
     npz, manifest, curve = save_fit(fit, args.output, stem=args.stem)
     verdict = "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member"
     failing = [m for m in fit.manifest["deferred_members"]
@@ -1164,6 +1199,10 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("--key", default="stimulus_id", help="row grain, comma-separated (default stimulus_id)")
         q.add_argument("--window", type=float, help="bin `time` at this width (needs time in --key)")
         q.add_argument("--exclude-ids", help="file of stimulus_ids to drop (one per line)")
+        q.add_argument("--exclude-rows",
+                       help="CSV or parquet with one column per --key column; matching rows are dropped "
+                            "(numeric key values compare as numbers, so 3 matches 3.0). With --window, "
+                            "give the binned key")
         q.add_argument("--groups-from-label", action="store_true",
                        help="grouped folds / block nulls keyed on the first key column (clip id)")
 

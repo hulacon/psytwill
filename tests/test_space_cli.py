@@ -240,3 +240,39 @@ def test_defer_members_flag_reaches_the_manifest(faces_table, tmp_path, capsys):
           "--defer-members", "faces_layout", *SPLIT_ARGS])
     manifest = json.loads((out / "V_def.json").read_text())
     assert manifest["deferred_members"] == ["faces_layout"]
+
+
+def test_exclude_rows_drops_exactly_the_listed_rows(two_corpora, tmp_path, capsys):
+    """--exclude-rows removes single (stimulus, time) rows from every member, recorded in the manifest."""
+    drop = pd.DataFrame({"stimulus_id": ["ext-librispeech-000", "ext-musopen-003", "ext-musopen-003"],
+                         # the BINNED key (--window floors 0.25 -> 0.0); a string and floats compare as numbers
+                         "time": ["0", 1.0, 2.5]})
+    rows = tmp_path / "drop.csv"
+    drop.to_csv(rows, index=False)
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "--exclude-rows", str(rows),
+            "-o", str(out), "--stem", "T_rows", *FIT_ARGS]
+    assert main(argv) == 0
+    manifest = json.loads((out / "T_rows.json").read_text())
+    assert manifest["n_rows"] == 2 * N_STIM * N_BINS - 3
+    assert manifest["n_excluded_rows"] == {"a": 3, "b": 3}
+    assert manifest["exclude_rows_file"] == str(rows)
+
+    proj = tmp_path / "proj.csv"
+    assert main(["space", "project", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--exclude-rows", str(rows), "--space", str(out / "T_rows.json"),
+                 "-o", str(proj)]) == 0
+    got = pd.read_csv(proj)
+    assert len(got) == 2 * N_STIM * N_BINS - 3
+    assert not ((got.stimulus_id == "ext-musopen-003") & (got.time == 1.0)).any()
+
+
+def test_exclude_rows_without_the_key_columns_is_refused(two_corpora, tmp_path, capsys):
+    rows = tmp_path / "drop.csv"
+    pd.DataFrame({"stimulus_id": ["ext-librispeech-000"]}).to_csv(rows, index=False)
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--exclude-rows", str(rows),
+            "-o", str(tmp_path / "space"), "--stem", "T_bad", *FIT_ARGS]
+    assert main(argv) != 0
+    assert "lacks key column(s) ['time']" in capsys.readouterr().err

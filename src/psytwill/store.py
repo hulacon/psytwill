@@ -99,6 +99,8 @@ class LoadReport:
     """Space -> prefixed provenance columns excluded from its matrix."""
     nulls: dict[str, dict | None] = field(default_factory=dict)
     """Space -> its Contract B 1.1 `nulls` map from the table sidecar(s); None = 1.0."""
+    excluded_rows: dict[str, int] = field(default_factory=dict)
+    """Space -> rows dropped by an --exclude-rows file (absent = no file given)."""
 
 
 def _read(
