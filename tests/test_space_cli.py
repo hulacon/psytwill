@@ -231,3 +231,12 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
         assert all(a <= b + 1e-9 for a, b in zip(pm["block_captured_at_k"], pm["block_captured_at_k_max"]))
+
+
+def test_defer_members_flag_reaches_the_manifest(faces_table, tmp_path, capsys):
+    path, _, _ = faces_table
+    out = tmp_path / "space"
+    main(["space", "fit", "--features", str(path), "-o", str(out), "--stem", "V_def",
+          "--defer-members", "faces_layout", *SPLIT_ARGS])
+    manifest = json.loads((out / "V_def.json").read_text())
+    assert manifest["deferred_members"] == ["faces_layout"]

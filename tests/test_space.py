@@ -631,3 +631,46 @@ def test_member_splits_resolve():
     assert member_source("faces") == ("faces", None)  # a whole-model member still loads whole
     cols = [c for parts in MEMBER_SPLITS["faces"].values() for c in parts]
     assert len(cols) == len(set(cols)) == 5
+
+
+class TestDeferredMembers:
+    """A deferred member is scored but does not choose k (DECIDED 2026-09-24)."""
+
+    def _with_independent(self, members):
+        sp, _ = members
+        rng = np.random.default_rng(1)
+        sp = dict(sp)
+        sp["d"] = _member("d", rng, rng.normal(size=(N, LATENT)), 10)
+        return sp
+
+    def test_deferred_failure_does_not_walk_k_up(self, members):
+        sp = self._with_independent(members)
+        full = fit_block(sp, ["a", "b", "d"], block="T", r2_min=0.9, **_fit_kwargs())
+        dfr = fit_block(sp, ["a", "b", "d"], block="T", r2_min=0.9, defer=["d"], **_fit_kwargs())
+        base = fit_block(sp, ["a", "b"], block="T", r2_min=0.9, **_fit_kwargs())
+        assert dfr.k == base.k < full.k
+        m = dfr.manifest
+        assert m["deferred_members"] == ["d"]
+        assert m["subsumes_non_deferred"] is True
+        # deferring changes who chooses k, never what the block claims to cover
+        assert m["subsumes_all_members"] is False
+        assert m["per_member"]["d"]["passed_all_folds"] is False
+        assert len(m["per_member"]["d"]["r2_per_fold"]) == 3
+
+    def test_deferred_member_that_passes_keeps_the_full_claim(self, members):
+        sp, _ = members
+        fit = fit_block(sp, ["a", "b", "c"], block="T", defer=["c"], **_fit_kwargs())
+        assert fit.manifest["subsumes_all_members"] is True
+
+    def test_no_deferral_is_unchanged(self, members):
+        sp, _ = members
+        a = fit_block(sp, ["a", "b", "c"], block="T", **_fit_kwargs())
+        assert a.manifest["deferred_members"] == []
+        assert a.manifest["subsumes_all_members"] == a.manifest["subsumes_non_deferred"]
+
+    def test_unknown_or_all_deferred_is_refused(self, members):
+        sp, _ = members
+        with pytest.raises(SpaceError, match="not block members"):
+            fit_block(sp, ["a", "b"], block="T", defer=["z"], **_fit_kwargs())
+        with pytest.raises(SpaceError, match="every member is deferred"):
+            fit_block(sp, ["a"], block="T", defer=["a"], **_fit_kwargs())

@@ -686,7 +686,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
                     groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                     n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
-                    random_state=args.seed, progress=progress)
+                    random_state=args.seed, progress=progress,
+                    defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()])
     for m in members:
         pm = fit.manifest["per_member"][m]
         if pm["masked_columns"]:
@@ -707,6 +708,10 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit.manifest["exclude_ids_file"] = args.exclude_ids
     npz, manifest, curve = save_fit(fit, args.output, stem=args.stem)
     verdict = "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member"
+    failing = [m for m in fit.manifest["deferred_members"]
+               if not fit.manifest["per_member"][m]["passed_all_folds"]]
+    if fit.manifest["subsumes_non_deferred"] and failing:
+        verdict = f"subsumes every member except deferred {', '.join(failing)}"
     print(f"psytwill space fit [{args.block}] -> {manifest}")
     print(f"  k={fit.k} ({verdict}); PR bound {fit.manifest['pr_sum_bound']:.1f}; "
           f"n={fit.manifest['n_rows']} rows, {len(members)} members, excluded {n_excl} ids")
@@ -1177,6 +1182,9 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--members", help="comma-separated member spaces (default: the block's battery members present)")
     f.add_argument("--k-schedule", help="comma-separated k candidates (default 8,16,...,256 below the PR bound)")
     f.add_argument("--n-splits", type=int, default=5)
+    f.add_argument("--defer-members",
+                   help="comma-separated members that are scored but do not decide k; the manifest "
+                        "records them as not subsumed when they fail (a future version's work)")
     f.add_argument("--corpora-from-label", action="store_true",
                    help="read the corpus from each row's ext-<corpus>-* stimulus_id "
                         "(non-external ids group as 'internal') for the gated-`missing` "

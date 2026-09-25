@@ -753,9 +753,17 @@ def fit_block(
     nulls: dict[str, dict | None] | None = None,
     structural_null_high: float = STRUCTURAL_NULL_HIGH,
     structural_null_low: float = STRUCTURAL_NULL_LOW,
+    defer: Sequence[str] = (),
     progress=None,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
+
+    ``defer`` names members that are fitted and scored but do not decide k:
+    the walk stops at the first k where every OTHER member passes, and the
+    manifest records the deferred members' verdicts and that the block does
+    not subsume them (DECIDED 2026-09-24, Ben, for V's thin `faces_layout`:
+    its failure was diagnosed, not a reason to walk V to full rank, and is
+    left to a future version).
 
     ``nulls`` maps each member to its Contract B 1.1 ``nulls`` map (None for
     a 1.0 input), and decides every null (see the NaN policy section): a NaN
@@ -768,6 +776,12 @@ def fit_block(
     missing = [m for m in members if m not in spaces]
     if missing:
         raise SpaceError(f"members not in the loaded spaces: {missing}; have {sorted(spaces)}")
+    defer = list(dict.fromkeys(defer))
+    unknown = [m for m in defer if m not in members]
+    if unknown:
+        raise SpaceError(f"deferred member(s) {unknown} are not block members {members}")
+    if defer and len(defer) == len(members):
+        raise SpaceError("every member is deferred, so nothing can choose k")
     if len(members) < 1:
         raise SpaceError("a block needs at least one member space")
     aligned, labels = align_spaces({m: spaces[m] for m in members})
@@ -889,7 +903,7 @@ def fit_block(
                 row = asdict(mc)
                 row["passed"] = mc.passes(r2_min, alpha)
                 curve.append(row)
-                if not row["passed"]:
+                if not row["passed"] and m not in defer:
                     all_pass = False
         if all_pass:
             chosen = k
@@ -948,7 +962,11 @@ def fit_block(
         "block": block,
         "members": members,
         "k": chosen,
-        "subsumes_all_members": subsumed,
+        # never true while a deferred member fails at k: deferring changes
+        # which members choose k, not what the block is claimed to cover
+        "subsumes_all_members": subsumed and all(per_member[m]["passed_all_folds"] for m in defer),
+        "deferred_members": defer,
+        "subsumes_non_deferred": subsumed,
         "pr_sum_bound": pr_sum,
         "pr_basis": "correlation",
         "k_below_pr_bound": chosen < pr_sum,
