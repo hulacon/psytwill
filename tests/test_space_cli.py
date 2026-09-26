@@ -61,6 +61,21 @@ def test_member_is_stacked_across_tables(two_corpora, tmp_path, capsys):
     assert f"loaded a: {2 * N_STIM * N_BINS} rows x 6 features from 2 tables" in text
 
 
+def test_per_corpus_fit_reports_each_corpus(two_corpora, tmp_path, capsys):
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "--per-corpus",
+            "-o", str(out), "--stem", "T_pc", *FIT_ARGS]
+    assert main(argv) == 0
+    manifest = json.loads((out / "T_pc.json").read_text())
+    assert manifest["criterion"]["scope"] == "per_corpus"
+    assert set(manifest["per_member"]["a"]["per_corpus"]) == {"librispeech", "musopen"}
+    curve = pd.read_csv(out / "T_pc_curve.csv")
+    assert set(curve["corpus"]) == {"all", "librispeech", "musopen"}
+    text = capsys.readouterr().out
+    assert "verdict over corpora" in text and "musopen" in text
+
+
 def test_single_table_output_is_unchanged(two_corpora, tmp_path, capsys):
     out = tmp_path / "space"
     argv = ["space", "fit", "--features", str(two_corpora[0]), "--key", "stimulus_id,time",
@@ -226,7 +241,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.5"
+    assert manifest["space_schema_version"] == "1.6"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])

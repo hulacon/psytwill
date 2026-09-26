@@ -251,7 +251,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.5"
+        assert meta["space_schema_version"] == "1.6"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -619,7 +619,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.5"
+        assert meta["space_schema_version"] == "1.6"
 
 
 
@@ -674,3 +674,62 @@ class TestDeferredMembers:
             fit_block(sp, ["a", "b"], block="T", defer=["z"], **_fit_kwargs())
         with pytest.raises(SpaceError, match="every member is deferred"):
             fit_block(sp, ["a"], block="T", defer=["a"], **_fit_kwargs())
+
+
+class TestPerCorpus:
+    """The criterion scored within each corpus (DECIDED 2026-09-26): a pooled
+    fold counts the offset between corpora as explained variance."""
+
+    @staticmethod
+    def _two_registers():
+        # a and b read the shared latent plus a corpus offset; d is the offset
+        # plus variance of its own inside each corpus, which no other member
+        # carries. Pooled, d looks explained (the offset dominates it);
+        # within either corpus it is not.
+        rng = np.random.default_rng(1)
+        corpora = np.array(["x"] * (N // 2) + ["y"] * (N // 2))
+        off = np.where(corpora == "x", 3.0, -3.0)[:, None]
+        Z = np.hstack([rng.normal(size=(N, LATENT)), off])
+        sp = {"a": _member("a", rng, Z, 24), "b": _member("b", rng, Z, 12)}
+        d = off @ rng.normal(size=(1, 6)) + rng.normal(size=(N, 6))
+        sp["d"] = SpaceMatrix(name="d", labels=sp["a"].labels, X=d,
+                              features=[f"d_{j:03d}" for j in range(6)])
+        return sp, corpora.tolist()
+
+    def test_pooled_passes_what_per_corpus_fails(self):
+        sp, corpora = self._two_registers()
+        pooled = fit_block(sp, ["a", "b", "d"], block="T", corpora=corpora, **_fit_kwargs())
+        per = fit_block(sp, ["a", "b", "d"], block="T", corpora=corpora, per_corpus=True,
+                        **_fit_kwargs())
+        assert pooled.manifest["subsumes_all_members"] is True
+        assert pooled.manifest["criterion"]["scope"] == "pooled"
+        assert per.manifest["subsumes_all_members"] is False
+        assert per.manifest["criterion"]["scope"] == "per_corpus"
+        assert per.manifest["criterion"]["corpus_rows"] == {"x": N // 2, "y": N // 2}
+        d = per.manifest["per_member"]["d"]
+        assert d["passed_all_folds"] is False
+        assert not d["per_corpus"]["x"]["passed_all_folds"]
+        # the pooled row is still reported, and still passes, at the same k
+        assert min(d["r2_per_fold"]) >= 0.5
+
+    def test_curve_rows_carry_their_scope(self):
+        sp, corpora = self._two_registers()
+        per = fit_block(sp, ["a", "b"], block="T", corpora=corpora, per_corpus=True,
+                        **_fit_kwargs())
+        scopes = {r["corpus"] for r in per.curve}
+        assert scopes == {"all", "x", "y"}
+        pooled = fit_block(sp, ["a", "b"], block="T", **_fit_kwargs())
+        assert {r["corpus"] for r in pooled.curve} == {"all"}
+        assert "per_corpus" not in pooled.manifest["per_member"]["a"]
+
+    def test_needs_corpora(self, members):
+        sp, _ = members
+        with pytest.raises(SpaceError, match="corpus label per row"):
+            fit_block(sp, ["a", "b"], block="T", per_corpus=True, **_fit_kwargs())
+
+    def test_thin_corpus_is_refused(self, members):
+        sp, _ = members
+        corpora = ["x"] * (N - 2) + ["y"] * 2
+        with pytest.raises(SpaceError, match="cannot score y in fold"):
+            fit_block(sp, ["a", "b"], block="T", corpora=corpora, per_corpus=True,
+                      **_fit_kwargs())

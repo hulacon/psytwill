@@ -698,18 +698,19 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     groups = None
     corpora = None
     schedule = tuple(int(k) for k in args.k_schedule.split(",")) if args.k_schedule else DEFAULT_K_SCHEDULE
-    if args.groups_from_label or args.corpora_from_label:
+    if args.groups_from_label or args.corpora_from_label or args.per_corpus:
         from psytwill.store import align_spaces
 
         _, labels = align_spaces({m: spaces[m] for m in members})
         if args.groups_from_label:
             groups = [lab.split("|")[0] for lab in labels]
-        if args.corpora_from_label:
+        if args.corpora_from_label or args.per_corpus:
             from psytwill.fitcorpus import is_external, parse_ext_id
 
             ids = [lab.split("|")[0] for lab in labels]
             corpora = [parse_ext_id(i)[0] if is_external(i) else "internal" for i in ids]
-            print(f"  gated-missing detector (warning only): {len(set(corpora))} corpora "
+            print(f"  corpora ({'criterion + ' if args.per_corpus else ''}gated-missing warning): "
+                  f"{len(set(corpora))} corpora "
                   f"({', '.join(sorted(set(corpora)))})")
 
     def progress(i, n, what):
@@ -719,7 +720,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
                     groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                     n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
-                    random_state=args.seed, progress=progress,
+                    random_state=args.seed, progress=progress, per_corpus=args.per_corpus,
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()])
     for m in members:
         pm = fit.manifest["per_member"][m]
@@ -755,7 +756,11 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         print(f"  {m:<18} PR {pm['participation_ratio']:6.1f} rank {pm['whitened_rank']:>4}  "
               f"R2 {min(pm['r2_per_fold']) if pm['r2_per_fold'] else float('nan'):.3f}  "
               f"overlap {min(pm['overlap_per_fold']) if pm['overlap_per_fold'] else float('nan'):.3f}  "
-              f"{'pass' if pm['passed_all_folds'] else 'FAIL'}")
+              f"{'pass' if pm['passed_all_folds'] else 'FAIL'}"
+              + ("  (R2/overlap pooled; verdict over corpora, below)" if args.per_corpus else ""))
+        for c, pc in pm.get("per_corpus", {}).items():
+            r2 = min(pc["r2_per_fold"]) if pc["r2_per_fold"] else float("nan")
+            print(f"      {c:<16} R2 {r2:.3f}  {'pass' if pc['passed_all_folds'] else 'FAIL'}")
     print(f"  weights {npz}\n  curve {curve}")
 
 
@@ -1229,6 +1234,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(non-external ids group as 'internal') for the gated-`missing` "
                         "WARNING only: nulls are handled as the producers declare them "
                         "(Contract B 1.1 `nulls`), never inferred from corpus contrast")
+    f.add_argument("--per-corpus", action="store_true",
+                   help="score the criterion within each corpus (read as --corpora-from-label "
+                        "does) and choose k only when every corpus passes; the pooled fold is "
+                        "still reported. For a multi-register mix, where pooled R^2 counts "
+                        "between-corpus differences as explained")
     _space_criterion(f)
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")

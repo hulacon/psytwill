@@ -111,7 +111,9 @@ def split_members(models: Sequence[str]) -> list[str]:
     return out
 
 
-SPACE_SCHEMA_VERSION = "1.5"
+# 1.6: curve rows carry `corpus` ("all" = the pooled fold); a per-corpus fit
+# adds one row per corpus and `per_member[m]["per_corpus"]`.
+SPACE_SCHEMA_VERSION = "1.6"
 
 
 # --------------------------------------------------------------------------
@@ -754,6 +756,7 @@ def fit_block(
     structural_null_high: float = STRUCTURAL_NULL_HIGH,
     structural_null_low: float = STRUCTURAL_NULL_LOW,
     defer: Sequence[str] = (),
+    per_corpus: bool = False,
     progress=None,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
@@ -768,7 +771,15 @@ def fit_block(
     ``nulls`` maps each member to its Contract B 1.1 ``nulls`` map (None for
     a 1.0 input), and decides every null (see the NaN policy section): a NaN
     without an entry refuses the fit. ``corpora`` (one label per aligned row)
-    only feeds the warning-only gated-`missing` detector.
+    feeds the warning-only gated-`missing` detector, and with ``per_corpus``
+    the criterion.
+
+    ``per_corpus`` scores every member on each corpus's share of each fold's
+    test rows and passes k only when every corpus passes; the pooled fold is
+    still scored (``corpus`` "all" in the curve) but does not decide k. On a
+    multi-register mix the pooled R^2 counts the differences BETWEEN corpora
+    as explained variance, which is easy to explain, so a pooled pass can hide
+    a member the block does not cover inside any one corpus.
     """
     _check_perm_floor(n_perm, alpha)
     _check_eval_blocks(eval_n, block_size)
@@ -804,6 +815,8 @@ def fit_block(
                          f"({len(corpora)} != {len(labels)})")
     if groups is not None and len(groups) != len(labels):
         raise SpaceError("groups must have one entry per aligned row")
+    if per_corpus and corpora is None:
+        raise SpaceError("per_corpus needs one corpus label per row (`--corpora-from-label`)")
     # 2. drop rows any member declares undefinable
     undef_rows = undefinable_rows(aligned, kinds)
     undefinable_dropped = {m: int(mask.sum()) for m, mask in undef_rows.items()}
@@ -871,6 +884,23 @@ def fit_block(
     # weights, so the bound follows it. Raw-covariance PR remains the basis of
     # the Contract B section 4.4 space manifest; `pr_basis` names which is which.
     folds = _folds(n, n_splits, g, random_state)
+    corp = np.asarray(corpora) if per_corpus else None
+    corpus_names = sorted(set(corp.tolist())) if per_corpus else []
+    if per_corpus:
+        # each corpus is scored inside each test fold, so it must be
+        # scoreable there: >= 3 rows, and >= 2 groups for the grouped ridge
+        thin = []
+        for fi, (_, test) in enumerate(folds):
+            for c in corpus_names:
+                sel = corp[test] == c
+                n_g = len(np.unique(g[test][sel])) if g is not None else int(sel.sum())
+                if sel.sum() < 3 or n_g < 2:
+                    thin.append(f"{c} in fold {fi} ({int(sel.sum())} rows, {n_g} groups)")
+        if thin:
+            raise SpaceError(
+                "per-corpus criterion cannot score " + "; ".join(thin) + ". Every corpus "
+                "needs >= 3 rows and >= 2 groups in every test fold: lower n_splits, or "
+                "leave the thin corpus out of the fit.")
     fold_maps = [fit_block_map(aligned, members, train) for train, _ in folds]
     k_top = min(fm.k_max for fm in fold_maps)
     schedule = sorted({int(k) for k in k_schedule if 1 <= int(k) < k_top} | {k_top})
@@ -891,20 +921,28 @@ def fit_block(
                  else fold_maps[fi].scores_from_concat(fold_concat[fi], k))
             placed = np.isfinite(S).all(axis=1)
             gt = g[test] if g is not None else None
+            scopes = [("all", np.ones(len(test), dtype=bool))]
+            if per_corpus:
+                scopes += [(c, corp[test] == c) for c in corpus_names]
             for m in members:
                 step += 1
                 if progress:
                     progress(step, n_steps, f"k={k} fold={fi} {m}")
-                mc = _check_present(S, aligned[m].X[test], present[m][test], placed,
-                                    member=m, k=k, fold=fi, groups=gt, k_nn=k_nn, n_perm=n_perm,
-                                    eval_n=eval_n, block_size=block_size,
-                                    random_state=random_state,
-                                    metric=metric_for_rank(fold_maps[fi].whiteners[m].rank))
-                row = asdict(mc)
-                row["passed"] = mc.passes(r2_min, alpha)
-                curve.append(row)
-                if not row["passed"] and m not in defer:
-                    all_pass = False
+                metric = metric_for_rank(fold_maps[fi].whiteners[m].rank)
+                Xt, pt = aligned[m].X[test], present[m][test]
+                for scope, sel in scopes:
+                    mc = _check_present(S[sel], Xt[sel], pt[sel], placed[sel], member=m, k=k,
+                                        fold=fi, groups=None if gt is None else gt[sel],
+                                        k_nn=k_nn, n_perm=n_perm, eval_n=eval_n,
+                                        block_size=block_size, random_state=random_state,
+                                        metric=metric)
+                    row = asdict(mc)
+                    row["corpus"] = scope
+                    row["passed"] = mc.passes(r2_min, alpha)
+                    curve.append(row)
+                    decides = (scope != "all") if per_corpus else True
+                    if decides and not row["passed"] and m not in defer:
+                        all_pass = False
         if all_pass:
             chosen = k
             break
@@ -925,7 +963,9 @@ def fit_block(
     block_pr = float(lam.sum() ** 2 / (lam ** 2).sum()) if lam.size and lam.sum() > 0 else 0.0
     per_member = {}
     for m in members:
-        rows = [r for r in curve if r["member"] == m and r["k"] == chosen]
+        at_k = [r for r in curve if r["member"] == m and r["k"] == chosen]
+        rows = [r for r in at_k if r["corpus"] == "all"]
+        deciding = [r for r in at_k if r["corpus"] != "all"] if per_corpus else rows
         per_member[m] = {
             "participation_ratio": pr[m],
             # share of the member's whitened slice spanned by each fold map's
@@ -953,8 +993,15 @@ def fit_block(
             "r2_per_fold": [r["r2"] for r in rows],
             "overlap_per_fold": [r["overlap"] for r in rows],
             "overlap_p_per_fold": [r["overlap_p"] for r in rows],
-            "passed_all_folds": all(r["passed"] for r in rows) if rows else False,
+            "passed_all_folds": all(r["passed"] for r in deciding) if deciding else False,
         }
+        if per_corpus:
+            per_member[m]["per_corpus"] = {
+                c: {"n_rows_per_fold": [r["n_rows"] for r in at_k if r["corpus"] == c],
+                    "r2_per_fold": [r["r2"] for r in at_k if r["corpus"] == c],
+                    "overlap_p_per_fold": [r["overlap_p"] for r in at_k if r["corpus"] == c],
+                    "passed_all_folds": all(r["passed"] for r in at_k if r["corpus"] == c)}
+                for c in corpus_names}
     manifest = {
         "space_schema_version": SPACE_SCHEMA_VERSION,
         "psytwill_version": __version__,
@@ -986,7 +1033,10 @@ def fit_block(
         "grouped": g is not None,
         "criterion": {"r2_min": r2_min, "alpha": alpha, "k_nn": k_nn, "n_perm": n_perm,
                       "eval_n": eval_n, "block_size": block_size, "random_state": random_state,
-                      "eval_sampling": _eval_sampling(eval_n, block_size)},
+                      "eval_sampling": _eval_sampling(eval_n, block_size),
+                      "scope": "per_corpus" if per_corpus else "pooled",
+                      "corpus_rows": ({c: int((corp == c).sum()) for c in corpus_names}
+                                      if per_corpus else None)},
         "max_nan_frac": max_nan_frac,
         "null_policy": {
             "source": "contract-b-1.1 nulls",
