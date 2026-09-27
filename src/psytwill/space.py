@@ -758,6 +758,7 @@ def fit_block(
     defer: Sequence[str] = (),
     per_corpus: bool = False,
     progress=None,
+    on_row=None,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
@@ -773,6 +774,11 @@ def fit_block(
     without an entry refuses the fit. ``corpora`` (one label per aligned row)
     feeds the warning-only gated-`missing` detector, and with ``per_corpus``
     the criterion.
+
+    ``on_row`` is called with each curve row as soon as it is scored, so a
+    caller can persist the walk before the fit returns (a per-corpus walk
+    over a large mix can outlast its allocation between the last step and
+    the save: MEASURED 2026-09-27, 24 h of scoring lost two minutes short).
 
     ``per_corpus`` scores every member on each corpus's share of each fold's
     test rows and passes k only when every corpus passes; the pooled fold is
@@ -940,6 +946,8 @@ def fit_block(
                     row["corpus"] = scope
                     row["passed"] = mc.passes(r2_min, alpha)
                     curve.append(row)
+                    if on_row is not None:
+                        on_row(row)
                     decides = (scope != "all") if per_corpus else True
                     if decides and not row["passed"] and m not in defer:
                         all_pass = False

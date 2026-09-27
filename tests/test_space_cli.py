@@ -291,3 +291,30 @@ def test_exclude_rows_without_the_key_columns_is_refused(two_corpora, tmp_path, 
             "-o", str(tmp_path / "space"), "--stem", "T_bad", *FIT_ARGS]
     assert main(argv) != 0
     assert "lacks key column(s) ['time']" in capsys.readouterr().err
+
+
+def test_curve_rows_reach_disk_before_the_save(two_corpora, tmp_path, monkeypatch):
+    import psytwill.space as space
+
+    def boom(*a, **k):
+        raise RuntimeError("allocation ended")
+
+    monkeypatch.setattr(space, "save_fit", boom)
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "--per-corpus",
+            "-o", str(out), "--stem", "T_cut", *FIT_ARGS]
+    with pytest.raises(RuntimeError, match="allocation ended"):
+        main(argv)
+    part = pd.read_csv(out / "T_cut_curve.partial.csv")
+    assert set(part["corpus"]) == {"all", "librispeech", "musopen"}
+    assert {"member", "k", "fold", "r2", "passed"} <= set(part.columns)
+
+
+def test_partial_curve_is_removed_after_the_save(two_corpora, tmp_path):
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "-o", str(out), "--stem", "T_ok", *FIT_ARGS]
+    assert main(argv) == 0
+    assert (out / "T_ok_curve.csv").exists()
+    assert not (out / "T_ok_curve.partial.csv").exists()

@@ -692,7 +692,7 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
 
 
 def _run_space_fit(args: argparse.Namespace) -> None:
-    from psytwill.space import DEFAULT_K_SCHEDULE, fit_block, save_fit
+    from psytwill.space import DEFAULT_K_SCHEDULE, SPACE_SCHEMA_VERSION, fit_block, save_fit
 
     spaces, members, n_excl, rep = _space_load(args)
     groups = None
@@ -717,10 +717,30 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         if i == 1 or i % 25 == 0 or i == n:
             print(f"  [{i}/{n}] {what}", flush=True)
 
+    # the walk's rows reach disk as they are scored; save_fit writes the
+    # final curve and this partial file is removed once it has
+    from pathlib import Path
+
+    stem = args.stem or f"{args.block}_v{SPACE_SCHEMA_VERSION.split('.')[0]}"
+    partial = Path(args.output) / f"{stem}_curve.partial.csv"
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    partial.unlink(missing_ok=True)
+
+    def on_row(row, _cols=[]):
+        import csv
+
+        with partial.open("a", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=_cols or list(row))
+            if not _cols:
+                _cols.extend(row)
+                w.writeheader()
+            w.writerow(row)
+
     fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
                     groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                     n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
                     random_state=args.seed, progress=progress, per_corpus=args.per_corpus,
+                    on_row=on_row,
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()])
     for m in members:
         pm = fit.manifest["per_member"][m]
@@ -743,6 +763,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit.manifest["exclude_rows_file"] = args.exclude_rows
     fit.manifest["n_excluded_rows"] = dict(rep.excluded_rows)
     npz, manifest, curve = save_fit(fit, args.output, stem=args.stem)
+    partial.unlink(missing_ok=True)
     verdict = "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member"
     failing = [m for m in fit.manifest["deferred_members"]
                if not fit.manifest["per_member"][m]["passed_all_folds"]]
