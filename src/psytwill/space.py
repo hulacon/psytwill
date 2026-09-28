@@ -24,6 +24,8 @@ Pipeline (design on record in the psytwill-space workbench,
 4. retention walks a ``k`` schedule and keeps the smallest ``k`` at which
    every member passes the criterion in every outer fold (block map fitted
    on the training rows, ridge/overlap evaluated on the test rows);
+   with ``per_corpus``, inside every corpus instead, on all of its rows
+   placed out of fold (see :func:`fit_block`);
 5. the frozen fit is refitted on all rows at that ``k``.
 
 Private blocks are grain-free: mean pooling commutes with a linear map, so
@@ -115,7 +117,15 @@ def split_members(models: Sequence[str]) -> list[str]:
 # adds one row per corpus and `per_member[m]["per_corpus"]`.
 # 1.7: `corpus_weights` (None, or the scheme and per-corpus row counts the
 # whiteners and block covariance were weighted by).
-SPACE_SCHEMA_VERSION = "1.7"
+# 1.8: a per-corpus row is ONE out-of-fold score per corpus (`fold` =
+# OOF_FOLD), not one per test fold; `per_member[m]["per_corpus"][c]` holds
+# n_rows/r2/overlap/overlap_p/passed; `criterion.corpus_scoring` and
+# `criterion.fold_frame_r2` record how the fold scores were pooled.
+SPACE_SCHEMA_VERSION = "1.8"
+
+#: `fold` of a curve row scored on every fold's test rows at once, each row
+#: placed by the fold map that did not see it (see :func:`fit_block`).
+OOF_FOLD = -1
 
 
 # --------------------------------------------------------------------------
@@ -797,6 +807,55 @@ def _folds(n: int, n_splits: int, groups: Sequence | None, random_state: int):
     return list(KFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(idx))
 
 
+@dataclass
+class _FoldFrame:
+    """How one fold map's scores sit against the reference fold map's.
+
+    Every fold map is its own PCA, so its scores are in its own basis (signs,
+    order among near-equal eigenvalues, a rotation inside the retained
+    subspace). Scores from different fold maps cannot be stacked into one
+    table until they share a frame. The statistics here are measured on the
+    complete rows BOTH maps were trained on, so the rotation never sees a row
+    either map is later scored on. Column slices of the scores are the nested
+    top-k scores, so one cross-product serves every k.
+    """
+
+    mean: np.ndarray  # (k_top,) this fold map's score mean on the shared rows
+    ref_mean: np.ndarray  # (k_top,) the reference map's
+    cross: np.ndarray  # (k_top, k_top) centred S_fold^T S_ref
+    ss: np.ndarray  # (k_top,) centred column sums of squares, this map
+    ref_ss: np.ndarray  # (k_top,) the reference map's
+    n_rows: int
+
+    def rotation(self, k: int) -> tuple[np.ndarray, float]:
+        """Orthogonal Procrustes rotation onto the reference frame at ``k``,
+        and the share of the reference scores' variance it reproduces."""
+        U, s, Vt = np.linalg.svd(self.cross[:k, :k])
+        resid = self.ss[:k].sum() + self.ref_ss[:k].sum() - 2.0 * s.sum()
+        return U @ Vt, float(1.0 - resid / self.ref_ss[:k].sum())
+
+    def apply(self, S: np.ndarray, k: int) -> tuple[np.ndarray, float]:
+        R, r2 = self.rotation(k)
+        return (S - self.mean[:k]) @ R + self.ref_mean[:k], r2
+
+
+def _fold_frame(fm: BlockMap, ref: BlockMap, spaces: dict[str, SpaceMatrix],
+                rows: np.ndarray, k_top: int) -> _FoldFrame:
+    A, B = fm.concat(spaces, rows), ref.concat(spaces, rows)
+    ok = ~(np.isnan(A).any(axis=1) | np.isnan(B).any(axis=1))
+    if ok.sum() <= k_top:
+        raise SpaceError(
+            f"only {int(ok.sum())} complete rows are shared by two fold maps' training sets, "
+            f"too few to align {k_top} block directions for the per-corpus criterion")
+    Sa = fm.scores_from_concat(A[ok], k_top)
+    Sb = ref.scores_from_concat(B[ok], k_top)
+    ma, mb = Sa.mean(axis=0), Sb.mean(axis=0)
+    Sa -= ma
+    Sb -= mb
+    return _FoldFrame(mean=ma, ref_mean=mb, cross=Sa.T @ Sb, ss=(Sa ** 2).sum(axis=0),
+                      ref_ss=(Sb ** 2).sum(axis=0), n_rows=int(ok.sum()))
+
+
 def _captured(bm: BlockMap, member: str, k: int) -> float:
     """Share of ``member``'s whitened slice spanned by the top-``k`` block components."""
     ranks = [bm.whiteners[m].rank for m in bm.members]
@@ -852,12 +911,22 @@ def fit_block(
     over a large mix can outlast its allocation between the last step and
     the save: MEASURED 2026-09-27, 24 h of scoring lost two minutes short).
 
-    ``per_corpus`` scores every member on each corpus's share of each fold's
-    test rows and passes k only when every corpus passes; the pooled fold is
-    still scored (``corpus`` "all" in the curve) but does not decide k. On a
-    multi-register mix the pooled R^2 counts the differences BETWEEN corpora
-    as explained variance, which is easy to explain, so a pooled pass can hide
-    a member the block does not cover inside any one corpus.
+    ``per_corpus`` scores every member inside each corpus and passes k only
+    when every corpus passes; the pooled folds are still scored (``corpus``
+    "all" in the curve) but do not decide k. On a multi-register mix the
+    pooled R^2 counts the differences BETWEEN corpora as explained variance,
+    which is easy to explain, so a pooled pass can hide a member the block
+    does not cover inside any one corpus.
+
+    Each corpus is scored ONCE, on all its rows (``fold`` = ``OOF_FOLD``):
+    every row is placed by the fold map that did not train on it, rotated
+    into fold 0's frame (orthogonal Procrustes on the complete rows both maps
+    trained on; its fit is recorded as ``criterion.fold_frame_r2``), and the
+    criterion runs on the stacked scores. Scoring each corpus's share of each
+    test fold instead (0.25.0-0.26.0) left the inner ridge a few hundred rows
+    from a handful of recordings, where it fails members the block carries:
+    MEASURED 2026-09-28, L_v0.4's narratives share of one fold (226 rows) read
+    R^2 ~ 0 for members at 0.9+ on the whole corpus.
 
     ``corpus_weights`` ("equal") weights every row by 1 / (its corpus's row
     count) in the member whiteners and the block covariance -- within each
@@ -976,20 +1045,18 @@ def fit_block(
     corp = np.asarray(corpora) if per_corpus else None
     corpus_names = sorted(set(corp.tolist())) if per_corpus else []
     if per_corpus:
-        # each corpus is scored inside each test fold, so it must be
-        # scoreable there: >= 3 rows, and >= 2 groups for the grouped ridge
+        # each corpus is scored once on all its rows (out of fold), so it
+        # needs >= 3 rows, and >= 2 groups for the grouped ridge
         thin = []
-        for fi, (_, test) in enumerate(folds):
-            for c in corpus_names:
-                sel = corp[test] == c
-                n_g = len(np.unique(g[test][sel])) if g is not None else int(sel.sum())
-                if sel.sum() < 3 or n_g < 2:
-                    thin.append(f"{c} in fold {fi} ({int(sel.sum())} rows, {n_g} groups)")
+        for c in corpus_names:
+            sel = corp == c
+            n_g = len(np.unique(g[sel])) if g is not None else int(sel.sum())
+            if sel.sum() < 3 or n_g < 2:
+                thin.append(f"{c} ({int(sel.sum())} rows, {n_g} groups)")
         if thin:
             raise SpaceError(
                 "per-corpus criterion cannot score " + "; ".join(thin) + ". Every corpus "
-                "needs >= 3 rows and >= 2 groups in every test fold: lower n_splits, or "
-                "leave the thin corpus out of the fit.")
+                "needs >= 3 rows and >= 2 groups: leave the thin corpus out of the fit.")
     corp_all = np.asarray(corpora) if corpus_weights is not None else None
 
     def _weights(rows):
@@ -1007,39 +1074,69 @@ def fit_block(
     # with an absent member the least-squares placement depends on k
     fold_scores = [None if masked[i] else fold_maps[i].scores_from_concat(W)
                    for i, W in enumerate(fold_concat)]
-    n_steps = len(schedule) * len(folds) * len(members)
+    # per-corpus scoring stacks every fold's test scores, so each fold map is
+    # aligned to fold 0's frame on the rows both trained on
+    frames = ([None] + [_fold_frame(fold_maps[i], fold_maps[0], aligned,
+                                    np.intersect1d(folds[0][0], folds[i][0]), k_top)
+                        for i in range(1, len(folds))]) if per_corpus else []
+    frame_r2: dict[int, list[float]] = {}
+    n_steps = len(schedule) * (len(folds) + int(per_corpus)) * len(members)
     step = 0
+
+    def _record(mc: MemberCheck, scope: str) -> bool:
+        row = asdict(mc)
+        row["corpus"] = scope
+        row["passed"] = mc.passes(r2_min, alpha)
+        curve.append(row)
+        if on_row is not None:
+            on_row(row)
+        decides = (scope != "all") if per_corpus else True
+        return not (decides and not row["passed"] and mc.member not in defer)
+
     for k in schedule:
         all_pass = True
+        S_oof = np.full((n, k), np.nan) if per_corpus else None
         for fi, (_, test) in enumerate(folds):
             S = (fold_scores[fi][:, :k] if fold_scores[fi] is not None
                  else fold_maps[fi].scores_from_concat(fold_concat[fi], k))
             placed = np.isfinite(S).all(axis=1)
             gt = g[test] if g is not None else None
-            scopes = [("all", np.ones(len(test), dtype=bool))]
             if per_corpus:
-                scopes += [(c, corp[test] == c) for c in corpus_names]
+                if fi == 0:
+                    S_oof[test], r2f = S, 1.0
+                else:
+                    S_oof[test], r2f = frames[fi].apply(S, k)
+                frame_r2.setdefault(k, []).append(r2f)
             for m in members:
                 step += 1
                 if progress:
                     progress(step, n_steps, f"k={k} fold={fi} {m}")
-                metric = metric_for_rank(fold_maps[fi].whiteners[m].rank)
-                Xt, pt = aligned[m].X[test], present[m][test]
-                for scope, sel in scopes:
-                    mc = _check_present(S[sel], Xt[sel], pt[sel], placed[sel], member=m, k=k,
-                                        fold=fi, groups=None if gt is None else gt[sel],
-                                        k_nn=k_nn, n_perm=n_perm, eval_n=eval_n,
-                                        block_size=block_size, random_state=random_state,
-                                        metric=metric)
-                    row = asdict(mc)
-                    row["corpus"] = scope
-                    row["passed"] = mc.passes(r2_min, alpha)
-                    curve.append(row)
-                    if on_row is not None:
-                        on_row(row)
-                    decides = (scope != "all") if per_corpus else True
-                    if decides and not row["passed"] and m not in defer:
-                        all_pass = False
+                mc = _check_present(S, aligned[m].X[test], present[m][test], placed, member=m,
+                                    k=k, fold=fi, groups=gt, k_nn=k_nn, n_perm=n_perm,
+                                    eval_n=eval_n, block_size=block_size,
+                                    random_state=random_state,
+                                    metric=metric_for_rank(fold_maps[fi].whiteners[m].rank))
+                all_pass &= _record(mc, "all")
+        if per_corpus:
+            placed = np.isfinite(S_oof).all(axis=1)
+            for m in members:
+                step += 1
+                if progress:
+                    progress(step, n_steps, f"k={k} per-corpus {m}")
+                # rows are in their original (temporal) order, so the block
+                # null's blocks hold; the metric follows the reference frame
+                metric = metric_for_rank(fold_maps[0].whiteners[m].rank)
+                for c in corpus_names:
+                    sel = corp == c
+                    # fold=0 only seeds the overlap subsample; the row is
+                    # recorded as OOF_FOLD
+                    mc = _check_present(S_oof[sel], aligned[m].X[sel], present[m][sel],
+                                        placed[sel], member=m, k=k, fold=0,
+                                        groups=None if g is None else g[sel], k_nn=k_nn,
+                                        n_perm=n_perm, eval_n=eval_n, block_size=block_size,
+                                        random_state=random_state, metric=metric)
+                    mc.fold = OOF_FOLD
+                    all_pass &= _record(mc, c)
         if all_pass:
             chosen = k
             break
@@ -1054,6 +1151,7 @@ def fit_block(
     for m in members:
         final.whiteners[m].undefinable = sorted(
             f for f in final.whiteners[m].features if kinds[m].get(f) == "undefinable")
+    walked = chosen  # the schedule k the curve rows were scored at
     chosen = min(chosen, final.k_max)  # the concatenation may have fewer directions than k
     pr = {m: float(final.whiteners[m].participation_ratio) for m in members}
     pr_sum = float(sum(pr.values()))
@@ -1095,11 +1193,9 @@ def fit_block(
         }
         if per_corpus:
             per_member[m]["per_corpus"] = {
-                c: {"n_rows_per_fold": [r["n_rows"] for r in at_k if r["corpus"] == c],
-                    "r2_per_fold": [r["r2"] for r in at_k if r["corpus"] == c],
-                    "overlap_p_per_fold": [r["overlap_p"] for r in at_k if r["corpus"] == c],
-                    "passed_all_folds": all(r["passed"] for r in at_k if r["corpus"] == c)}
-                for c in corpus_names}
+                r["corpus"]: {"n_rows": r["n_rows"], "r2": r["r2"], "overlap": r["overlap"],
+                              "overlap_p": r["overlap_p"], "passed": r["passed"]}
+                for r in deciding}
     manifest = {
         "space_schema_version": SPACE_SCHEMA_VERSION,
         "psytwill_version": __version__,
@@ -1140,7 +1236,13 @@ def fit_block(
                       "eval_sampling": _eval_sampling(eval_n, block_size),
                       "scope": "per_corpus" if per_corpus else "pooled",
                       "corpus_rows": ({c: int((corp == c).sum()) for c in corpus_names}
-                                      if per_corpus else None)},
+                                      if per_corpus else None),
+                      # per corpus: every fold's test rows stacked, each fold's
+                      # scores rotated into fold 0's frame; the rotation's fit
+                      # (share of fold 0's score variance reproduced on the
+                      # rows both maps trained on), one per fold, at k
+                      "corpus_scoring": "out_of_fold_procrustes" if per_corpus else None,
+                      "fold_frame_r2": frame_r2.get(walked) if per_corpus else None},
         "max_nan_frac": max_nan_frac,
         "null_policy": {
             "source": "contract-b-1.1 nulls",

@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 
 from psytwill.space import (
+    OOF_FOLD,
     BlockFit,
+    _check_present,
+    _fold_frame,
+    _folds,
     _pairwise_block_pca,
     apply_structural_fill,
     detect_structural_columns,
@@ -253,7 +257,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.7"
+        assert meta["space_schema_version"] == "1.8"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -621,7 +625,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.7"
+        assert meta["space_schema_version"] == "1.8"
 
 
 
@@ -710,7 +714,7 @@ class TestPerCorpus:
         assert per.manifest["criterion"]["corpus_rows"] == {"x": N // 2, "y": N // 2}
         d = per.manifest["per_member"]["d"]
         assert d["passed_all_folds"] is False
-        assert not d["per_corpus"]["x"]["passed_all_folds"]
+        assert not d["per_corpus"]["x"]["passed"]
         # the pooled row is still reported, and still passes, at the same k
         assert min(d["r2_per_fold"]) >= 0.5
 
@@ -732,9 +736,77 @@ class TestPerCorpus:
     def test_thin_corpus_is_refused(self, members):
         sp, _ = members
         corpora = ["x"] * (N - 2) + ["y"] * 2
-        with pytest.raises(SpaceError, match="cannot score y in fold"):
+        with pytest.raises(SpaceError, match=r"cannot score y \(2 rows"):
             fit_block(sp, ["a", "b"], block="T", corpora=corpora, per_corpus=True,
                       **_fit_kwargs())
+
+    def test_each_corpus_is_scored_once_out_of_fold(self):
+        sp, corpora = self._two_registers()
+        per = fit_block(sp, ["a", "b"], block="T", corpora=corpora, per_corpus=True,
+                        **_fit_kwargs())
+        rows = [r for r in per.curve if r["corpus"] != "all"]
+        assert {r["fold"] for r in rows} == {OOF_FOLD}
+        for k in {r["k"] for r in rows}:
+            for m in ("a", "b"):
+                mine = [r for r in rows if r["k"] == k and r["member"] == m]
+                assert sorted(r["corpus"] for r in mine) == ["x", "y"]
+                assert all(r["n_rows"] == N // 2 for r in mine)
+        crit = per.manifest["criterion"]
+        assert crit["corpus_scoring"] == "out_of_fold_procrustes"
+        assert len(crit["fold_frame_r2"]) == 3 and min(crit["fold_frame_r2"]) > 0.99
+        pc = per.manifest["per_member"]["a"]["per_corpus"]["x"]
+        assert set(pc) == {"n_rows", "r2", "overlap", "overlap_p", "passed"}
+
+    @staticmethod
+    def _thin_share():
+        # corpus t is 64 rows in recordings of 20, 20, 20, 2 and 2 rows, so
+        # one test fold holds a sliver of it split unevenly over three
+        # recordings -- the shape of L_v0.4's narratives fold 2 (2026-09-28)
+        rng = np.random.default_rng(0)
+        Z = rng.normal(size=(N, LATENT))
+        sp = {m: _member(m, rng, Z, d, noise=0.5) for m, d in (("a", 64), ("b", 12), ("c", 6))}
+        sizes = [20, 20, 20, 2, 2]
+        n_t = sum(sizes)
+        groups = [f"x{i // 20}" for i in range(N - n_t)]
+        for gi, s in enumerate(sizes):
+            groups += [f"t{gi}"] * s
+        return sp, ["x"] * (N - n_t) + ["t"] * n_t, groups
+
+    def test_a_thin_fold_share_no_longer_fails_a_member_the_block_carries(self):
+        sp, corpora, groups = self._thin_share()
+        kw = _fit_kwargs()
+        fit = fit_block(sp, ["a", "b", "c"], block="T", corpora=corpora, groups=groups,
+                        per_corpus=True, **kw)
+        t = {m: fit.manifest["per_member"][m]["per_corpus"]["t"] for m in "abc"}
+        assert all(v["passed"] and v["n_rows"] == 64 and v["r2"] > 0.85 for v in t.values())
+        # the artifact the out-of-fold scoring replaces: t's share of the one
+        # fold that holds it over several recordings, scored alone, fails
+        # members that pass on the whole corpus
+        g, corp = np.asarray(groups), np.asarray(corpora)
+        folds = _folds(N, kw["n_splits"], g, 0)
+        thin = [(tr, te) for tr, te in folds if len(set(g[te][corp[te] == "t"])) >= 2]
+        assert thin, "fixture no longer splits t unevenly; re-tune the recording sizes"
+        tr, te = thin[0]
+        S = fit_block_map(sp, ["a", "b", "c"], tr).scores(sp, te, k=fit.k)
+        sel = corp[te] == "t"
+        ok = np.ones(int(sel.sum()), dtype=bool)
+        r2 = [_check_present(S[sel], sp[m].X[te][sel], ok, ok, groups=g[te][sel], member=m,
+                             k=fit.k, fold=0, n_perm=kw["n_perm"], eval_n=None,
+                             k_nn=kw["k_nn"]).r2 for m in "abc"]
+        assert min(r2) < 0.5
+
+    def test_fold_frames_put_held_out_scores_in_the_reference_basis(self, members):
+        sp, _ = members
+        idx = np.arange(N)
+        ref = fit_block_map(sp, ["a", "b", "c"], idx[: 2 * N // 3])
+        fm = fit_block_map(sp, ["a", "b", "c"], idx[N // 3:])
+        k = min(ref.k_max, fm.k_max)
+        frame = _fold_frame(fm, ref, sp, idx[N // 3: 2 * N // 3], k)
+        held = idx[: N // 3]  # the reference trained on these; fm and the rotation did not
+        S, r2 = frame.apply(fm.scores(sp, held, k=4), 4)
+        target = ref.scores(sp, held, k=4)
+        assert r2 > 0.99
+        assert np.linalg.norm(S - target) / np.linalg.norm(target) < 0.05
 
 
 def _same_directions(A, B, atol=1e-6):

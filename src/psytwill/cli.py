@@ -781,8 +781,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
               f"{'pass' if pm['passed_all_folds'] else 'FAIL'}"
               + ("  (R2/overlap pooled; verdict over corpora, below)" if args.per_corpus else ""))
         for c, pc in pm.get("per_corpus", {}).items():
-            r2 = min(pc["r2_per_fold"]) if pc["r2_per_fold"] else float("nan")
-            print(f"      {c:<16} R2 {r2:.3f}  {'pass' if pc['passed_all_folds'] else 'FAIL'}")
+            print(f"      {c:<16} R2 {pc['r2']:.3f}  overlap p {pc['overlap_p']:.3f}  "
+                  f"n {pc['n_rows']:>6}  {'pass' if pc['passed'] else 'FAIL'}  (out of fold)")
     print(f"  weights {npz}\n  curve {curve}")
 
 
@@ -1258,9 +1258,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "(Contract B 1.1 `nulls`), never inferred from corpus contrast")
     f.add_argument("--per-corpus", action="store_true",
                    help="score the criterion within each corpus (read as --corpora-from-label "
-                        "does) and choose k only when every corpus passes; the pooled fold is "
-                        "still reported. For a multi-register mix, where pooled R^2 counts "
-                        "between-corpus differences as explained")
+                        "does), once on all its rows placed out of fold, and choose k only when "
+                        "every corpus passes; the pooled folds are still reported. For a "
+                        "multi-register mix, where pooled R^2 counts between-corpus differences "
+                        "as explained")
     f.add_argument("--corpus-weights", choices=["equal"],
                    help="weight rows so every corpus (read as --corpora-from-label does) counts "
                         "equally in the member whiteners and the block covariance; the criterion "
