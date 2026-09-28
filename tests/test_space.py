@@ -13,7 +13,6 @@ from psytwill.space import (
     BlockFit,
     _check_present,
     _fold_frame,
-    _folds,
     _pairwise_block_pca,
     apply_structural_fill,
     detect_structural_columns,
@@ -779,16 +778,17 @@ class TestPerCorpus:
                         per_corpus=True, **kw)
         t = {m: fit.manifest["per_member"][m]["per_corpus"]["t"] for m in "abc"}
         assert all(v["passed"] and v["n_rows"] == 64 and v["r2"] > 0.85 for v in t.values())
-        # the artifact the out-of-fold scoring replaces: t's share of the one
-        # fold that holds it over several recordings, scored alone, fails
-        # members that pass on the whole corpus
+        # the artifact the out-of-fold scoring replaces: t's share of a test
+        # fold that holds it as a sliver over uneven recordings (20 + 2 + 2
+        # rows), scored alone, fails members that pass on the whole corpus.
+        # The split is built by hand: which fold GroupKFold gives each
+        # recording differs between scikit-learn versions (1.7 vs 1.9).
         g, corp = np.asarray(groups), np.asarray(corpora)
-        folds = _folds(N, kw["n_splits"], g, 0)
-        thin = [(tr, te) for tr, te in folds if len(set(g[te][corp[te] == "t"])) >= 2]
-        assert thin, "fixture no longer splits t unevenly; re-tune the recording sizes"
-        tr, te = thin[0]
+        held = np.isin(g, ["t2", "t3", "t4"]) | np.isin(g, [f"x{i}" for i in range(0, 26, 3)])
+        tr, te = np.flatnonzero(~held), np.flatnonzero(held)
         S = fit_block_map(sp, ["a", "b", "c"], tr).scores(sp, te, k=fit.k)
         sel = corp[te] == "t"
+        assert sel.sum() == 24
         ok = np.ones(int(sel.sum()), dtype=bool)
         r2 = [_check_present(S[sel], sp[m].X[te][sel], ok, ok, groups=g[te][sel], member=m,
                              k=fit.k, fold=0, n_perm=kw["n_perm"], eval_n=None,
