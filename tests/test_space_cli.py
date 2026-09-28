@@ -76,6 +76,17 @@ def test_per_corpus_fit_reports_each_corpus(two_corpora, tmp_path, capsys):
     assert "verdict over corpora" in text and "musopen" in text
 
 
+def test_corpus_weights_flag_reaches_the_manifest(two_corpora, tmp_path):
+    out = tmp_path / "space"
+    argv = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "--per-corpus", "--corpus-weights", "equal",
+            "-o", str(out), "--stem", "T_cw", *FIT_ARGS]
+    assert main(argv) == 0
+    manifest = json.loads((out / "T_cw.json").read_text())
+    assert manifest["corpus_weights"]["scheme"] == "equal"
+    assert set(manifest["corpus_weights"]["corpus_rows"]) == {"librispeech", "musopen"}
+
+
 def test_single_table_output_is_unchanged(two_corpora, tmp_path, capsys):
     out = tmp_path / "space"
     argv = ["space", "fit", "--features", str(two_corpora[0]), "--key", "stimulus_id,time",
@@ -241,7 +252,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.6"
+    assert manifest["space_schema_version"] == "1.7"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])

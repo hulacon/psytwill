@@ -10,11 +10,13 @@ import pytest
 
 from psytwill.space import (
     BlockFit,
+    _pairwise_block_pca,
     apply_structural_fill,
     detect_structural_columns,
     prepare_member,
     check_fit,
     check_member,
+    corpus_row_weights,
     eval_subsample,
     fit_block,
     fit_block_map,
@@ -251,7 +253,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.6"
+        assert meta["space_schema_version"] == "1.7"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -619,7 +621,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.6"
+        assert meta["space_schema_version"] == "1.7"
 
 
 
@@ -733,3 +735,109 @@ class TestPerCorpus:
         with pytest.raises(SpaceError, match="cannot score y in fold"):
             fit_block(sp, ["a", "b"], block="T", corpora=corpora, per_corpus=True,
                       **_fit_kwargs())
+
+
+def _same_directions(A, B, atol=1e-6):
+    """Rows of A and B span the same directions, row by row, up to sign."""
+    return np.allclose(np.abs(np.sum(A * B, axis=1)), 1.0, atol=atol)
+
+
+class TestCorpusWeights:
+    """Row weights in the whiteners and the block covariance (DECIDED
+    2026-09-28 for L's caption-heavy mix)."""
+
+    def test_unit_weights_match_the_unweighted_whitener(self, members):
+        sp, _ = members
+        a = fit_whitener(sp["a"], sp["a"].X)
+        b = fit_whitener(sp["a"], sp["a"].X, weights=np.ones(N))
+        assert a.rank == b.rank
+        assert np.allclose(a.mean, b.mean) and np.allclose(a.std, b.std)
+        assert np.allclose(a.scales, b.scales)
+        assert np.isclose(a.participation_ratio, b.participation_ratio)
+        assert _same_directions(a.components, b.components)
+
+    def test_integer_weights_equal_repeated_rows(self, members):
+        sp, _ = members
+        X = sp["b"].X
+        w = np.where(np.arange(N) % 3 == 0, 2.0, 1.0)
+        rep = np.repeat(X, w.astype(int), axis=0)
+        a = fit_whitener(sp["b"], X, weights=w)
+        b = fit_whitener(sp["b"], rep)
+        assert np.allclose(a.mean, b.mean) and np.allclose(a.std, b.std)
+        assert np.isclose(a.participation_ratio, b.participation_ratio)
+        assert a.rank == b.rank
+        assert _same_directions(a.components, b.components)
+
+    def test_block_map_weights_equal_repeated_rows(self, members):
+        sp, _ = members
+        w = np.where(np.arange(N) % 3 == 0, 2.0, 1.0)
+        idx = np.repeat(np.arange(N), w.astype(int))
+        a = fit_block_map(sp, ["a", "b"], np.arange(N), weights=w)
+        b = fit_block_map(sp, ["a", "b"], idx)
+        assert np.allclose(a.block_mean, b.block_mean)
+        top = min(4, a.k_max)
+        assert _same_directions(a.block_components[:top], b.block_components[:top])
+
+    def test_pairwise_unit_weights_match_unweighted(self):
+        rng = np.random.default_rng(3)
+        W = rng.normal(size=(200, 5)) @ rng.normal(size=(5, 5))
+        W[:40, :2] = np.nan
+        m0, v0, e0, n0 = _pairwise_block_pca(W)
+        m1, v1, e1, n1 = _pairwise_block_pca(W, weights=np.ones(200))
+        assert np.allclose(m0, m1) and np.allclose(e0, e1) and n0 == n1
+        assert _same_directions(v0, v1)
+
+    def test_minority_corpus_directions_are_kept_under_equal_weights(self):
+        # corpus x (540 rows) and y (60 rows) vary along different latent
+        # directions of one member. Pooled, x dominates the covariance and the
+        # PR rank keeps x's directions; weighted equally, y's are kept too.
+        rng = np.random.default_rng(4)
+        n_x, n_y = 540, 60
+        L = rng.normal(size=(8, 32))
+        Zx = np.hstack([rng.normal(size=(n_x, 4)), np.zeros((n_x, 4))])
+        Zy = np.hstack([np.zeros((n_y, 4)), rng.normal(size=(n_y, 4))])
+        X = np.vstack([Zx, Zy]) @ L + 0.05 * rng.normal(size=(n_x + n_y, 32))
+        sp = SpaceMatrix(name="m", labels=[f"s{i:04d}" for i in range(n_x + n_y)], X=X,
+                         features=[f"m_{j:03d}" for j in range(32)])
+        corpora = np.array(["x"] * n_x + ["y"] * n_y)
+        pooled = fit_whitener(sp, X)
+        equal = fit_whitener(sp, X, weights=corpus_row_weights(corpora))
+        assert equal.rank > pooled.rank
+
+        def captured(w):
+            Zc = (X[n_x:] - w.mean) / w.std
+            Zc = Zc - Zc.mean(axis=0)
+            return ((Zc @ w.components.T) ** 2).sum() / (Zc ** 2).sum()
+
+        assert captured(equal) > captured(pooled) + 0.2
+
+    def test_corpus_row_weights_give_each_corpus_equal_total(self):
+        w = corpus_row_weights(["x"] * 30 + ["y"] * 10 + ["z"] * 5)
+        c = np.array(["x"] * 30 + ["y"] * 10 + ["z"] * 5)
+        totals = [w[c == k].sum() for k in "xyz"]
+        assert np.allclose(totals, 1.0)
+
+    def test_fit_records_the_weighting(self, members):
+        sp, _ = members
+        corpora = ["x"] * (N - 100) + ["y"] * 100
+        fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, corpus_weights="equal",
+                        **_fit_kwargs())
+        assert fit.manifest["corpus_weights"] == {"scheme": "equal",
+                                                  "corpus_rows": {"x": N - 100, "y": 100}}
+        plain = fit_block(sp, ["a", "b"], block="T", **_fit_kwargs())
+        assert plain.manifest["corpus_weights"] is None
+
+    def test_weighting_needs_corpora_and_a_known_scheme(self, members):
+        sp, _ = members
+        with pytest.raises(SpaceError, match="corpus_weights needs one corpus label"):
+            fit_block(sp, ["a", "b"], block="T", corpus_weights="equal", **_fit_kwargs())
+        with pytest.raises(SpaceError, match="unknown corpus weighting"):
+            fit_block(sp, ["a", "b"], block="T", corpora=["x"] * N, corpus_weights="size",
+                      **_fit_kwargs())
+
+    def test_bad_weights_are_refused(self, members):
+        sp, _ = members
+        with pytest.raises(SpaceError, match="finite and positive"):
+            fit_whitener(sp["a"], sp["a"].X, weights=np.zeros(N))
+        with pytest.raises(SpaceError, match="one entry per row"):
+            fit_whitener(sp["a"], sp["a"].X, weights=np.ones(N - 1))

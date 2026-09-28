@@ -113,7 +113,9 @@ def split_members(models: Sequence[str]) -> list[str]:
 
 # 1.6: curve rows carry `corpus` ("all" = the pooled fold); a per-corpus fit
 # adds one row per corpus and `per_member[m]["per_corpus"]`.
-SPACE_SCHEMA_VERSION = "1.6"
+# 1.7: `corpus_weights` (None, or the scheme and per-corpus row counts the
+# whiteners and block covariance were weighted by).
+SPACE_SCHEMA_VERSION = "1.7"
 
 
 # --------------------------------------------------------------------------
@@ -170,11 +172,17 @@ class SpaceWhitener:
 
 def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
                  rel_tol: float = 1e-8,
-                 structural_fill: dict | None = None) -> SpaceWhitener:
+                 structural_fill: dict | None = None,
+                 weights: np.ndarray | None = None) -> SpaceWhitener:
     """Fit a whitener on ``X`` (training rows of ``space``).
 
     ``rank`` defaults to ``ceil(participation_ratio)`` of the training rows,
     capped by the number of non-degenerate directions.
+
+    ``weights`` (one per row, positive) weight the mean, the scale and the
+    covariance, so a row of weight 2 counts as two copies of itself. They are
+    rescaled to sum to the row count, which keeps the eigenvalues on the
+    unweighted scale. ``None`` runs the unweighted path unchanged.
 
     ``X`` must be complete: the caller passes only the rows where the member
     is present, because an imputed cell would enter the member's geometry as
@@ -186,15 +194,25 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
     if np.isnan(X).any():
         raise SpaceError(f"'{space.name}': fit_whitener takes complete rows only; "
                          f"{int(np.isnan(X).any(axis=1).sum())} row(s) hold NaN")
-    # nan-aware reductions kept (no NaN reaches here) so a complete member
-    # whitens bit-identically to 0.20.0
-    mean = np.nanmean(X, axis=0)
-    std = np.nanstd(X, axis=0)
-    std = np.where(std > 0, std, 1.0)  # constant columns pass through as zeros
-    Z = (X - mean) / std
-    pr = float(participation_ratio(Z))
-    # eigendecomposition of the covariance via SVD of Z
-    _, s, vt = np.linalg.svd(Z, full_matrices=False)
+    if weights is None:
+        # nan-aware reductions kept (no NaN reaches here) so a complete member
+        # whitens bit-identically to 0.20.0
+        mean = np.nanmean(X, axis=0)
+        std = np.nanstd(X, axis=0)
+        std = np.where(std > 0, std, 1.0)  # constant columns pass through as zeros
+        Z = (X - mean) / std
+        pr = float(participation_ratio(Z))
+        # eigendecomposition of the covariance via SVD of Z
+        _, s, vt = np.linalg.svd(Z, full_matrices=False)
+    else:
+        w = _normalized_weights(weights, X.shape[0])
+        mean = (w[:, None] * X).sum(axis=0) / w.sum()
+        std = np.sqrt((w[:, None] * (X - mean) ** 2).sum(axis=0) / w.sum())
+        std = np.where(std > 0, std, 1.0)
+        Z = (X - mean) / std
+        _, s, vt = np.linalg.svd(Z * np.sqrt(w)[:, None], full_matrices=False)
+        lam = s ** 2
+        pr = float(lam.sum() ** 2 / (lam ** 2).sum()) if lam.sum() > 0 else 0.0
     eig = (s ** 2) / max(Z.shape[0] - 1, 1)
     keep = eig > eig[0] * rel_tol if eig.size else np.zeros(0, dtype=bool)
     n_ok = int(keep.sum())
@@ -212,6 +230,35 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
         participation_ratio=pr,
         structural_fill=dict(structural_fill or {}),
     )
+
+
+def _normalized_weights(weights, n: int) -> np.ndarray:
+    w = np.asarray(weights, dtype=float).ravel()
+    if w.shape[0] != n:
+        raise SpaceError(f"weights must have one entry per row ({w.shape[0]} != {n})")
+    if not np.isfinite(w).all() or (w <= 0).any():
+        raise SpaceError("weights must be finite and positive")
+    return w * (n / w.sum())
+
+
+CORPUS_WEIGHTINGS = ("equal",)
+
+
+def corpus_row_weights(corpora: Sequence, scheme: str = "equal") -> np.ndarray:
+    """Row weights that give every corpus the same total weight.
+
+    ``"equal"`` weights a row by 1 / (its corpus's row count), so each corpus
+    contributes equally to the whiteners and the block covariance whatever
+    its size. MEASURED 2026-09-28 on L: with captions 46 % of the pooled
+    rows, each embedding member's whitener kept the caption-heavy directions,
+    and within speech `ebind_text` reached only R^2 0.52 even at full rank.
+    Equal weights lifted it to 0.61 for 20 % more whitened directions.
+    """
+    if scheme not in CORPUS_WEIGHTINGS:
+        raise SpaceError(f"unknown corpus weighting {scheme!r}; have {CORPUS_WEIGHTINGS}")
+    c = np.asarray(corpora)
+    _, inv, counts = np.unique(c, return_inverse=True, return_counts=True)
+    return 1.0 / counts[np.asarray(inv).ravel()]
 
 
 # --------------------------------------------------------------------------
@@ -291,19 +338,29 @@ def member_present(space: SpaceMatrix) -> np.ndarray:
     return ~np.isnan(X).any(axis=1) if X.size else np.ones(X.shape[0], dtype=bool)
 
 
-def _pairwise_block_pca(W: np.ndarray, rel_tol: float = 1e-10):
-    """Mean and PCA of ``W`` from its pairwise-complete covariance."""
+def _pairwise_block_pca(W: np.ndarray, rel_tol: float = 1e-10, weights: np.ndarray | None = None):
+    """Mean and PCA of ``W`` from its pairwise-complete covariance.
+
+    With ``weights`` (normalized to sum to the row count) every sum is
+    weighted, so a column pair's count is its summed weight."""
     present = ~np.isnan(W)
-    cnt = present.sum(axis=0)
-    mean = np.where(cnt > 0, np.nansum(W, axis=0) / np.maximum(cnt, 1), 0.0)
-    W0 = np.where(present, W - mean, 0.0)
     P = present.astype(float)
-    pairs = P.T @ P
-    if (pairs < 2).any():
-        i, j = np.argwhere(pairs < 2)[0]
+    n_both = P.T @ P
+    if (n_both < 2).any():
+        i, j = np.argwhere(n_both < 2)[0]
         raise SpaceError(f"block columns {i} and {j} are present together in fewer than two rows, "
                          "so their covariance is unidentifiable without filling a value")
-    C = (W0.T @ W0) / (pairs - 1)
+    if weights is None:
+        cnt = present.sum(axis=0)
+        mean = np.where(cnt > 0, np.nansum(W, axis=0) / np.maximum(cnt, 1), 0.0)
+        W0 = np.where(present, W - mean, 0.0)
+        C = (W0.T @ W0) / (n_both - 1)
+    else:
+        w = np.asarray(weights, dtype=float)[:, None]
+        cnt = (P * w).sum(axis=0)
+        mean = np.where(cnt > 0, np.nansum(W * w, axis=0) / np.where(cnt > 0, cnt, 1.0), 0.0)
+        W0 = np.where(present, W - mean, 0.0)  # zero where absent, so absent rows add nothing
+        C = ((W0 * w).T @ W0) / ((P * w).T @ P - 1)
     eig, vec = np.linalg.eigh(C)
     order = np.argsort(eig)[::-1]
     eig, vec = eig[order], vec[:, order]
@@ -312,20 +369,34 @@ def _pairwise_block_pca(W: np.ndarray, rel_tol: float = 1e-10):
 
 
 def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: np.ndarray,
-                  *, k_max: int | None = None) -> BlockMap:
+                  *, k_max: int | None = None, weights: np.ndarray | None = None) -> BlockMap:
+    """Whiteners and block PCA on ``rows``; ``weights`` (one per entry of
+    ``rows``) weight both, see :func:`fit_whitener`."""
+    rows = np.asarray(rows)
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape[0] != rows.shape[0]:
+            raise SpaceError("weights must have one entry per fitted row")
     whiteners = {}
     for m in members:
         X = np.asarray(spaces[m].X, dtype=float)[rows]
-        whiteners[m] = fit_whitener(spaces[m], X[~np.isnan(X).any(axis=1)])
+        ok = ~np.isnan(X).any(axis=1)
+        whiteners[m] = fit_whitener(spaces[m], X[ok],
+                                    weights=None if weights is None else weights[ok])
     parts = [whiteners[m].transform(spaces[m].X[rows]) for m in members]
     W = np.concatenate(parts, axis=1)
+    w = None if weights is None else _normalized_weights(weights, W.shape[0])
     if not np.isnan(W).any():
-        mean = W.mean(axis=0)
-        _, s, vt = np.linalg.svd(W - mean, full_matrices=False)
+        if w is None:
+            mean = W.mean(axis=0)
+            _, s, vt = np.linalg.svd(W - mean, full_matrices=False)
+        else:
+            mean = (w[:, None] * W).sum(axis=0) / w.sum()
+            _, s, vt = np.linalg.svd((W - mean) * np.sqrt(w)[:, None], full_matrices=False)
         eig = (s ** 2) / max(W.shape[0] - 1, 1)
         cov, n_neg = "complete", 0
     else:
-        mean, vt, eig, n_neg = _pairwise_block_pca(W)
+        mean, vt, eig, n_neg = _pairwise_block_pca(W, weights=w)
         cov = "pairwise"
     kk = vt.shape[0] if k_max is None else min(int(k_max), vt.shape[0])
     return BlockMap(
@@ -757,6 +828,7 @@ def fit_block(
     structural_null_low: float = STRUCTURAL_NULL_LOW,
     defer: Sequence[str] = (),
     per_corpus: bool = False,
+    corpus_weights: str | None = None,
     progress=None,
     on_row=None,
 ) -> BlockFit:
@@ -786,6 +858,13 @@ def fit_block(
     multi-register mix the pooled R^2 counts the differences BETWEEN corpora
     as explained variance, which is easy to explain, so a pooled pass can hide
     a member the block does not cover inside any one corpus.
+
+    ``corpus_weights`` ("equal") weights every row by 1 / (its corpus's row
+    count) in the member whiteners and the block covariance -- within each
+    fold's training rows, and over all rows for the saved map -- so each
+    corpus shapes the space equally whatever its size (DECIDED 2026-09-28,
+    Ben, for L's caption-heavy mix). The criterion is not weighted: with
+    ``per_corpus`` it is already scored inside each corpus.
     """
     _check_perm_floor(n_perm, alpha)
     _check_eval_blocks(eval_n, block_size)
@@ -823,6 +902,10 @@ def fit_block(
         raise SpaceError("groups must have one entry per aligned row")
     if per_corpus and corpora is None:
         raise SpaceError("per_corpus needs one corpus label per row (`--corpora-from-label`)")
+    if corpus_weights is not None:
+        if corpora is None:
+            raise SpaceError("corpus_weights needs one corpus label per row (`--corpora-from-label`)")
+        corpus_row_weights(corpora[:1], corpus_weights)  # refuse an unknown scheme up front
     # 2. drop rows any member declares undefinable
     undef_rows = undefinable_rows(aligned, kinds)
     undefinable_dropped = {m: int(mask.sum()) for m, mask in undef_rows.items()}
@@ -907,7 +990,13 @@ def fit_block(
                 "per-corpus criterion cannot score " + "; ".join(thin) + ". Every corpus "
                 "needs >= 3 rows and >= 2 groups in every test fold: lower n_splits, or "
                 "leave the thin corpus out of the fit.")
-    fold_maps = [fit_block_map(aligned, members, train) for train, _ in folds]
+    corp_all = np.asarray(corpora) if corpus_weights is not None else None
+
+    def _weights(rows):
+        return None if corp_all is None else corpus_row_weights(corp_all[rows], corpus_weights)
+
+    fold_maps = [fit_block_map(aligned, members, train, weights=_weights(train))
+                 for train, _ in folds]
     k_top = min(fm.k_max for fm in fold_maps)
     schedule = sorted({int(k) for k in k_schedule if 1 <= int(k) < k_top} | {k_top})
     curve: list[dict] = []
@@ -960,7 +1049,8 @@ def fit_block(
     else:
         subsumed = True
 
-    final = fit_block_map(aligned, members, np.arange(n), k_max=chosen)
+    final = fit_block_map(aligned, members, np.arange(n), k_max=chosen,
+                          weights=_weights(np.arange(n)))
     for m in members:
         final.whiteners[m].undefinable = sorted(
             f for f in final.whiteners[m].features if kinds[m].get(f) == "undefinable")
@@ -1037,6 +1127,12 @@ def fit_block(
         # which is truncated to k; before 1.5 this field always equalled k
         "concat_rank": int(k_top),
         "n_rows": n,
+        # how rows were weighted in the whiteners and the block covariance
+        # (None = every row counts once); the criterion is never weighted
+        "corpus_weights": None if corpus_weights is None else {
+            "scheme": corpus_weights,
+            "corpus_rows": {str(c): int(v) for c, v in
+                            zip(*np.unique(corp_all, return_counts=True))}},
         "n_splits": n_splits,
         "grouped": g is not None,
         "criterion": {"r2_min": r2_min, "alpha": alpha, "k_nn": k_nn, "n_perm": n_perm,

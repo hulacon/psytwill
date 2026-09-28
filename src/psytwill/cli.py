@@ -698,13 +698,13 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     groups = None
     corpora = None
     schedule = tuple(int(k) for k in args.k_schedule.split(",")) if args.k_schedule else DEFAULT_K_SCHEDULE
-    if args.groups_from_label or args.corpora_from_label or args.per_corpus:
+    if args.groups_from_label or args.corpora_from_label or args.per_corpus or args.corpus_weights:
         from psytwill.store import align_spaces
 
         _, labels = align_spaces({m: spaces[m] for m in members})
         if args.groups_from_label:
             groups = [lab.split("|")[0] for lab in labels]
-        if args.corpora_from_label or args.per_corpus:
+        if args.corpora_from_label or args.per_corpus or args.corpus_weights:
             from psytwill.fitcorpus import is_external, parse_ext_id
 
             ids = [lab.split("|")[0] for lab in labels]
@@ -740,6 +740,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                     n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
                     random_state=args.seed, progress=progress, per_corpus=args.per_corpus,
+                    corpus_weights=args.corpus_weights,
                     on_row=on_row,
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()])
     for m in members:
@@ -1260,6 +1261,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "does) and choose k only when every corpus passes; the pooled fold is "
                         "still reported. For a multi-register mix, where pooled R^2 counts "
                         "between-corpus differences as explained")
+    f.add_argument("--corpus-weights", choices=["equal"],
+                   help="weight rows so every corpus (read as --corpora-from-label does) counts "
+                        "equally in the member whiteners and the block covariance; the criterion "
+                        "is not weighted. For a mix whose corpora differ in size")
     _space_criterion(f)
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
