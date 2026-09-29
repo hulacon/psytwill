@@ -126,7 +126,10 @@ def split_members(models: Sequence[str]) -> list[str]:
 # `n_groups`; `criterion.scoreable` records the floor; per-corpus entries
 # carry `unscoreable`, and `passed_all_folds` is None when no deciding row
 # could be scored.
-SPACE_SCHEMA_VERSION = "1.9"
+# 1.10: curve rows carry `spread` (the member's variance on the scored rows in
+# its fit-time whitened coordinates); a member below MIN_SPREAD is
+# unscoreable; `criterion.scoreable` adds `min_spread`.
+SPACE_SCHEMA_VERSION = "1.10"
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
 #: placed by the fold map that did not see it (see :func:`fit_block`).
@@ -657,6 +660,8 @@ class MemberCheck:
     # when ungrouped), and why the member was not scored ("" = it was).
     n_groups: int | None = None
     unscoreable: str = ""
+    # Share of the member's fit-time variation on the scored rows (schema 1.10).
+    spread: float = float("nan")
 
     def passes(self, r2_min: float, alpha: float) -> bool | None:
         """None when the member was not scored: it is neither a pass nor a fail."""
@@ -683,10 +688,30 @@ MIN_EVAL_BLOCKS = 10
 # folds are unchanged.
 MIN_ROWS_PER_K = 10
 MIN_SCORE_GROUPS = 5
+# A member is also unscoreable where the table holds almost none of its
+# variation (Ben 2026-09-29, "add variance floor"): `spread` is its mean
+# variance over its whitened directions on the scored rows, 1.0 on the fit
+# rows by construction. R^2 is a share of the table's own variance, so on a
+# table where the member is flat it scores noise below anything the block was
+# built to keep. MEASURED over every A/L/V transfer table (workbench
+# out/spread/): A's `speech` on musopen (music only) holds 0.0003 and read
+# R^2 0.004 in-fit and held out alike; the next lowest on any table is 0.045
+# (L `emotion` on film captions, which passes at R^2 0.87), then 0.068. The
+# floor sits in that gap.
+MIN_SPREAD = 0.01
+
+
+def member_spread(whitener: "SpaceWhitener", X: np.ndarray) -> float:
+    """Mean variance of complete rows ``X`` over ``whitener``'s directions."""
+    if X.shape[0] < 2:
+        return float("nan")
+    # ddof=1, as the whitener's eigenvalues, so the fit rows read exactly 1
+    return float(whitener.transform(X).var(axis=0, ddof=1).mean())
 
 
 def unscoreable_reason(n_rows: int, n_groups: int | None, k: int, block_size: int | None,
-                       min_rows_per_k: int = MIN_ROWS_PER_K) -> str:
+                       min_rows_per_k: int = MIN_ROWS_PER_K, spread: float | None = None,
+                       min_spread: float = MIN_SPREAD) -> str:
     """Why a member cannot be scored on ``n_rows`` rows at ``k`` ("" = it can)."""
     why = []
     if n_rows < min_rows_per_k * k:
@@ -695,6 +720,8 @@ def unscoreable_reason(n_rows: int, n_groups: int | None, k: int, block_size: in
         why.append(f"{n_groups} groups < {MIN_SCORE_GROUPS}")
     if block_size is not None and block_size > 1 and n_rows // block_size < MIN_EVAL_BLOCKS:
         why.append(f"{n_rows // block_size} blocks of {block_size} < {MIN_EVAL_BLOCKS}")
+    if spread is not None and spread < min_spread:
+        why.append(f"spread {spread:.2g} < {min_spread:g} of the fit's")
     return "; ".join(why)
 
 
@@ -767,18 +794,22 @@ def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int
 
 def _check_present(scores: np.ndarray, space_X: np.ndarray, present: np.ndarray,
                    placed: np.ndarray, *, groups: Sequence | None = None,
-                   min_rows_per_k: int | None = None, **kw) -> MemberCheck:
+                   min_rows_per_k: int | None = None, whitener: "SpaceWhitener | None" = None,
+                   min_spread: float = MIN_SPREAD, **kw) -> MemberCheck:
     """:func:`check_member` on the rows where the member is present and the
     row is placed at k -- its R^2 target and neighbour graph exist only there.
 
     With ``min_rows_per_k``, a member those rows cannot score (see
-    :func:`unscoreable_reason`) is returned unscored, with the reason."""
+    :func:`unscoreable_reason`) is returned unscored, with the reason; with
+    ``whitener`` too, its spread on those rows is recorded and floored."""
     rows = np.asarray(present, dtype=bool) & np.asarray(placed, dtype=bool)
     gr = None if groups is None else np.asarray(groups)[rows]
     n_groups = None if gr is None else int(len(np.unique(gr)))
+    spread = (None if whitener is None
+              else member_spread(whitener, np.asarray(space_X, dtype=float)[rows]))
     why = ("" if min_rows_per_k is None else
            unscoreable_reason(int(rows.sum()), n_groups, kw["k"], kw.get("block_size"),
-                              min_rows_per_k))
+                              min_rows_per_k, spread=spread, min_spread=min_spread))
     if why:
         nan = float("nan")
         mc = MemberCheck(member=kw["member"], k=kw["k"], fold=kw["fold"], r2=nan, overlap=nan,
@@ -788,6 +819,8 @@ def _check_present(scores: np.ndarray, space_X: np.ndarray, present: np.ndarray,
     else:
         mc = check_member(scores[rows], np.asarray(space_X)[rows], groups=gr, **kw)
     mc.n_groups = n_groups
+    if spread is not None:
+        mc.spread = spread
     mc.n_absent = int((~np.asarray(present, dtype=bool)).sum())
     mc.n_unplaced = int((np.asarray(present, dtype=bool) & ~np.asarray(placed, dtype=bool)).sum())
     return mc
@@ -944,6 +977,7 @@ def fit_block(
     per_corpus: bool = False,
     corpus_weights: str | None = None,
     min_rows_per_k: int = MIN_ROWS_PER_K,
+    min_spread: float = MIN_SPREAD,
     progress=None,
     on_row=None,
 ) -> BlockFit:
@@ -992,8 +1026,9 @@ def fit_block(
     ``per_corpus`` it is already scored inside each corpus.
 
     A member too thin inside a corpus to be scored there (fewer than
-    ``min_rows_per_k * k`` present, placed rows, too few groups or blocks;
-    see :func:`unscoreable_reason`) gets a per-corpus row with ``passed`` =
+    ``min_rows_per_k * k`` present, placed rows, too few groups or blocks,
+    or under ``min_spread`` of its variation in the reference fold map's
+    whitened coordinates; see :func:`unscoreable_reason`) gets a per-corpus row with ``passed`` =
     None that neither passes nor blocks k (DECIDED 2026-09-29, Ben), as long
     as some corpus scores it; a non-deferred member no corpus can score
     blocks k. The pooled folds are scored as before.
@@ -1200,7 +1235,9 @@ def fit_block(
                                         groups=None if g is None else g[sel], k_nn=k_nn,
                                         n_perm=n_perm, eval_n=eval_n, block_size=block_size,
                                         random_state=random_state, metric=metric,
-                                        min_rows_per_k=min_rows_per_k)
+                                        min_rows_per_k=min_rows_per_k,
+                                        whitener=fold_maps[0].whiteners[m],
+                                        min_spread=min_spread)
                     mc.fold = OOF_FOLD
                     all_pass &= _record(mc, c)
                     scored_somewhere |= not mc.unscoreable
@@ -1269,7 +1306,7 @@ def fit_block(
             per_member[m]["per_corpus"] = {
                 r["corpus"]: {"n_rows": r["n_rows"], "r2": r["r2"], "overlap": r["overlap"],
                               "overlap_p": r["overlap_p"], "passed": r["passed"],
-                              "unscoreable": r["unscoreable"]}
+                              "unscoreable": r["unscoreable"], "spread": r["spread"]}
                 for r in deciding}
     manifest = {
         "space_schema_version": SPACE_SCHEMA_VERSION,
@@ -1322,7 +1359,8 @@ def fit_block(
                       # the floor below which a per-corpus member is not scored
                       "scoreable": ({"min_rows_per_k": min_rows_per_k,
                                      "min_groups": MIN_SCORE_GROUPS,
-                                     "min_blocks": MIN_EVAL_BLOCKS} if per_corpus else None)},
+                                     "min_blocks": MIN_EVAL_BLOCKS,
+                                     "min_spread": min_spread} if per_corpus else None)},
         "max_nan_frac": max_nan_frac,
         "null_policy": {
             "source": "contract-b-1.1 nulls",
@@ -1416,7 +1454,8 @@ def load_fit(manifest_path: str | Path) -> BlockFit:
 def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence | None = None,
               r2_min: float = 0.5, alpha: float = 0.01, k_nn: int = DEFAULT_K, n_perm: int = 250,
               eval_n: int | None = 5000, block_size: int | None = None,
-              random_state: int = 0, min_rows_per_k: int = MIN_ROWS_PER_K) -> list[dict]:
+              random_state: int = 0, min_rows_per_k: int = MIN_ROWS_PER_K,
+              min_spread: float = MIN_SPREAD) -> list[dict]:
     """The subsumption criterion for every member on an arbitrary table (no refit).
 
     A member the table cannot score (see :func:`unscoreable_reason`) gets a
@@ -1448,7 +1487,8 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
                             k=fit.k, fold=0, groups=groups, k_nn=k_nn, n_perm=n_perm,
                             eval_n=eval_n, block_size=block_size, random_state=random_state,
                             metric=metric_for_rank(fit.map.whiteners[m].rank),
-                            min_rows_per_k=min_rows_per_k)
+                            min_rows_per_k=min_rows_per_k, whitener=fit.map.whiteners[m],
+                            min_spread=min_spread)
         row = asdict(mc)
         row["passed"] = mc.passes(r2_min, alpha)
         out.append(row)

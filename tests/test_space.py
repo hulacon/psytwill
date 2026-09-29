@@ -10,6 +10,7 @@ import pytest
 
 from psytwill.space import (
     MIN_ROWS_PER_K,
+    MIN_SPREAD,
     OOF_FOLD,
     BlockFit,
     _check_present,
@@ -258,7 +259,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.9"
+        assert meta["space_schema_version"] == "1.10"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -626,7 +627,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.9"
+        assert meta["space_schema_version"] == "1.10"
 
 
 
@@ -756,7 +757,7 @@ class TestPerCorpus:
         assert crit["corpus_scoring"] == "out_of_fold_procrustes"
         assert len(crit["fold_frame_r2"]) == 3 and min(crit["fold_frame_r2"]) > 0.99
         pc = per.manifest["per_member"]["a"]["per_corpus"]["x"]
-        assert set(pc) == {"n_rows", "r2", "overlap", "overlap_p", "passed", "unscoreable"}
+        assert set(pc) == {"n_rows", "r2", "overlap", "overlap_p", "passed", "unscoreable", "spread"}
         assert pc["unscoreable"] == ""
 
     @staticmethod
@@ -845,6 +846,38 @@ class TestUnscoreable:
         assert unscoreable_reason(600, 20, 8, 60) == ""
         assert unscoreable_reason(10, 1, 64, 60).count(";") == 2
         assert unscoreable_reason(79, 5, 8, None, min_rows_per_k=1) == ""
+        assert unscoreable_reason(800, 5, 8, None, spread=0.02) == ""
+        assert unscoreable_reason(800, 5, 8, None, spread=0.0003) == "spread 0.0003 < 0.01 of the fit's"
+        assert unscoreable_reason(800, 5, 8, None, spread=float("nan")) == ""  # too few rows to measure
+
+    @staticmethod
+    def _flattened(sp, m, rows, factor=1e-3):
+        """``m`` shrunk toward its mean on ``rows``: present, but almost flat there."""
+        X = sp[m].X.copy()
+        mu = X.mean(axis=0)
+        X[rows] = mu + factor * (X[rows] - mu)
+        out = dict(sp)
+        out[m] = SpaceMatrix(name=m, labels=sp[m].labels, X=X, features=sp[m].features)
+        return out
+
+    def test_check_sets_aside_a_member_flat_on_the_table(self, members):
+        # A's `speech` on musopen: present on every row, but the table holds
+        # almost none of its variation, so R^2 has nothing to explain
+        sp, _ = members
+        fit = fit_block(sp, ["a", "b", "c"], block="T", **_fit_kwargs())
+        table = self._flattened(sp, "c", np.arange(N))
+        rows = {r["member"]: r for r in check_fit(fit, table, n_perm=150, eval_n=None, k_nn=10)}
+        assert rows["c"]["passed"] is None and rows["c"]["n_rows"] == N
+        assert rows["c"]["spread"] < MIN_SPREAD
+        assert rows["c"]["unscoreable"].startswith("spread ")
+        assert rows["a"]["passed"] is True and rows["b"]["passed"] is True
+        # on the fit's own rows every member holds all of its variation
+        full = check_fit(fit, sp, n_perm=150, eval_n=None, k_nn=10)
+        assert all(r["spread"] == pytest.approx(1.0, abs=1e-6) for r in full)
+        # the floor is adjustable
+        off = {r["member"]: r for r in check_fit(fit, table, n_perm=150, eval_n=None, k_nn=10,
+                                                  min_spread=0.0)}
+        assert off["c"]["passed"] is not None
 
     def test_check_scores_every_other_member(self, members):
         sp, _ = members
@@ -886,9 +919,21 @@ class TestUnscoreable:
         assert pm["c"]["passed_all_folds"] is True  # the verdict is over the scored corpora
         assert all(pm[m]["per_corpus"][cc]["passed"] for m in "ab" for cc in "xy")
         assert fit.manifest["criterion"]["scoreable"] == {
-            "min_rows_per_k": MIN_ROWS_PER_K, "min_groups": 5, "min_blocks": 10}
+            "min_rows_per_k": MIN_ROWS_PER_K, "min_groups": 5, "min_blocks": 10,
+            "min_spread": MIN_SPREAD}
         # the pooled folds are not guarded
         assert all(r["unscoreable"] == "" for r in fit.curve if r["corpus"] == "all")
+
+    def test_per_corpus_fit_sets_a_flat_member_aside_in_that_corpus_only(self, members):
+        sp, _ = members
+        corpora = np.array(["x"] * (N // 2) + ["y"] * (N // 2))
+        table = self._flattened(sp, "c", np.flatnonzero(corpora == "y"))
+        fit = fit_block(table, ["a", "b", "c"], block="T", corpora=corpora.tolist(),
+                        per_corpus=True, **_fit_kwargs())
+        c = fit.manifest["per_member"]["c"]["per_corpus"]
+        assert c["y"]["passed"] is None and c["y"]["unscoreable"].startswith("spread ")
+        assert c["x"]["passed"] is True and c["x"]["spread"] > 0.5
+        assert fit.manifest["criterion"]["scoreable"]["min_spread"] == MIN_SPREAD
 
     def test_a_member_no_corpus_can_score_does_not_pass_k(self, members):
         # every member below the floor in every corpus: there is no evidence
