@@ -121,7 +121,12 @@ def split_members(models: Sequence[str]) -> list[str]:
 # OOF_FOLD), not one per test fold; `per_member[m]["per_corpus"][c]` holds
 # n_rows/r2/overlap/overlap_p/passed; `criterion.corpus_scoring` and
 # `criterion.fold_frame_r2` record how the fold scores were pooled.
-SPACE_SCHEMA_VERSION = "1.8"
+# 1.9: a member too thin to score on a table (see MIN_ROWS_PER_K) gets a row
+# with `passed` = None and the reason in `unscoreable`; curve rows carry
+# `n_groups`; `criterion.scoreable` records the floor; per-corpus entries
+# carry `unscoreable`, and `passed_all_folds` is None when no deciding row
+# could be scored.
+SPACE_SCHEMA_VERSION = "1.9"
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
 #: placed by the fold map that did not see it (see :func:`fit_block`).
@@ -648,8 +653,15 @@ class MemberCheck:
     # Neither enters the criterion; n_rows counts what did.
     n_absent: int = 0
     n_unplaced: int = 0
+    # Scoreability (schema 1.9): distinct groups among the scored rows (None
+    # when ungrouped), and why the member was not scored ("" = it was).
+    n_groups: int | None = None
+    unscoreable: str = ""
 
-    def passes(self, r2_min: float, alpha: float) -> bool:
+    def passes(self, r2_min: float, alpha: float) -> bool | None:
+        """None when the member was not scored: it is neither a pass nor a fail."""
+        if self.unscoreable:
+            return None
         return bool(self.r2 >= r2_min and self.overlap_p < alpha)
 
 
@@ -657,6 +669,33 @@ class MemberCheck:
 # leaves most blocks in place scores like the observed graph. Below ~10 blocks
 # the null is too coarse to reach alpha = .01 honestly, so it is refused.
 MIN_EVAL_BLOCKS = 10
+
+# A member is scored on a table only where its present, placed rows can carry
+# the criterion (DECIDED 2026-09-29, Ben): >= MIN_ROWS_PER_K * k rows, >=
+# MIN_SCORE_GROUPS groups (the grouped ridge's full n_splits) and, under a
+# block null, >= MIN_EVAL_BLOCKS blocks. Below that it is UNSCOREABLE: a row
+# with passed=None that counts neither way. MEASURED on this project's fits:
+# ~1*k rows failed every member (V faces_layout, n~340 at k=336), ~2*k read
+# R^2 0.09-0.56, 4-6*k still read ~0.1 under the whole corpus, ~18*k agreed
+# with the in-fit control. Before this, `check_fit` raised on a member present
+# in one clip (A_v0.3 on musopen, 2026-09-28) and the whole table went unread.
+# Applied in `check_fit` and `fit_block`'s per-corpus scoring; the pooled
+# folds are unchanged.
+MIN_ROWS_PER_K = 10
+MIN_SCORE_GROUPS = 5
+
+
+def unscoreable_reason(n_rows: int, n_groups: int | None, k: int, block_size: int | None,
+                       min_rows_per_k: int = MIN_ROWS_PER_K) -> str:
+    """Why a member cannot be scored on ``n_rows`` rows at ``k`` ("" = it can)."""
+    why = []
+    if n_rows < min_rows_per_k * k:
+        why.append(f"{n_rows} rows < {min_rows_per_k}*k = {min_rows_per_k * k}")
+    if n_groups is not None and n_groups < MIN_SCORE_GROUPS:
+        why.append(f"{n_groups} groups < {MIN_SCORE_GROUPS}")
+    if block_size is not None and block_size > 1 and n_rows // block_size < MIN_EVAL_BLOCKS:
+        why.append(f"{n_rows // block_size} blocks of {block_size} < {MIN_EVAL_BLOCKS}")
+    return "; ".join(why)
 
 
 def _eval_sampling(eval_n: int | None, block_size: int | None) -> str:
@@ -727,12 +766,28 @@ def check_member(scores: np.ndarray, space_X: np.ndarray, *, member: str, k: int
 
 
 def _check_present(scores: np.ndarray, space_X: np.ndarray, present: np.ndarray,
-                   placed: np.ndarray, *, groups: Sequence | None = None, **kw) -> MemberCheck:
+                   placed: np.ndarray, *, groups: Sequence | None = None,
+                   min_rows_per_k: int | None = None, **kw) -> MemberCheck:
     """:func:`check_member` on the rows where the member is present and the
-    row is placed at k -- its R^2 target and neighbour graph exist only there."""
+    row is placed at k -- its R^2 target and neighbour graph exist only there.
+
+    With ``min_rows_per_k``, a member those rows cannot score (see
+    :func:`unscoreable_reason`) is returned unscored, with the reason."""
     rows = np.asarray(present, dtype=bool) & np.asarray(placed, dtype=bool)
     gr = None if groups is None else np.asarray(groups)[rows]
-    mc = check_member(scores[rows], np.asarray(space_X)[rows], groups=gr, **kw)
+    n_groups = None if gr is None else int(len(np.unique(gr)))
+    why = ("" if min_rows_per_k is None else
+           unscoreable_reason(int(rows.sum()), n_groups, kw["k"], kw.get("block_size"),
+                              min_rows_per_k))
+    if why:
+        nan = float("nan")
+        mc = MemberCheck(member=kw["member"], k=kw["k"], fold=kw["fold"], r2=nan, overlap=nan,
+                         overlap_p=nan, null_mean=nan, n_rows=int(rows.sum()),
+                         metric=kw.get("metric", "cosine"), eval_sampling="none",
+                         unscoreable=why)
+    else:
+        mc = check_member(scores[rows], np.asarray(space_X)[rows], groups=gr, **kw)
+    mc.n_groups = n_groups
     mc.n_absent = int((~np.asarray(present, dtype=bool)).sum())
     mc.n_unplaced = int((np.asarray(present, dtype=bool) & ~np.asarray(placed, dtype=bool)).sum())
     return mc
@@ -888,6 +943,7 @@ def fit_block(
     defer: Sequence[str] = (),
     per_corpus: bool = False,
     corpus_weights: str | None = None,
+    min_rows_per_k: int = MIN_ROWS_PER_K,
     progress=None,
     on_row=None,
 ) -> BlockFit:
@@ -934,6 +990,13 @@ def fit_block(
     corpus shapes the space equally whatever its size (DECIDED 2026-09-28,
     Ben, for L's caption-heavy mix). The criterion is not weighted: with
     ``per_corpus`` it is already scored inside each corpus.
+
+    A member too thin inside a corpus to be scored there (fewer than
+    ``min_rows_per_k * k`` present, placed rows, too few groups or blocks;
+    see :func:`unscoreable_reason`) gets a per-corpus row with ``passed`` =
+    None that neither passes nor blocks k (DECIDED 2026-09-29, Ben), as long
+    as some corpus scores it; a non-deferred member no corpus can score
+    blocks k. The pooled folds are scored as before.
     """
     _check_perm_floor(n_perm, alpha)
     _check_eval_blocks(eval_n, block_size)
@@ -1091,7 +1154,8 @@ def fit_block(
         if on_row is not None:
             on_row(row)
         decides = (scope != "all") if per_corpus else True
-        return not (decides and not row["passed"] and mc.member not in defer)
+        # an unscoreable row (passed None) neither passes nor blocks k
+        return not (decides and row["passed"] is False and mc.member not in defer)
 
     for k in schedule:
         all_pass = True
@@ -1126,6 +1190,7 @@ def fit_block(
                 # rows are in their original (temporal) order, so the block
                 # null's blocks hold; the metric follows the reference frame
                 metric = metric_for_rank(fold_maps[0].whiteners[m].rank)
+                scored_somewhere = False
                 for c in corpus_names:
                     sel = corp == c
                     # fold=0 only seeds the overlap subsample; the row is
@@ -1134,9 +1199,15 @@ def fit_block(
                                         placed[sel], member=m, k=k, fold=0,
                                         groups=None if g is None else g[sel], k_nn=k_nn,
                                         n_perm=n_perm, eval_n=eval_n, block_size=block_size,
-                                        random_state=random_state, metric=metric)
+                                        random_state=random_state, metric=metric,
+                                        min_rows_per_k=min_rows_per_k)
                     mc.fold = OOF_FOLD
                     all_pass &= _record(mc, c)
+                    scored_somewhere |= not mc.unscoreable
+                # a member no corpus can score gives k no evidence either way,
+                # so k cannot pass on its account (the floor only rises with k)
+                if not scored_somewhere and m not in defer:
+                    all_pass = False
         if all_pass:
             chosen = k
             break
@@ -1162,6 +1233,7 @@ def fit_block(
         at_k = [r for r in curve if r["member"] == m and r["k"] == chosen]
         rows = [r for r in at_k if r["corpus"] == "all"]
         deciding = [r for r in at_k if r["corpus"] != "all"] if per_corpus else rows
+        scored = [r for r in deciding if r["passed"] is not None]
         per_member[m] = {
             "participation_ratio": pr[m],
             # share of the member's whitened slice spanned by each fold map's
@@ -1189,12 +1261,15 @@ def fit_block(
             "r2_per_fold": [r["r2"] for r in rows],
             "overlap_per_fold": [r["overlap"] for r in rows],
             "overlap_p_per_fold": [r["overlap_p"] for r in rows],
-            "passed_all_folds": all(r["passed"] for r in deciding) if deciding else False,
+            # None: every deciding row was unscoreable, so there is no verdict
+            "passed_all_folds": (all(r["passed"] for r in scored) if scored
+                                 else None if deciding else False),
         }
         if per_corpus:
             per_member[m]["per_corpus"] = {
                 r["corpus"]: {"n_rows": r["n_rows"], "r2": r["r2"], "overlap": r["overlap"],
-                              "overlap_p": r["overlap_p"], "passed": r["passed"]}
+                              "overlap_p": r["overlap_p"], "passed": r["passed"],
+                              "unscoreable": r["unscoreable"]}
                 for r in deciding}
     manifest = {
         "space_schema_version": SPACE_SCHEMA_VERSION,
@@ -1205,7 +1280,8 @@ def fit_block(
         "k": chosen,
         # never true while a deferred member fails at k: deferring changes
         # which members choose k, not what the block is claimed to cover
-        "subsumes_all_members": subsumed and all(per_member[m]["passed_all_folds"] for m in defer),
+        "subsumes_all_members": subsumed and all(per_member[m]["passed_all_folds"] is True
+                                                 for m in defer),
         "deferred_members": defer,
         "subsumes_non_deferred": subsumed,
         "pr_sum_bound": pr_sum,
@@ -1242,7 +1318,11 @@ def fit_block(
                       # (share of fold 0's score variance reproduced on the
                       # rows both maps trained on), one per fold, at k
                       "corpus_scoring": "out_of_fold_procrustes" if per_corpus else None,
-                      "fold_frame_r2": frame_r2.get(walked) if per_corpus else None},
+                      "fold_frame_r2": frame_r2.get(walked) if per_corpus else None,
+                      # the floor below which a per-corpus member is not scored
+                      "scoreable": ({"min_rows_per_k": min_rows_per_k,
+                                     "min_groups": MIN_SCORE_GROUPS,
+                                     "min_blocks": MIN_EVAL_BLOCKS} if per_corpus else None)},
         "max_nan_frac": max_nan_frac,
         "null_policy": {
             "source": "contract-b-1.1 nulls",
@@ -1336,8 +1416,13 @@ def load_fit(manifest_path: str | Path) -> BlockFit:
 def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence | None = None,
               r2_min: float = 0.5, alpha: float = 0.01, k_nn: int = DEFAULT_K, n_perm: int = 250,
               eval_n: int | None = 5000, block_size: int | None = None,
-              random_state: int = 0) -> list[dict]:
-    """The subsumption criterion for every member on an arbitrary table (no refit)."""
+              random_state: int = 0, min_rows_per_k: int = MIN_ROWS_PER_K) -> list[dict]:
+    """The subsumption criterion for every member on an arbitrary table (no refit).
+
+    A member the table cannot score (see :func:`unscoreable_reason`) gets a
+    row with ``passed`` = None and the reason in ``unscoreable``; the other
+    members are scored as usual.
+    """
     _check_perm_floor(n_perm, alpha)
     _check_eval_blocks(eval_n, block_size)
     for m in fit.members:
@@ -1362,7 +1447,8 @@ def check_fit(fit: BlockFit, spaces: dict[str, SpaceMatrix], *, groups: Sequence
         mc = _check_present(S, aligned[m].X, member_present(aligned[m]), placed, member=m,
                             k=fit.k, fold=0, groups=groups, k_nn=k_nn, n_perm=n_perm,
                             eval_n=eval_n, block_size=block_size, random_state=random_state,
-                            metric=metric_for_rank(fit.map.whiteners[m].rank))
+                            metric=metric_for_rank(fit.map.whiteners[m].rank),
+                            min_rows_per_k=min_rows_per_k)
         row = asdict(mc)
         row["passed"] = mc.passes(r2_min, alpha)
         out.append(row)

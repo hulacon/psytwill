@@ -767,7 +767,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     partial.unlink(missing_ok=True)
     verdict = "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member"
     failing = [m for m in fit.manifest["deferred_members"]
-               if not fit.manifest["per_member"][m]["passed_all_folds"]]
+               if fit.manifest["per_member"][m]["passed_all_folds"] is not True]
     if fit.manifest["subsumes_non_deferred"] and failing:
         verdict = f"subsumes every member except deferred {', '.join(failing)}"
     print(f"psytwill space fit [{args.block}] -> {manifest}")
@@ -778,12 +778,19 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         print(f"  {m:<18} PR {pm['participation_ratio']:6.1f} rank {pm['whitened_rank']:>4}  "
               f"R2 {min(pm['r2_per_fold']) if pm['r2_per_fold'] else float('nan'):.3f}  "
               f"overlap {min(pm['overlap_per_fold']) if pm['overlap_per_fold'] else float('nan'):.3f}  "
-              f"{'pass' if pm['passed_all_folds'] else 'FAIL'}"
+              f"{_verdict(pm['passed_all_folds'])}"
               + ("  (R2/overlap pooled; verdict over corpora, below)" if args.per_corpus else ""))
         for c, pc in pm.get("per_corpus", {}).items():
+            if pc["passed"] is None:
+                print(f"      {c:<16} n {pc['n_rows']:>6}  UNSCOREABLE  ({pc['unscoreable']})")
+                continue
             print(f"      {c:<16} R2 {pc['r2']:.3f}  overlap p {pc['overlap_p']:.3f}  "
-                  f"n {pc['n_rows']:>6}  {'pass' if pc['passed'] else 'FAIL'}  (out of fold)")
+                  f"n {pc['n_rows']:>6}  {_verdict(pc['passed'])}  (out of fold)")
     print(f"  weights {npz}\n  curve {curve}")
+
+
+def _verdict(passed: bool | None) -> str:
+    return "UNSCOREABLE" if passed is None else "pass" if passed else "FAIL"
 
 
 def _run_space_project(args: argparse.Namespace) -> None:
@@ -824,18 +831,27 @@ def _run_space_check(args: argparse.Namespace) -> None:
         groups = [lab.split("|")[0] for lab in labels]
     rows = check_fit(fit, spaces, groups=groups, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
                      n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size, random_state=args.seed)
-    n_pass = sum(r["passed"] for r in rows)
-    print(f"psytwill space check [{fit.block}, k={fit.k}] on {rows[0]['n_rows']} rows: {n_pass}/{len(rows)} members pass")
+    n_pass = sum(r["passed"] is True for r in rows)
+    n_fail = sum(r["passed"] is False for r in rows)
+    n_unscoreable = len(rows) - n_pass - n_fail
+    print(f"psytwill space check [{fit.block}, k={fit.k}] on {rows[0]['n_rows']} rows: "
+          f"{n_pass}/{n_pass + n_fail} scored members pass"
+          + (f"; {n_unscoreable} UNSCOREABLE on this table" if n_unscoreable else ""))
     for r in rows:
+        if r["passed"] is None:
+            print(f"  {r['member']:<18} n {r['n_rows']}  UNSCOREABLE  ({r['unscoreable']})")
+            continue
         print(f"  {r['member']:<18} R2 {r['r2']:.3f}  overlap {r['overlap']:.3f} (null {r['null_mean']:.3f}, q99 {r['null_q99']:.3f}, p={r['overlap_p']:.3f})  "
-              f"{'pass' if r['passed'] else 'FAIL'}")
+              f"{_verdict(r['passed'])}")
     if args.output:
         import pandas as pd
 
         pd.DataFrame(rows).to_csv(args.output, index=False)
         print(f"  {args.output}")
-    if n_pass < len(rows):
-        raise SpaceError(f"{len(rows) - n_pass} member(s) not subsumed")
+    if n_fail:
+        raise SpaceError(f"{n_fail} member(s) not subsumed")
+    if not n_pass:
+        raise SpaceError("no member could be scored on this table")
 
 
 def build_parser() -> argparse.ArgumentParser:

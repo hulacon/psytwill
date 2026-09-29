@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from psytwill.space import (
+    MIN_ROWS_PER_K,
     OOF_FOLD,
     BlockFit,
     _check_present,
@@ -27,6 +28,7 @@ from psytwill.space import (
     load_fit,
     save_fit,
     structural_fill_values,
+    unscoreable_reason,
 )
 from psytwill.compare import neighbor_overlap_null
 from psytwill.exceptions import SpaceError
@@ -256,7 +258,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.8"
+        assert meta["space_schema_version"] == "1.9"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -624,7 +626,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.8"
+        assert meta["space_schema_version"] == "1.9"
 
 
 
@@ -754,7 +756,8 @@ class TestPerCorpus:
         assert crit["corpus_scoring"] == "out_of_fold_procrustes"
         assert len(crit["fold_frame_r2"]) == 3 and min(crit["fold_frame_r2"]) > 0.99
         pc = per.manifest["per_member"]["a"]["per_corpus"]["x"]
-        assert set(pc) == {"n_rows", "r2", "overlap", "overlap_p", "passed"}
+        assert set(pc) == {"n_rows", "r2", "overlap", "overlap_p", "passed", "unscoreable"}
+        assert pc["unscoreable"] == ""
 
     @staticmethod
     def _thin_share():
@@ -774,8 +777,10 @@ class TestPerCorpus:
     def test_a_thin_fold_share_no_longer_fails_a_member_the_block_carries(self):
         sp, corpora, groups = self._thin_share()
         kw = _fit_kwargs()
+        # t's 64 rows are below the 10*k scoring floor at this k; the floor is
+        # lowered so the test isolates what out-of-fold scoring changed
         fit = fit_block(sp, ["a", "b", "c"], block="T", corpora=corpora, groups=groups,
-                        per_corpus=True, **kw)
+                        per_corpus=True, min_rows_per_k=1, **kw)
         t = {m: fit.manifest["per_member"][m]["per_corpus"]["t"] for m in "abc"}
         assert all(v["passed"] and v["n_rows"] == 64 and v["r2"] > 0.85 for v in t.values())
         # the artifact the out-of-fold scoring replaces: t's share of a test
@@ -807,6 +812,95 @@ class TestPerCorpus:
         target = ref.scores(sp, held, k=4)
         assert r2 > 0.99
         assert np.linalg.norm(S - target) / np.linalg.norm(target) < 0.05
+
+
+class TestUnscoreable:
+    """A member too thin on a table is set aside, not scored and not fatal
+    (DECIDED 2026-09-29, Ben). The case it answers: A_v0.3 on musopen, a
+    speech-free corpus where speech_emotion is present in one clip; the
+    grouped ridge refused the single group and `check_fit` raised, so no
+    member of the corpus was read."""
+
+    CLIP = 30  # rows per clip; N // CLIP = 20 clips
+
+    @classmethod
+    def _gated_in_one_clip(cls, sp, rows=None):
+        """``c`` present only in the first clip of ``rows`` (default: all rows)."""
+        rows = np.arange(N) if rows is None else rows
+        X = sp["c"].X.copy()
+        off = np.zeros(N, dtype=bool)
+        off[rows[cls.CLIP:]] = True
+        X[off] = np.nan
+        out = dict(sp)
+        out["c"] = SpaceMatrix(name="c", labels=sp["c"].labels, X=X, features=sp["c"].features)
+        nulls = {"a": {}, "b": {}, "c": {f: _undefined() for f in sp["c"].features}}
+        return out, nulls
+
+    def test_reason_names_each_floor(self):
+        assert unscoreable_reason(80, 5, 8, None) == ""
+        assert unscoreable_reason(79, 5, 8, None) == "79 rows < 10*k = 80"
+        assert unscoreable_reason(800, 4, 8, None) == "4 groups < 5"
+        assert unscoreable_reason(800, None, 8, None) == ""  # ungrouped: no group floor
+        assert unscoreable_reason(590, 20, 8, 60) == "9 blocks of 60 < 10"
+        assert unscoreable_reason(600, 20, 8, 60) == ""
+        assert unscoreable_reason(10, 1, 64, 60).count(";") == 2
+        assert unscoreable_reason(79, 5, 8, None, min_rows_per_k=1) == ""
+
+    def test_check_scores_every_other_member(self, members):
+        sp, _ = members
+        fit = fit_block(sp, ["a", "b", "c"], block="T", **_fit_kwargs())
+        table, _ = self._gated_in_one_clip(sp)
+        groups = [f"clip{i // self.CLIP:02d}" for i in range(N)]
+        rows = {r["member"]: r for r in check_fit(fit, table, groups=groups, n_perm=150,
+                                                   eval_n=None, k_nn=10)}
+        assert rows["a"]["passed"] is True and rows["b"]["passed"] is True
+        assert rows["a"]["unscoreable"] == "" and rows["a"]["n_groups"] == N // self.CLIP
+        c = rows["c"]
+        assert c["passed"] is None
+        assert c["n_rows"] == self.CLIP and c["n_groups"] == 1
+        assert "1 groups < 5" in c["unscoreable"]
+        assert c["unscoreable"] == unscoreable_reason(self.CLIP, 1, fit.k, None)
+        assert np.isnan(c["r2"]) and np.isnan(c["overlap_p"])
+
+    def test_check_floor_is_adjustable(self, members):
+        # ungrouped, 30 rows clears a floor of 1*k: c is scored again
+        sp, _ = members
+        fit = fit_block(sp, ["a", "b", "c"], block="T", **_fit_kwargs())
+        table, _ = self._gated_in_one_clip(sp)
+        rows = {r["member"]: r for r in check_fit(fit, table, n_perm=150, eval_n=None, k_nn=10,
+                                                   min_rows_per_k=1)}
+        assert rows["c"]["passed"] is not None and rows["c"]["unscoreable"] == ""
+
+    def test_per_corpus_fit_sets_the_thin_member_aside_in_that_corpus_only(self, members):
+        sp, _ = members
+        corpora = np.array(["x"] * (N // 2) + ["y"] * (N // 2))
+        table, nulls = self._gated_in_one_clip(sp, rows=np.flatnonzero(corpora == "y"))
+        groups = [f"clip{i // self.CLIP:02d}" for i in range(N)]
+        fit = fit_block(table, ["a", "b", "c"], block="T", nulls=nulls, corpora=corpora.tolist(),
+                        groups=groups, per_corpus=True, **_fit_kwargs())
+        pm = fit.manifest["per_member"]
+        assert fit.manifest["subsumes_all_members"]
+        c = pm["c"]["per_corpus"]
+        assert c["y"]["passed"] is None and "1 groups < 5" in c["y"]["unscoreable"]
+        assert c["x"]["passed"] is True and c["x"]["unscoreable"] == ""
+        assert pm["c"]["passed_all_folds"] is True  # the verdict is over the scored corpora
+        assert all(pm[m]["per_corpus"][cc]["passed"] for m in "ab" for cc in "xy")
+        assert fit.manifest["criterion"]["scoreable"] == {
+            "min_rows_per_k": MIN_ROWS_PER_K, "min_groups": 5, "min_blocks": 10}
+        # the pooled folds are not guarded
+        assert all(r["unscoreable"] == "" for r in fit.curve if r["corpus"] == "all")
+
+    def test_a_member_no_corpus_can_score_does_not_pass_k(self, members):
+        # every member below the floor in every corpus: there is no evidence
+        # for any k, so the walk must not claim one
+        sp, _ = members
+        corpora = ["x"] * (N // 2) + ["y"] * (N // 2)
+        fit = fit_block(sp, ["a", "b", "c"], block="T", corpora=corpora, per_corpus=True,
+                        min_rows_per_k=10 * N, **_fit_kwargs())
+        pm = fit.manifest["per_member"]
+        assert all(pm[m]["passed_all_folds"] is None for m in "abc")
+        assert fit.manifest["subsumes_non_deferred"] is False
+        assert fit.manifest["subsumes_all_members"] is False
 
 
 def _same_directions(A, B, atol=1e-6):
