@@ -129,7 +129,10 @@ def split_members(models: Sequence[str]) -> list[str]:
 # 1.10: curve rows carry `spread` (the member's variance on the scored rows in
 # its fit-time whitened coordinates); a member below MIN_SPREAD is
 # unscoreable; `criterion.scoreable` adds `min_spread`.
-SPACE_SCHEMA_VERSION = "1.10"
+# 1.11: `min_support` and `per_member[m]["low_support_columns"]` (columns
+# dropped before whitening because too few fit rows leave their most common
+# value; see MIN_SUPPORT).
+SPACE_SCHEMA_VERSION = "1.11"
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
 #: placed by the fold map that did not see it (see :func:`fit_block`).
@@ -616,6 +619,55 @@ def prepare_member(space: SpaceMatrix, *, max_nan_frac: float = DEFAULT_MAX_NAN_
     return out, dropped
 
 
+# MINIMUM SUPPORT (DECIDED 2026-10-01, Ben). A column whose fit rows almost
+# all hold one value (a detector class that fires on one image) gets its
+# standardization scale from those few rows, and a new table that hits it
+# lands far outside anything the block was fit on. MEASURED on V_v0.6:
+# `yolo_hair_drier` is nonzero on 1 of 72,000 NSD images (SD 0.0037), so one
+# friends frame with a hair dryer sat at z = 268 and alone held 81 % of
+# resmem's held-out residual (friends 5/14 -> 13/14 without that row). Support
+# is the number of defined fit rows that differ from the column's most common
+# value: a count or binary column's nonzero rows, ~n for a continuous one. On
+# NSD the next lowest V column is `yolo_toaster` at 56, then 293; 10 sits in
+# that gap. The column is DROPPED (recorded in the manifest), never clipped or
+# rescaled: a dropped column is ignored by name on every later table.
+MIN_SUPPORT = 10
+
+
+def column_support(space: SpaceMatrix) -> np.ndarray:
+    """Per column, the defined rows that differ from its most common value."""
+    X = np.asarray(space.X, dtype=float)
+    out = np.zeros(X.shape[1], dtype=int)
+    for j in range(X.shape[1]):
+        col = X[:, j]
+        col = col[np.isfinite(col)]
+        if col.size == 0:
+            continue
+        vals, cnt = np.unique(col, return_counts=True)
+        out[j] = int(col.size - cnt.max())
+    return out
+
+
+def drop_low_support(space: SpaceMatrix, min_support: int = MIN_SUPPORT) -> tuple[SpaceMatrix, list[str]]:
+    """Drop columns with fewer than ``min_support`` rows off their modal value.
+
+    A constant column (support 0) is dropped too; ``fit_whitener`` would
+    otherwise pass it through as zeros. ``min_support`` <= 0 keeps everything.
+    """
+    if min_support <= 0:
+        return space, []
+    keep = column_support(space) >= min_support
+    dropped = [f for f, k in zip(space.features, keep) if not k]
+    if not dropped:
+        return space, []
+    if not keep.any():
+        raise SpaceError(f"'{space.name}': no column reaches the minimum support of {min_support} rows")
+    out = SpaceMatrix(name=space.name, labels=list(space.labels), X=np.asarray(space.X, dtype=float)[:, keep],
+                      features=[f for f, k in zip(space.features, keep) if k],
+                      modality=space.modality, extractor=space.extractor, n_replicates=space.n_replicates)
+    return out, dropped
+
+
 def select_features(space: SpaceMatrix, features: Sequence[str]) -> SpaceMatrix:
     """Restrict ``space`` to ``features`` in that order (a fit's kept columns)."""
     idx = {f: i for i, f in enumerate(space.features)}
@@ -978,6 +1030,7 @@ def fit_block(
     corpus_weights: str | None = None,
     min_rows_per_k: int = MIN_ROWS_PER_K,
     min_spread: float = MIN_SPREAD,
+    min_support: int = MIN_SUPPORT,
     progress=None,
     on_row=None,
 ) -> BlockFit:
@@ -1113,6 +1166,12 @@ def fit_block(
                                              exempt=undefined)
         if dropped:
             dropped_columns[m] = dropped
+    # 3b. minimum support (see MIN_SUPPORT): drop, never rescale
+    low_support: dict[str, list[str]] = {}
+    for m in members:
+        aligned[m], dropped = drop_low_support(aligned[m], min_support)
+        if dropped:
+            low_support[m] = dropped
     present = {m: member_present(aligned[m]) for m in members}
     n = len(labels)
     if n < 3 * n_splits:
@@ -1285,6 +1344,7 @@ def fit_block(
             "eval_rows": [r["eval_rows"] for r in rows],
             "dim": aligned[m].dim,
             "dropped_columns": dropped_columns.get(m, []),
+            "low_support_columns": low_support.get(m, []),
             "masked_columns": sorted(f for f in aligned[m].features
                                      if kinds[m].get(f) in ("undefined", "missing")
                                      and np.isnan(aligned[m].X[:, aligned[m].features.index(f)]).any()),
@@ -1362,6 +1422,7 @@ def fit_block(
                                      "min_blocks": MIN_EVAL_BLOCKS,
                                      "min_spread": min_spread} if per_corpus else None)},
         "max_nan_frac": max_nan_frac,
+        "min_support": min_support,
         "null_policy": {
             "source": "contract-b-1.1 nulls",
             "undefined": "masked: member absent from the row, never filled",

@@ -10,6 +10,7 @@ import pytest
 
 from psytwill.space import (
     MIN_ROWS_PER_K,
+    MIN_SUPPORT,
     MIN_SPREAD,
     OOF_FOLD,
     BlockFit,
@@ -17,7 +18,9 @@ from psytwill.space import (
     _fold_frame,
     _pairwise_block_pca,
     apply_structural_fill,
+    column_support,
     detect_structural_columns,
+    drop_low_support,
     prepare_member,
     check_fit,
     check_member,
@@ -192,6 +195,57 @@ class TestNaNPolicy:
         assert all(r["passed"] for r in rows)
 
 
+
+class TestMinimumSupport:
+    """A column almost every fit row holds at one value is dropped before
+    whitening (DECIDED 2026-10-01): V_v0.6 standardized `yolo_hair_drier` on
+    one positive NSD image, and one friends frame with a hair dryer then sat
+    268 SDs out and sank unrelated members' held-out R^2."""
+
+    def _with_rare(self, sp, n_pos):
+        X = np.c_[sp["b"].X, np.zeros(N)]
+        X[:n_pos, -1] = 1.0
+        return SpaceMatrix(name="b", labels=sp["b"].labels, X=X,
+                           features=sp["b"].features + ["b_rare"])
+
+    def test_support_counts_rows_off_the_modal_value(self, members):
+        sp, _ = members
+        b = self._with_rare(sp, 3)
+        sup = column_support(b)
+        assert sup[-1] == 3
+        assert (sup[:-1] == N - 1).all()  # continuous: every value distinct
+
+    def test_low_support_column_is_dropped_and_recorded(self, members):
+        sp, _ = members
+        sp = dict(sp)
+        sp["b"] = self._with_rare(sp, 1)
+        kept, dropped = drop_low_support(sp["b"])
+        assert dropped == ["b_rare"] and kept.dim == 12
+        fit = fit_block(sp, ["a", "b"], block="T", r2_min=0.9, **_fit_kwargs())
+        assert fit.manifest["per_member"]["b"]["low_support_columns"] == ["b_rare"]
+        assert fit.manifest["min_support"] == MIN_SUPPORT
+        assert "b_rare" not in fit.map.whiteners["b"].features
+        # a later table where the rare column fires is read without it
+        X = sp["b"].X.copy()
+        X[:, -1] = 1.0
+        hot = dict(sp, b=SpaceMatrix(name="b", labels=sp["b"].labels, X=X, features=sp["b"].features))
+        S0, _ = fit.project(sp)
+        S1, _ = fit.project(hot)
+        assert np.allclose(S0, S1)
+
+    def test_column_at_the_floor_is_kept_and_rule_can_be_switched_off(self, members):
+        sp, _ = members
+        b = self._with_rare(sp, MIN_SUPPORT)
+        assert drop_low_support(b)[1] == []
+        assert drop_low_support(self._with_rare(sp, 1), 0)[1] == []
+
+    def test_member_with_no_supported_column_is_refused(self):
+        b = SpaceMatrix(name="b", labels=[f"s{i}" for i in range(50)], X=np.zeros((50, 2)),
+                        features=["b_000", "b_001"])
+        with pytest.raises(SpaceError, match="minimum support"):
+            drop_low_support(b)
+
+
 class TestRankMetricRule:
     """Cosine neighbour graphs are degenerate below whitened rank 3.
 
@@ -259,7 +313,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.10"
+        assert meta["space_schema_version"] == "1.11"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -627,7 +681,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.10"
+        assert meta["space_schema_version"] == "1.11"
 
 
 

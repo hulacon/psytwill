@@ -748,6 +748,9 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         if pm["masked_columns"]:
             n_abs = fit.manifest["null_policy"]["n_member_rows_absent"][m]
             print(f"  {m}: absent from {n_abs} row(s), masked on {', '.join(pm['masked_columns'])}")
+        if pm["low_support_columns"]:
+            print(f"  {m}: dropped (support < {fit.manifest['min_support']} rows): "
+                  f"{', '.join(pm['low_support_columns'])}")
         if pm["undefinable_rows_dropped"]:
             print(f"  {m}: {pm['undefinable_rows_dropped']} undefinable row(s) dropped")
         if pm["suspected_gated_missing"]:
