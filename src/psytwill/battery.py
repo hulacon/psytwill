@@ -201,7 +201,28 @@ BATTERY: dict[str, BatteryModel] = {
 }
 
 
-def _validate(battery: Mapping[str, BatteryModel]) -> None:
+#: Models an extractor ships that the battery deliberately does NOT admit,
+#: each with its reason. :func:`check_registry` counts them as accounted for,
+#: so declining a model is a recorded decision rather than a red test; a
+#: model listed here and in the battery is refused by :func:`_validate`.
+NOT_ADMITTED: dict[str, dict[str, str]] = {
+    "viz2psy": {
+        "vgg19": "generic CNN control arm for the functional-space stimulus route "
+                 "(mmmdata-agents workbench functional-space, 2026-09-28). Not a "
+                 "psytwill-space member: admission would add it to V at the next fit, "
+                 "where dinov2/clip/places/gist already cover it (Ben 2026-10-01).",
+    },
+}
+
+
+def _validate(battery: Mapping[str, BatteryModel],
+              not_admitted: Mapping[str, Mapping[str, str]] = NOT_ADMITTED) -> None:
+    for ext, models in not_admitted.items():
+        if ext not in EXTRACTOR_VERSIONS:
+            raise BatteryError(f"NOT_ADMITTED names unknown extractor {ext!r}")
+        both = sorted(m for m in models if m in battery and battery[m].extractor == ext)
+        if both:
+            raise BatteryError(f"{ext} model(s) {both} are both admitted and NOT_ADMITTED")
     owners: dict[str, str] = {}
     for m in battery.values():
         if m.extractor not in EXTRACTOR_VERSIONS:
@@ -340,15 +361,17 @@ def check_registry(
     registry_names: Iterable[str],
     *,
     battery: Mapping[str, BatteryModel] = BATTERY,
+    not_admitted: Mapping[str, Mapping[str, str]] = NOT_ADMITTED,
 ) -> tuple[set[str], set[str]]:
     """Two-sided registry cross-check for one extractor.
 
     Returns ``(missing_from_battery, missing_from_registry)``: models the
-    package ships that the battery has not admitted, and battery models the
-    package no longer ships. Both empty means the clamp and the package agree.
+    package ships that the battery has neither admitted nor listed in
+    ``not_admitted``, and battery models the package no longer ships. Both
+    empty means the clamp and the package agree.
     """
     if extractor not in EXTRACTOR_VERSIONS:
         raise BatteryError(f"unknown extractor {extractor!r}; battery covers {sorted(EXTRACTOR_VERSIONS)}")
     live = set(registry_names)
     pinned = {m.model for m in battery.values() if m.extractor == extractor}
-    return live - pinned, pinned - live
+    return live - pinned - set(not_admitted.get(extractor, {})), pinned - live

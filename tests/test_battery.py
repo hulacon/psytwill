@@ -144,6 +144,17 @@ class TestCheckRegistry:
         live2 = (live - {"wordform"}) | {"pos_tags"}
         assert check_registry("word2psy", live2) == ({"pos_tags"}, {"wordform"})
 
+    def test_not_admitted_model_is_accounted_for(self):
+        live = {m.model for m in BATTERY.values() if m.extractor == "viz2psy"} | {"vgg19"}
+        assert check_registry("viz2psy", live) == (set(), set())
+        assert check_registry("viz2psy", live, not_admitted={}) == ({"vgg19"}, set())
+        # another extractor's exclusion does not excuse it
+        assert check_registry("viz2psy", live, not_admitted={"word2psy": {"vgg19": "x"}}) == ({"vgg19"}, set())
+
+    def test_model_both_admitted_and_not_admitted_is_refused(self):
+        with pytest.raises(BatteryError, match="both admitted and NOT_ADMITTED"):
+            _validate(BATTERY, {"viz2psy": {"clip": "x"}})
+
     def test_unknown_extractor(self):
         with pytest.raises(BatteryError, match="unknown extractor"):
             check_registry("pliers", [])
