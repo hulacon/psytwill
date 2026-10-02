@@ -37,6 +37,7 @@ the four ``_mean/_sd/_min/_max`` suffixes, a consumer-side fact).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Iterable, Mapping
 
 from psytwill.exceptions import BatteryError
@@ -288,12 +289,25 @@ def _norm_ckpt(value: Any) -> str | None:
     return str(value)
 
 
+# A space-release coordinate (``space release project``): psytwill's own
+# output, ``checkpoint`` = "<release>@<version>:<manifest stem>". It is derived
+# FROM the battery, so the clamp on extractor inputs does not apply to it.
+RELEASE_CHECKPOINT_RE = re.compile(r"^[^@\s]+@[^:\s]+:\S+$")
+
+
+def is_release_model(extractor: str | None, entry: Any) -> bool:
+    return (extractor == "psytwill" and isinstance(entry, Mapping)
+            and bool(RELEASE_CHECKPOINT_RE.match(str(entry.get("checkpoint") or ""))))
+
+
 def _check_one(sidecar: Mapping[str, Any], source: str, battery: Mapping[str, BatteryModel]) -> list[str]:
     out: list[str] = []
     extractor = sidecar.get("extractor")
     models = sidecar.get("models") or {}
     for name, entry in models.items():
         pinned = battery.get(name)
+        if pinned is None and is_release_model(extractor, entry):
+            continue
         if pinned is None:
             out.append(f"{source}: unknown_model {name} (not in battery {BATTERY_VERSION})")
             continue

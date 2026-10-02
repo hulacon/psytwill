@@ -111,6 +111,16 @@ class TestCheckSidecar:
         out = check_sidecar(_sidecar("videomae", "MCG-NJU/videomae-base"))
         assert out == [f"<sidecar>: unknown_model videomae (not in battery {BATTERY_VERSION})"]
 
+    def test_release_coordinates_are_outside_the_clamp(self):
+        # psytwill's own release families are derived from the battery, not inputs to it
+        ok = {"extractor": "psytwill", "models": {"pspace_v": {"checkpoint": "psytwill-space@0.1.0:V_v0.7"}}}
+        assert check_sidecar(ok) == []
+        assert check_sidecar({"table": "features", "inputs": [{"path": "s/psytwill_space.csv", **ok}]}) == []
+        # ...but only with a release checkpoint, and only from psytwill
+        for bad in ({"extractor": "psytwill", "models": {"pspace_v": {"checkpoint": "something"}}},
+                    {"extractor": "viz2psy", "models": {"pspace_v": {"checkpoint": "psytwill-space@0.1.0:V_v0.7"}}}):
+            assert [line.split()[1] for line in check_sidecar(bad)] == ["unknown_model"]
+
     def test_extractor_and_prefix_mismatch(self):
         out = check_sidecar(
             _sidecar("places", "wideresnet18_places365", extractor="aud2psy",
