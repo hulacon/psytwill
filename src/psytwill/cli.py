@@ -943,6 +943,27 @@ def _run_relate_project(args: argparse.Namespace) -> None:
     print(f"psytwill space relate project [{fit.name} side {args.side} ({t.block}), k={fit.k}] -> {out}  ({len(df)} rows)")
 
 
+def _run_release_write(args: argparse.Namespace) -> None:
+    from psytwill.release import build_release, parse_absent, write_release
+
+    rel = build_release(name=args.name, version=args.version, blocks=args.blocks, relations=args.relations or [],
+                        absent=[parse_absent(a) for a in (args.absent or [])], note=args.note)
+    path = write_release(rel, args.output)
+    b = ", ".join(f"{n} k={e['k']}" for n, e in rel["blocks"].items())
+    r = ", ".join(f"{n} ({e['a']}<->{e['b']}) k={e['k']}" for n, e in rel["relations"].items()) or "none"
+    a = ", ".join("<->".join(x["pair"]) for x in rel["absent"]) or "none"
+    print(f"psytwill space release {rel['name']} {rel['version']}: blocks {b}; relations {r}; absent {a}\n  {path}")
+
+
+def _run_release_verify(args: argparse.Namespace) -> None:
+    from psytwill.release import load_release
+
+    rel = load_release(args.release)
+    m = rel.meta
+    print(f"psytwill space release {rel.label}: {len(m['blocks'])} blocks, {len(m['relations'])} relations, "
+          f"{len(m['absent'])} absences; every pinned file matches")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -1322,7 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "space",
-        help="Private-block fits and relations (psytwill-space): fit | project | check | relate",
+        help="Private-block fits, relations and releases (psytwill-space): fit | project | check | relate | release",
     )
     spsub = sp.add_subparsers(dest="space_verb", required=True)
 
@@ -1432,6 +1453,22 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--scores", required=True, help="block score table (`space project` output)")
     rp.add_argument("-o", "--output", required=True, help="variates table (.parquet or .csv)")
     rp.set_defaults(func=_run_relate_project)
+
+    rls = spsub.add_parser("release", help="name a set of blocks + relations as one pinned version: write | verify")
+    rlsub = rls.add_subparsers(dest="release_verb", required=True)
+    rw = rlsub.add_parser("write", help="write an immutable release manifest")
+    rw.add_argument("--name", required=True, help="e.g. psytwill-space")
+    rw.add_argument("--version", required=True, help="release version, e.g. 0.1.0")
+    rw.add_argument("--blocks", nargs="+", required=True, help="block .json manifests")
+    rw.add_argument("--relations", nargs="+", help="relation .json manifests (fitted on blocks given here)")
+    rw.add_argument("--absent", nargs="+", metavar="'X,Y: evidence'",
+                    help="pairs measured to share nothing (k = 0), each with where the measurement is recorded")
+    rw.add_argument("--note", help="free-text note recorded in the release")
+    rw.add_argument("-o", "--output", required=True, help="output directory (file: <name>_<version>.json)")
+    rw.set_defaults(func=_run_release_write)
+    rv = rlsub.add_parser("verify", help="check every file a release pins is unchanged")
+    rv.add_argument("release", help="release .json")
+    rv.set_defaults(func=_run_release_verify)
 
     return parser
 
