@@ -971,7 +971,7 @@ def _run_release_project(args: argparse.Namespace) -> None:
     import pandas as pd
 
     from psytwill.release import load_release
-    from psytwill.release_project import parse_grain, project_grain, registry_id_map, write_family
+    from psytwill.release_project import parse_grain, project_grain, registry_id_map, uncovered, write_family
     from psytwill.store import distinct_values
 
     t0 = time.time()
@@ -982,10 +982,16 @@ def _run_release_project(args: argparse.Namespace) -> None:
         if not sep:
             raise SpaceError(f"--key-map {spec!r}: write it as TABLE=FILE")
         key_maps[table] = path
-    grains = [parse_grain(g, key_maps) for g in args.grain]
-    stray = set(key_maps) - {g[0] for g in args.grain}
+    skip = {}
+    for spec in args.skip_member or []:
+        table, sep, members = spec.partition("=")
+        if not sep or not members:
+            raise SpaceError(f"--skip-member {spec!r}: write it as TABLE=MEMBER[,MEMBER]")
+        skip.setdefault(table, []).extend(m for m in members.split(",") if m)
+    grains = [parse_grain(g, key_maps, skip) for g in args.grain]
+    stray = (set(key_maps) | set(skip)) - {g[0] for g in args.grain}
     if stray:
-        raise SpaceError(f"--key-map for table(s) {sorted(stray)} that no --grain writes")
+        raise SpaceError(f"--key-map / --skip-member for table(s) {sorted(stray)} that no --grain writes")
     reg = Path(args.registry)
     registry = pd.read_csv(reg, sep="\t" if reg.suffix in (".tsv", ".tab") else ",")
     results = []
@@ -996,11 +1002,14 @@ def _run_release_project(args: argparse.Namespace) -> None:
         window = json.loads(Path(entry["manifest"]).read_text()).get("window") if "time" in g.key else None
         # map ids first (streamed), then read only the set's rows
         src = sorted(set().union(*(distinct_values(f, "stimulus_id") for f in g.features)))
-        id_map = registry_id_map(registry, src, join=args.registry_join, pattern=args.id_pattern)
+        id_map = registry_id_map(registry, src, join=args.registry_join, pattern=args.id_pattern,
+                                 partial=args.partial_coverage)
         ns = argparse.Namespace(features=g.features, key=",".join(g.key), window=window,
                                 exclude_ids=None, exclude_rows=None, include_ids=set(id_map))
-        spaces, _, _, _ = _space_load(ns, members=list(entry["members"]))
-        results.append(project_grain(rel, g, spaces, id_map))
+        spaces, _, _, _ = _space_load(ns, members=[m for m in entry["members"] if m not in g.skip_members])
+        res = project_grain(rel, g, spaces, id_map)
+        res.uncovered = uncovered(registry, id_map)
+        results.append(res)
         del spaces
     side = write_family(rel, results, args.output, set_name=args.set, registry=reg, id_join=args.registry_join,
                         id_pattern=args.id_pattern, runtime_sec=round(time.time() - t0, 1))
@@ -1013,6 +1022,13 @@ def _run_release_project(args: argparse.Namespace) -> None:
     for m, e in meta["models"].items():
         for table, te in e["tables"].items():
             print(f"  leak guard {m} [{table}]: {te['leak_guard']['rule']}")
+    for table, gr in meta["input"]["grains"].items():
+        if gr["members_absent"]:
+            print(f"  {table}: members absent by declaration: {', '.join(gr['members_absent'])}")
+        if gr["registry_uncovered"]:
+            print(f"  {table}: {len(gr['registry_uncovered'])} registry stimuli have no row "
+                  f"(--partial-coverage): {', '.join(gr['registry_uncovered'][:5])}"
+                  + (" ..." if len(gr["registry_uncovered"]) > 5 else ""))
     if meta["input"]["archived_previous"]:
         print(f"  previous release's family moved to {meta['input']['archived_previous']}")
     print(f"  {side}")
@@ -1535,6 +1551,12 @@ def build_parser() -> argparse.ArgumentParser:
     rpj.add_argument("--key-map", action="append", metavar="TABLE=FILE",
                      help="for a table whose sub-stimulus key the source numbers differently: a table of "
                           "src_<key> and <key> columns, one to one")
+    rpj.add_argument("--skip-member", action="append", metavar="TABLE=MEMBER[,MEMBER]",
+                     help="a block member this set does not carry at all: masked in every row (as an "
+                          "`undefined` member is), never filled, and listed in the sidecar")
+    rpj.add_argument("--partial-coverage", action="store_true",
+                     help="allow registry stimuli with no row in the input (a film without dialogue has no "
+                          "transcript); they are listed in the sidecar instead of refused")
     rpj.add_argument("-o", "--output", required=True, help="family stem, e.g. <store>/shared1000/psytwill_space")
     rpj.set_defaults(func=_run_release_project)
     rv = rlsub.add_parser("verify", help="check every file a release pins is unchanged")

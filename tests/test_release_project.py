@@ -162,7 +162,8 @@ def test_fitted_rows_are_refused(space, tmp_path, capsys):
 
 def test_registry_must_be_covered(space, tmp_path, capsys):
     reg = tmp_path / "wide.tsv"
-    pd.DataFrame({"stimulus_id": ["img9999"], "tid": [99999]}).to_csv(reg, sep="\t", index=False)
+    rows = [{"stimulus_id": f"img{i + 1:04d}", "tid": i} for i in range(N_HELD)] + [{"stimulus_id": "img9999", "tid": 99999}]
+    pd.DataFrame(rows).to_csv(reg, sep="\t", index=False)
     assert main(_argv(space, tmp_path / "f" / "psytwill_space", registry=reg, kmap=False)) == 1
     assert "have no row in the input" in capsys.readouterr().err
 
@@ -206,3 +207,31 @@ def test_table_names_must_be_findable(space, tmp_path, capsys):
     argv[argv.index("chunks")] = "captions"
     assert main(argv) == 1
     assert "not a §4.1 table suffix" in capsys.readouterr().err
+
+
+def test_skipped_member_is_masked_and_declared(space, tmp_path, capsys):
+    out = tmp_path / "skip" / "psytwill_space"
+    argv = _argv(space, out) + ["--skip-member=-=b"]
+    assert main(argv) == 0
+    img = pd.read_csv(out.parent / "psytwill_space.csv")
+    meta = json.loads((out.parent / "psytwill_space.meta.json").read_text())
+    assert meta["input"]["grains"]["base"]["members_absent"] == ["b"]
+    assert meta["models"]["pspace_v"]["tables"]["base"]["members_absent"] == ["b"]
+    # placed from member a alone: every row still has coordinates, and they differ from the full projection
+    full = pd.read_csv(space["tmp"] / "store" / "toy" / "psytwill_space.csv")
+    v = [c for c in img.columns if c.startswith("pspace_v_")]
+    assert np.isfinite(img[v].to_numpy()).all()
+    assert not np.allclose(img[v].to_numpy(), full[v].to_numpy())
+    assert "members absent by declaration: b" in capsys.readouterr().out
+    assert main(_argv(space, tmp_path / "bad" / "psytwill_space") + ["--skip-member=-=zz"]) == 1
+
+
+def test_partial_coverage_lists_what_is_missing(space, tmp_path):
+    reg = tmp_path / "wider.tsv"
+    ids = list(range(N_HELD))
+    rows = [{"stimulus_id": f"img{i + 1:04d}", "tid": i} for i in ids] + [{"stimulus_id": "img9999", "tid": 99999}]
+    pd.DataFrame(rows).to_csv(reg, sep="\t", index=False)
+    out = tmp_path / "partial_cov" / "psytwill_space"
+    assert main(_argv(space, out, registry=reg) + ["--partial-coverage"]) == 0
+    meta = json.loads((out.parent / "psytwill_space.meta.json").read_text())
+    assert meta["input"]["grains"]["base"]["registry_uncovered"] == ["img9999"]

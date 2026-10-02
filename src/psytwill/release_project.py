@@ -26,6 +26,15 @@ Conventions (psytwill-space project-design, DECIDED 2026-10-02):
   row of either score table it was fitted on. Anything else is refused. (A
   path test cannot see the same stimulus filed under another path in a fit
   corpus; the sidecar records which rule passed.)
+- **Absent members are declared, never filled.** ``--skip-member`` names a
+  block member a set does not carry at all (twp1000's single-word files have
+  no turn or word tables for A's ``conversation`` / ``speech_rate``). The
+  member is masked in every row, exactly as an ``undefined`` member is, and
+  the sidecar lists it per table.
+- **Coverage.** By default the family must cover the whole registry. A source
+  that legitimately lacks some stimuli (films without dialogue have no
+  transcript) passes ``--partial-coverage``, and the registry ids it does not
+  cover are listed in the sidecar.
 - **Unplaced rows stay.** A row the block cannot place is written as NaN and
   declared ``undefined`` in ``nulls``, so every source row has a row and an
   absence is visible.
@@ -89,6 +98,7 @@ class Grain:
     key: list[str]
     features: list[str]
     key_map: str | None = None
+    skip_members: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.table and self.table not in TABLE_NAMES:
@@ -99,13 +109,14 @@ class Grain:
             raise SpaceError(f"a grain's key must start with stimulus_id, not {self.key}")
 
 
-def parse_grain(spec: Sequence[str], key_maps: dict[str, str]) -> Grain:
+def parse_grain(spec: Sequence[str], key_maps: dict[str, str],
+                skip: dict[str, list[str]] | None = None) -> Grain:
     """``[TABLE, BLOCK, KEY, FEATURES...]`` from the CLI (TABLE '-' = base)."""
     if len(spec) < 4:
         raise SpaceError(f"--grain {' '.join(spec)}: give TABLE BLOCK KEY FEATURES... (TABLE '-' for the base table)")
     table = "" if spec[0] == "-" else spec[0]
     return Grain(table=table, block=spec[1], key=spec[2].split(","), features=list(spec[3:]),
-                 key_map=key_maps.get(spec[0]))
+                 key_map=key_maps.get(spec[0]), skip_members=list((skip or {}).get(spec[0], [])))
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +125,7 @@ def parse_grain(spec: Sequence[str], key_maps: dict[str, str]) -> Grain:
 
 
 def registry_id_map(registry: pd.DataFrame, src_ids: Sequence[str], *, join: str | None = None,
-                    pattern: str | None = None) -> dict[str, str]:
+                    pattern: str | None = None, partial: bool = False) -> dict[str, str]:
     """Source id -> registry ``stimulus_id``, refused unless one to one and covering.
 
     Without ``join`` the source ids must already be registry ids. With it, the
@@ -149,19 +160,26 @@ def registry_id_map(registry: pd.DataFrame, src_ids: Sequence[str], *, join: str
             hit = rx.fullmatch(s)
             if hit and _key_value(hit.group(1)) in by:
                 m[s] = by[_key_value(hit.group(1))]
-    _require_bijection(m, reg_ids, what="source ids")
+    _require_bijection(m, reg_ids, what="source ids", partial=partial)
     return m
 
 
-def _require_bijection(m: dict, targets: Sequence[str], *, what: str) -> None:
+def uncovered(registry: pd.DataFrame, id_map: dict[str, str]) -> list[str]:
+    return sorted(set(registry["stimulus_id"].astype(str)) - set(id_map.values()))
+
+
+def _require_bijection(m: dict, targets: Sequence[str], *, what: str, partial: bool = False) -> None:
     many = [t for t, c in Counter(m.values()).items() if c > 1]
     if many:
         raise SpaceError(f"{len(many)} registry stimulus_id(s) receive more than one of the {what} "
                          f"(e.g. {sorted(many)[:3]}); the mapping must be one to one")
+    if not m:
+        raise SpaceError(f"none of the {what} map onto the registry; check --registry-join / --id-pattern")
     missing = sorted(set(targets) - set(m.values()))
-    if missing:
+    if missing and not partial:
         raise SpaceError(f"{len(missing)} registry stimulus_id(s) have no row in the input "
-                         f"(e.g. {missing[:3]}); a family covers its whole registry")
+                         f"(e.g. {missing[:3]}); a family covers its whole registry. If this source "
+                         "legitimately lacks them, pass --partial-coverage (they are listed in the sidecar)")
 
 
 def read_key_map(path: str | Path, key: Sequence[str]) -> dict[tuple, tuple]:
@@ -248,6 +266,7 @@ class GrainResult:
     src_ids: set[str]
     columns: dict[str, np.ndarray] = field(default_factory=dict)  # model -> n x k (NaN = unplaced)
     leak: dict = field(default_factory=dict)  # model -> guard evidence
+    uncovered: list[str] = field(default_factory=list)  # registry ids with no row (--partial-coverage)
 
 
 def _restrict(space, keep: set[str]):
@@ -261,12 +280,23 @@ def _restrict(space, keep: set[str]):
 
 def project_grain(release: Release, grain: Grain, spaces: dict, id_map: dict[str, str]) -> GrainResult:
     """Place one grain's rows through its release block and every relation side on that block."""
+    from psytwill.store import SpaceMatrix
+
     fit = release.block(grain.block)
     meta = release.meta["blocks"][grain.block]
+    stray = [m for m in grain.skip_members if m not in fit.members]
+    if stray:
+        raise SpaceError(f"--skip-member {stray}: not members of block {grain.block} ({fit.members})")
+    present = [m for m in fit.members if m not in grain.skip_members]
     keep = set(id_map)
-    spaces = {m: _restrict(spaces[m], keep) for m in fit.members}
+    spaces = {m: _restrict(spaces[m], keep) for m in present}
     universe = sorted({lab for sp in spaces.values() for lab in sp.labels})
     src_ids = {lab.split("|")[0] for lab in universe}
+    for m in grain.skip_members:
+        # absent from every row: masked exactly as an `undefined` member is, never filled
+        feats = list(fit.map.whiteners[m].features)
+        spaces[m] = SpaceMatrix(name=m, labels=universe, X=np.full((len(universe), len(feats)), np.nan),
+                                features=feats)
     S, placed = fit.project(spaces)
     pos = {lab: i for i, lab in enumerate(universe)}
     full = np.full((len(universe), fit.k), np.nan)
@@ -407,6 +437,7 @@ def write_family(release: Release, results: Sequence[GrainResult], stem: str | P
                 "block": g.block,
                 "n_rows": int(len(X)),
                 "n_unplaced": int((~np.isfinite(X).all(axis=1)).sum()),
+                "members_absent": list(g.skip_members) if is_block else [],
                 "leak_guard": r.leak[model],
             }
     meta = {
@@ -427,6 +458,8 @@ def write_family(release: Release, results: Sequence[GrainResult], stem: str | P
                     "key_map": None if not r.grain.key_map else
                     {"path": str(r.grain.key_map), "sha256": sha256_file(r.grain.key_map)},
                     "n_source_ids": len(r.src_ids),
+                    "members_absent": list(r.grain.skip_members),
+                    "registry_uncovered": r.uncovered,
                 } for r in results},
             "absent": rel.get("absent", []),
             "archived_previous": archived,
