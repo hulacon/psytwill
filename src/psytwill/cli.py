@@ -602,15 +602,15 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
     import numpy as np
 
     from psytwill.features import group_nulls
-    from psytwill.store import LoadReport, SpaceMatrix, load_spaces, model_inventory
+    from psytwill.store import LoadReport, SpaceMatrix, distinct_values, load_spaces
 
     key = tuple(args.key.split(","))
     rep = LoadReport()
     where: dict[str, list[str]] = {}
     table_nulls = {str(path): group_nulls(path) for path in args.features}
     for path in args.features:
-        for m in model_inventory(path)["model"].dropna().unique():
-            where.setdefault(str(m), []).append(str(path))
+        for m in sorted(distinct_values(path, "model")):
+            where.setdefault(m, []).append(str(path))
     if members is None:
         members = _space_members(args, list(where))
     from psytwill.space import member_source, select_features
@@ -632,7 +632,8 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
         else:
             parts = []
             for path in where[model]:
-                got = load_spaces(path, key=key, models=[model], window=args.window, report=rep)
+                got = load_spaces(path, key=key, models=[model], window=args.window, report=rep,
+                                  stimulus_ids=getattr(args, "include_ids", None))
                 if model not in got:
                     raise SpaceError(f"model {model!r} in {path} loaded as none of {sorted(got)} "
                                      "(string-valued or empty?)")
@@ -971,6 +972,7 @@ def _run_release_project(args: argparse.Namespace) -> None:
 
     from psytwill.release import load_release
     from psytwill.release_project import parse_grain, project_grain, registry_id_map, write_family
+    from psytwill.store import distinct_values
 
     t0 = time.time()
     rel = load_release(args.release)
@@ -992,12 +994,14 @@ def _run_release_project(args: argparse.Namespace) -> None:
             raise SpaceError(f"block {g.block!r} is not in {rel.label} (blocks: {sorted(rel.meta['blocks'])})")
         entry = rel.meta["blocks"][g.block]
         window = json.loads(Path(entry["manifest"]).read_text()).get("window") if "time" in g.key else None
-        ns = argparse.Namespace(features=g.features, key=",".join(g.key), window=window,
-                                exclude_ids=None, exclude_rows=None)
-        spaces, _, _, _ = _space_load(ns, members=list(entry["members"]))
-        src = sorted({lab.split("|")[0] for sp in spaces.values() for lab in sp.labels})
+        # map ids first (streamed), then read only the set's rows
+        src = sorted(set().union(*(distinct_values(f, "stimulus_id") for f in g.features)))
         id_map = registry_id_map(registry, src, join=args.registry_join, pattern=args.id_pattern)
+        ns = argparse.Namespace(features=g.features, key=",".join(g.key), window=window,
+                                exclude_ids=None, exclude_rows=None, include_ids=set(id_map))
+        spaces, _, _, _ = _space_load(ns, members=list(entry["members"]))
         results.append(project_grain(rel, g, spaces, id_map))
+        del spaces
     side = write_family(rel, results, args.output, set_name=args.set, registry=reg, id_join=args.registry_join,
                         id_pattern=args.id_pattern, runtime_sec=round(time.time() - t0, 1))
     meta = json.loads(side.read_text())

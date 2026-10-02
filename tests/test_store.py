@@ -15,6 +15,7 @@ from psytwill.store import (
     LoadReport,
     align_spaces,
     dedupe_spaces,
+    distinct_values,
     load_spaces,
     model_inventory,
 )
@@ -84,6 +85,19 @@ def test_prefix_namespaces_spaces(image_table):
         "image:clip",
         "image:resmem",
     }
+
+
+def test_stimulus_ids_filter_the_read(image_table):
+    full = load_spaces(image_table)
+    some = load_spaces(image_table, stimulus_ids=["img003", "img007", "not-there"])
+    assert some["clip"].labels == ["img003", "img007"]
+    rows = [full["clip"].labels.index(lab) for lab in some["clip"].labels]
+    np.testing.assert_array_equal(some["clip"].X, full["clip"].X[rows])
+
+
+def test_distinct_values_streams_one_column(image_table):
+    assert distinct_values(image_table, "model") == {"clip", "resmem", "caption"}
+    assert distinct_values(image_table, "stimulus_id") == {f"img{i:03d}" for i in range(12)}
 
 
 def test_missing_key_column_names_the_available_ones(image_table):

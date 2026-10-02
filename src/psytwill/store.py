@@ -108,8 +108,13 @@ def _read(
     columns: Sequence[str],
     model: str | None = None,
     models: Iterable[str] | None = None,
+    stimulus_ids: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """Read selected columns, string columns as categoricals.
+
+    ``stimulus_ids`` keeps only those stimuli, filtered inside the parquet
+    read, so a projection of 1,000 items out of a 73,000-item fit corpus never
+    materializes the other 72,000.
 
     One pass per *file*, not per model: the long table repeats `stimulus_id`,
     `model` and `feature` on every row, so a 15.9 M-row group re-read once per
@@ -122,12 +127,14 @@ def _read(
     """
     import pyarrow.parquet as pq
 
+    filters = []
     if model is not None:
-        filters = [("model", "=", model)]
+        filters.append(("model", "=", model))
     elif models is not None:
-        filters = [("model", "in", list(models))]
-    else:
-        filters = None
+        filters.append(("model", "in", list(models)))
+    if stimulus_ids is not None:
+        filters.append(("stimulus_id", "in", sorted(set(map(str, stimulus_ids)))))
+    filters = filters or None
     try:
         table = pq.read_table(path, columns=list(columns), filters=filters)
         df = table.to_pandas(strings_to_categorical=True)
@@ -146,6 +153,25 @@ def _read(
             f"Could not read '{path}' ({exc}). Parquet input needs pyarrow; "
             "install pyarrow, or aggregate to .csv first."
         ) from exc
+
+
+def distinct_values(path: str | Path, column: str) -> set[str]:
+    """Distinct non-null values of one column, streamed batch by batch.
+
+    For a long-form table whose full read would be the expensive part
+    (``model`` or ``stimulus_id`` of a 10^9-row group), this holds one
+    batch at a time.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    out: set[str] = set()
+    for batch in pq.ParquetFile(path).iter_batches(columns=[column], batch_size=1 << 22):
+        col = batch.column(0)
+        if hasattr(col, "dictionary"):
+            col = col.dictionary
+        out.update(str(v) for v in pc.unique(col).to_pylist() if v is not None)
+    return out
 
 
 def _schema_names(path: Path) -> set[str]:
@@ -188,8 +214,11 @@ def load_spaces(
     prefix: str | None = None,
     window: float | None = None,
     report: LoadReport | None = None,
+    stimulus_ids: Iterable[str] | None = None,
 ) -> dict[str, SpaceMatrix]:
     """Load each model in a long-form table as a :class:`SpaceMatrix`.
+
+    ``stimulus_ids`` restricts the read to those stimuli (None = all).
 
     ``key`` is the row grain: ``("stimulus_id",)`` for an image set,
     ``("stimulus_id", "time")`` for a movie grid. Rows sharing a key are
@@ -235,7 +264,7 @@ def load_spaces(
         + ["model", "feature", "value", "value_str"]
         + [c for c in META_COLUMNS if c in available]
     )
-    frame = _read(p, cols, models=models)
+    frame = _read(p, cols, models=models, stimulus_ids=stimulus_ids)
     if window is not None:
         # +1e-9 so a float-noise 0.9999... lands in its true bin, not the one
         # below; exact for the store's power-of-two grid, harmless elsewhere.
