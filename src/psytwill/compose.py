@@ -43,6 +43,22 @@ composed-run dispatch) works unchanged: visual and audio models land on the
 grid (``movies_frames`` / ``movies_audio_frames``, starts vs centers), text
 models land at word grain (``movies_transcript_words``).
 
+**A family composes beside the battery, not into it.** ``family=NAME``
+writes ``movies_<NAME>_frames`` / ``movies_<NAME>_audio_frames`` /
+``movies_<NAME>_transcript_chunks`` — the stems a projection family's group
+tables carry (e.g. psytwill-space's ``movies_psytwill_space_*``) — so a second
+compose into a run root that already holds the battery tables adds tables
+instead of overwriting them. A model whose rows say ``modality='shared'`` (a
+cross-block relation such as ``pspace_vl``) takes the modality of the other
+models in its store, so the same relation composes once per side, each into
+its side's stream; model names collide only within one stream.
+
+**Grid stamps follow the store.** A gridded store stamps either bin starts
+or bin centers; compose reads which from the rows and stamps fill rows and
+untimed expansions in that stream the same way. A stream whose gridded
+stores disagree is refused. A stream with no gridded rows takes the movie
+group tables' convention (visual starts, audio centers).
+
 **Empty bins are explicit.** Fixation, rest and lead-in/out bins get rows
 with a NaN ``value`` for every (model, feature) the stream carries (unless
 ``sparse=True``): a gap the fit-time structural-undefined fill can act on is
@@ -69,6 +85,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -115,9 +132,22 @@ GRID_STREAMS = {"visual": "movies_frames", "audio": "movies_audio_frames"}
 TRANSCRIPT_STREAM = "movies_transcript_words"
 
 #: The audio grid stamps bin centers, visual stamps bin starts — the store's
-#: measured convention (see store.load_spaces docstring). Composed fill rows
-#: and untimed expansions follow the stream they land in.
+#: measured convention (see store.load_spaces docstring). It is the default
+#: for a stream with no gridded rows; otherwise the gridded stores' own
+#: stamping wins (:func:`grid_stamp`), so a start-stamped projection family
+#: composes without mixing conventions.
 STREAM_STAMP = {"movies_frames": "start", "movies_audio_frames": "center"}
+
+#: Family stems: ``movies_<family>_<suffix>``, the release-family group-table
+#: naming (``psytwill space release project``). Text lands at chunk grain
+#: there, so its stem says chunks.
+FAMILY_SUFFIXES = {"visual": "frames", "audio": "audio_frames",
+                   "text": "transcript_chunks"}
+_FAMILY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+#: Rows of a cross-block relation carry this modality; the model composes
+#: on the side its store holds (:func:`classify_store`).
+SHARED_MODALITY = "shared"
 
 MODALITY_ALIASES = {
     "visual": "visual", "image": "visual", "video": "visual",
@@ -259,6 +289,11 @@ def classify_store(path: str | Path, modality_map: Optional[dict[str, str]] = No
             modality = str(sub["modality"].dropna().iloc[0])
         if modality_map and str(model) in modality_map:
             modality = modality_map[str(model)]
+        if modality is not None and modality.lower() == SHARED_MODALITY:
+            rows.append({"model": str(model), "modality": SHARED_MODALITY,
+                         "grain": grain, "n_rows": int(len(sub)),
+                         "n_stimuli": int(sub["stimulus_id"].nunique())})
+            continue
         if modality is None or modality.lower() not in MODALITY_ALIASES:
             raise InputError(
                 f"'{p.name}' model {model!r} has no usable modality "
@@ -273,11 +308,31 @@ def classify_store(path: str | Path, modality_map: Optional[dict[str, str]] = No
         })
     if not rows:
         raise InputError(f"'{p.name}' has no models.")
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    shared = out["modality"] == SHARED_MODALITY
+    if shared.any():
+        sides = sorted(set(out.loc[~shared, "modality"]))
+        if len(sides) != 1:
+            names = sorted(out.loc[shared, "model"])
+            raise InputError(
+                f"'{p.name}': {names} carry modality 'shared', which takes "
+                "the modality of the other models in its store, but the "
+                f"store holds {sides or 'no other models'}; pass "
+                f"--modality-map {names[0]}=visual|audio|text."
+            )
+        out.loc[shared, "modality"] = sides[0]
+    return out
 
 
-def stream_for(modality: str, grain: str) -> str:
-    """Target stem for one (modality, grain), or a named refusal."""
+def stream_for(modality: str, grain: str, family: Optional[str] = None) -> str:
+    """Target stem for one (modality, grain), or a named refusal.
+
+    With ``family``, the stem is ``movies_<family>_<suffix>``
+    (:data:`FAMILY_SUFFIXES`); the grain rules are the same.
+    """
+    if family is not None:
+        stream_for(modality, grain)  # same refusals
+        return f"movies_{family}_{FAMILY_SUFFIXES[modality]}"
     if modality == "text":
         if grain == "gridded":
             raise InputError(
@@ -291,6 +346,26 @@ def stream_for(modality: str, grain: str) -> str:
     raise InputError(
         f"no composition rule for a {grain} {modality} model (beats-style "
         "grains are not composed yet); exclude it with --models."
+    )
+
+
+def grid_stamp(times: np.ndarray, window: float) -> Optional[str]:
+    """``'start'`` or ``'center'`` from where a gridded store's ``time``
+    values sit within their bins; None when there are none. Anything else
+    (an off-grid store) is refused rather than snapped."""
+    t = np.asarray(times, dtype=float)
+    t = t[np.isfinite(t)]
+    if not len(t):
+        return None
+    frac = np.round(np.mod(t / window, 1.0), 6) % 1.0
+    if np.all(np.isclose(frac, 0.0, atol=1e-6) | np.isclose(frac, 1.0, atol=1e-6)):
+        return "start"
+    if np.all(np.isclose(frac, 0.5, atol=1e-6)):
+        return "center"
+    raise InputError(
+        f"gridded rows sit neither on bin starts nor bin centers of a "
+        f"{window}s grid (e.g. time {t[~np.isclose(frac, 0.0) & ~np.isclose(frac, 0.5)][0]}); "
+        "re-aggregate on the grid, or pass the matching --window."
     )
 
 
@@ -489,9 +564,17 @@ def _finalize(frame: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(sort_cols, kind="stable").reset_index(drop=True)
 
 
-def read_comparability(path: str | Path) -> dict[str, dict[str, Optional[str]]]:
+def read_comparability(path: str | Path) -> dict[Any, dict[str, Optional[str]]]:
     """``model -> {comparable, note}`` from a TSV with columns
-    ``model, comparable[, note]``; labels must be in :data:`COMPARABILITY_LABELS`."""
+    ``model, comparable[, note]``; labels must be in :data:`COMPARABILITY_LABELS`.
+
+    An optional ``stream`` column labels a model per target stream — a
+    relation composed on two sides can differ by side. Such rows key as
+    ``(stream, model)``; a blank stream keys as the model alone, which
+    :func:`_label_for` uses for any stream without its own row. An empty
+    ``comparable`` cell is an explicit "no verdict" (null in the sidecar)
+    with a note saying why.
+    """
     p = Path(path)
     if not p.exists():
         raise InputError(f"comparability table not found: {p}")
@@ -501,17 +584,25 @@ def read_comparability(path: str | Path) -> dict[str, dict[str, Optional[str]]]:
         raise InputError(
             f"{p.name} lacks column(s) {sorted(missing)}; expected "
             "model, comparable[, note]")
-    bad = sorted(set(df["comparable"]) - set(COMPARABILITY_LABELS))
+    bad = sorted(set(df["comparable"]) - set(COMPARABILITY_LABELS) - {""})
     if bad:
         raise InputError(
             f"{p.name}: unknown comparable label(s) {bad}; use one of "
             f"{sorted(COMPARABILITY_LABELS)}")
-    dup = sorted(df.loc[df["model"].duplicated(), "model"])
+    stream = df["stream"] if "stream" in df.columns else pd.Series("", index=df.index)
+    keys = [m if not s else (s, m) for m, s in zip(df["model"], stream)]
+    dup = sorted({str(k) for k in pd.Series(keys)[pd.Series(keys).duplicated()]})
     if dup:
         raise InputError(f"{p.name}: model(s) listed twice: {dup}")
     note = df["note"] if "note" in df.columns else pd.Series("", index=df.index)
-    return {m: {"comparable": c, "note": n or None}
-            for m, c, n in zip(df["model"], df["comparable"], note)}
+    return {k: {"comparable": c or None, "note": n or None}
+            for k, c, n in zip(keys, df["comparable"], note)}
+
+
+def _label_for(comp: dict, stream: str, model: str) -> Optional[dict[str, Optional[str]]]:
+    """The comparability row for ``model`` in ``stream``: a stream-specific
+    row first, then the model-wide one; None when the table lists neither."""
+    return comp.get((stream, model)) or comp.get(model)
 
 
 def _signature(events: Sequence[Path], stores: Sequence[Path],
@@ -536,6 +627,44 @@ def _signature(events: Sequence[Path], stores: Sequence[Path],
     return sig
 
 
+def _summary_key(plan: dict[str, Any], plans: Sequence[dict[str, Any]]) -> str:
+    """The model name, or ``model@stream`` when the model composes into more
+    than one stream (a relation's two sides)."""
+    n = sum(1 for q in plans if q["model"] == plan["model"])
+    return plan["model"] if n == 1 else f"{plan['model']}@{plan['stream']}"
+
+
+def _stream_stamps(plans: Sequence[dict[str, Any]], window: float,
+                   ids: Sequence[str]) -> dict[str, str]:
+    """Grid stream -> stamp convention: the gridded stores' own (all must
+    agree), else the movie group tables' default. Transcript streams have no
+    grid and no entry. Reads ``time`` for the presented ``ids`` only."""
+    out: dict[str, str] = {}
+    for stem in sorted({p["stream"] for p in plans}):
+        stem_plans = [p for p in plans if p["stream"] == stem]
+        if all(p["modality"] == "text" for p in stem_plans):
+            continue
+        found: dict[str, str] = {}
+        for p in stem_plans:
+            if p["grain"] != "gridded":
+                continue
+            t = _pq(p["store"], ["time", "model"], ids=ids)
+            st = grid_stamp(t.loc[t["model"] == p["model"], "time"].to_numpy(), window)
+            if st is not None:
+                found[f"{p['store'].name}:{p['model']}"] = st
+        kinds = set(found.values())
+        if len(kinds) > 1:
+            raise InputError(
+                f"{stem}: gridded stores disagree on stamping ({found}); "
+                "compose them into separate runs or re-aggregate one.")
+        if kinds:
+            out[stem] = kinds.pop()
+        else:
+            modality = stem_plans[0]["modality"]
+            out[stem] = STREAM_STAMP[GRID_STREAMS[modality]]
+    return out
+
+
 def build_composed(
     events: Sequence[str | Path],
     stores: Sequence[str | Path],
@@ -550,6 +679,7 @@ def build_composed(
     sparse: bool = False,
     min_coverage: float = 0.5,
     comparability: Optional[str | Path] = None,
+    family: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -562,12 +692,17 @@ def build_composed(
     overrides). ``dry_run`` reports the plan without reading feature values
     or writing anything. ``comparability`` stamps per-model labels into the
     sidecars (see :func:`read_comparability`); models it does not list stay
-    ``null`` and are named in the summary.
+    ``null`` and are named in the summary. ``family`` names the stems
+    (module docstring) so a projection family composes beside the battery.
     """
     if window <= 0:
         raise InputError("--window must be positive seconds")
     if not 0 < min_coverage <= 1:
         raise InputError("--min-coverage must be in (0, 1]")
+    if family is not None and not _FAMILY_RE.match(family):
+        raise InputError(
+            f"--family {family!r}: use lowercase letters, digits and '_' "
+            "(it becomes part of the table stems)")
     comp_path = None if comparability is None else Path(comparability)
     comp = {} if comp_path is None else read_comparability(comp_path)
     out_root = Path(output_dir)
@@ -578,7 +713,7 @@ def build_composed(
 
     wanted = set(models) if models else None
     plans: list[dict[str, Any]] = []
-    seen_models: dict[str, str] = {}
+    seen_models: dict[tuple[str, str], str] = {}
     for spath in stores:
         spath = Path(spath)
         cls = classify_store(spath, modality_map)
@@ -586,25 +721,28 @@ def build_composed(
             cls = cls[cls["model"].isin(wanted)]
         checkpoints = store_checkpoints(spath)
         for r in cls.itertuples(index=False):
-            if r.model in seen_models:
+            stream = stream_for(r.modality, r.grain, family)
+            if (stream, r.model) in seen_models:
                 raise InputError(
                     f"model {r.model!r} appears in both "
-                    f"'{seen_models[r.model]}' and '{spath.name}'; composed "
-                    "keys would collide — drop one store or use --models."
+                    f"'{seen_models[(stream, r.model)]}' and '{spath.name}' "
+                    f"for {stream}; composed keys would collide — drop one "
+                    "store or use --models."
                 )
-            seen_models[r.model] = spath.name
+            seen_models[(stream, r.model)] = spath.name
             plans.append({
                 "store": spath, "model": r.model, "modality": r.modality,
-                "grain": r.grain, "stream": stream_for(r.modality, r.grain),
+                "grain": r.grain, "stream": stream,
                 "n_rows": r.n_rows, "n_stimuli": r.n_stimuli,
                 "checkpoint": checkpoints.get(r.model),
             })
     if wanted is not None:
-        missing = sorted(wanted - set(seen_models))
+        found = {m for _, m in seen_models}
+        missing = sorted(wanted - found)
         if missing:
             raise InputError(
                 f"--models {missing} not found in any given store; available: "
-                f"{sorted(seen_models)}"
+                f"{sorted(found)}"
             )
     if not plans:
         raise InputError("the given stores contribute no models")
@@ -615,6 +753,9 @@ def build_composed(
         "sparse": sparse, "models": sorted(wanted) if wanted else None,
         "modality_map": modality_map or None, "min_coverage": min_coverage,
     }
+    if family is not None:
+        # only when set, so pre-family composes keep their signatures
+        params["family"] = family
     signature = _signature([Path(p) for p in events], [Path(s) for s in stores],
                            None if registry_dir is None else Path(registry_dir),
                            params, comp_path)
@@ -624,13 +765,15 @@ def build_composed(
         "runs": {s: {"n_presentations": r["n_presentations"],
                      "run_end": r["run_end"]} for s, r in runs.items()},
         "streams": {},
-        "models": {p["model"]: {"stream": p["stream"], "grain": p["grain"],
-                                "store": p["store"].name} for p in plans},
+        "models": {_summary_key(p, plans): {
+            "stream": p["stream"], "grain": p["grain"], "store": p["store"].name}
+            for p in plans},
     }
     if comp_path is not None:
         summary["comparability"] = {
             "table": str(comp_path),
-            "unlabelled": sorted(p["model"] for p in plans if p["model"] not in comp),
+            "unlabelled": sorted(_summary_key(p, plans) for p in plans
+                                 if _label_for(comp, p["stream"], p["model"]) is None),
         }
 
     if dry_run:
@@ -670,6 +813,7 @@ def build_composed(
             return summary
 
     ids = sorted(pres["_sid"].unique())
+    stamps = _stream_stamps(plans, window, ids)
     matched_sids: set[str] = set()
     feat_dir.mkdir(parents=True, exist_ok=True)
 
@@ -688,8 +832,8 @@ def build_composed(
                     [p["model"] for p in spath_models if p["grain"] == grain])]
                 if not len(sub):
                     continue
-                if grain == "untimed" and stem in STREAM_STAMP:
-                    part = compose_untimed(pres, sub, window, STREAM_STAMP[stem],
+                if grain == "untimed" and stem in stamps:
+                    part = compose_untimed(pres, sub, window, stamps[stem],
                                            min_coverage)
                 elif grain == "gridded":
                     part = compose_gridded(pres, sub, window, min_coverage)
@@ -701,14 +845,14 @@ def build_composed(
         if not parts:
             continue
         frame = _finalize(pd.concat(parts, ignore_index=True))
-        if stem in STREAM_STAMP and not sparse:
-            frame = fill_grid(frame, runs, window, STREAM_STAMP[stem])
+        if stem in stamps and not sparse:
+            frame = fill_grid(frame, runs, window, stamps[stem])
             sort_cols = ["stimulus_id", "time", "model", "feature"]
             frame = frame.sort_values(sort_cols, kind="stable").reset_index(drop=True)
         out_path = expected[stem]
         frame.to_parquet(out_path, index=False)
         key_cols = (["stimulus_id", "time", "model", "feature"]
-                    if stem in STREAM_STAMP
+                    if stem in stamps
                     else ["stimulus_id", "chunk_idx", "word_idx", "model", "feature"])
         meta = {
             "schema_version": COMPOSE_SCHEMA_VERSION,
@@ -720,12 +864,12 @@ def build_composed(
             "time_semantics": (
                 "experimental time: presentation onsets as recorded in the "
                 f"events column {onset_column!r}, expanded onto a {window}s "
-                f"grid ({STREAM_STAMP.get(stem, 'word/chunk')} stamping); no "
+                f"grid ({stamps.get(stem, 'word/chunk')} stamping); no "
                 "HRF, no TR (Contract C)."
             ),
-            "grid": None if stem not in STREAM_STAMP else {
+            "grid": None if stem not in stamps else {
                 "window": window,
-                "stamp": STREAM_STAMP[stem],
+                "stamp": stamps[stem],
                 "fill": "sparse" if sparse else "full",
                 "min_coverage": min_coverage,
             },
@@ -750,8 +894,8 @@ def build_composed(
                     "checkpoint": p["checkpoint"],
                     "grain": p["grain"],
                     "source_store": str(p["store"].resolve()),
-                    "comparable": (comp.get(p["model"]) or {}).get("comparable"),
-                    "comparability_note": (comp.get(p["model"]) or {}).get("note"),
+                    "comparable": (_label_for(comp, stem, p["model"]) or {}).get("comparable"),
+                    "comparability_note": (_label_for(comp, stem, p["model"]) or {}).get("note"),
                 } for p in stem_plans
             },
             "comparability": {

@@ -210,6 +210,7 @@ def _run_compose(args: argparse.Namespace) -> None:
         sparse=args.sparse,
         min_coverage=args.min_coverage,
         comparability=args.comparability,
+        family=args.family,
         force=args.force,
         dry_run=args.dry_run,
     )
@@ -1338,7 +1339,14 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--comparability", metavar="TSV",
                     help="per-model render-falsifier verdicts (columns model, "
                     "comparable[, note]; labels item, item+offset, window, "
-                    "none) written into each sidecar's models.<m>.comparable")
+                    "none) written into each sidecar's models.<m>.comparable; "
+                    "an optional stream column labels a model per stream, "
+                    "an empty comparable cell is an explicit null")
+    cp.add_argument("--family", metavar="NAME",
+                    help="write movies_<NAME>_{frames,audio_frames,"
+                    "transcript_chunks} instead of the battery stems, so a "
+                    "projection family (e.g. psytwill_space) composes beside "
+                    "the battery tables in the same run root")
     cp.add_argument("--dry-run", action="store_true",
                     help="report the plan (runs, streams, models, row "
                     "estimates) without reading values or writing")

@@ -476,3 +476,156 @@ def test_missing_comparability_table_is_loud(img_events, visual_store, tmp_path)
     with pytest.raises(InputError, match="comparability table not found"):
         build_composed([img_events], [visual_store], tmp_path / "x", window=W,
                        comparability=tmp_path / "nope.tsv")
+
+
+# --------------------------------------------------------------------------
+# projection families: own stems, shared relations, store-driven stamps
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def family_stores(tmp_path):
+    """A projection family the way a release writes it: an image table with
+    a V block + the V side of a relation, a word table with an L block + the
+    L side, and a word-audio table stamped at bin STARTS."""
+    img, word, aud = [], [], []
+    for sid, v in (("imgA", 1.0), ("imgB", 2.0)):
+        img += [{"stimulus_id": sid, "model": "pv", "feature": "pv_000",
+                 "value": v, "modality": "visual", "extractor": "psytwill"},
+                {"stimulus_id": sid, "model": "pvl", "feature": "pvl_000",
+                 "value": 10 * v, "modality": "shared", "extractor": "psytwill"}]
+    for i, (sid, v) in enumerate((("cabin", 0.1), ("river", 0.2))):
+        word += [{"stimulus_id": sid, "chunk_idx": i, "model": "pl",
+                  "feature": "pl_000", "value": v, "modality": "text",
+                  "extractor": "psytwill"},
+                 {"stimulus_id": sid, "chunk_idx": i, "model": "pvl",
+                  "feature": "pvl_000", "value": -v, "modality": "shared",
+                  "extractor": "psytwill"}]
+        for t in (0.0, 0.5):
+            aud.append({"stimulus_id": sid, "time": t, "model": "pa",
+                        "feature": "pa_000", "value": v if t == 0.0 else None,
+                        "modality": "audio", "extractor": "psytwill"})
+    return (_store(tmp_path / "fam_img_features.parquet", img),
+            _store(tmp_path / "fam_word_features.parquet", word),
+            _store(tmp_path / "fam_aud_features.parquet", aud))
+
+
+def test_family_stems():
+    assert stream_for("visual", "untimed", "fam") == "movies_fam_frames"
+    assert stream_for("audio", "gridded", "fam") == "movies_fam_audio_frames"
+    assert stream_for("text", "chunked", "fam") == "movies_fam_transcript_chunks"
+    with pytest.raises(InputError, match="gridded text"):
+        stream_for("text", "gridded", "fam")
+
+
+def test_shared_modality_follows_its_store(family_stores):
+    img, word, _ = family_stores
+    assert classify_store(img).set_index("model")["modality"].to_dict() == {
+        "pv": "visual", "pvl": "visual"}
+    assert classify_store(word).set_index("model")["modality"].to_dict() == {
+        "pl": "text", "pvl": "text"}
+
+
+def test_shared_alone_needs_a_map(tmp_path):
+    p = _store(tmp_path / "rel_features.parquet", [
+        {"stimulus_id": "x", "model": "r", "feature": "r_0", "value": 1.0,
+         "modality": "shared"}])
+    with pytest.raises(InputError, match="--modality-map r="):
+        classify_store(p)
+
+
+def test_family_composes_beside_the_battery(events, visual_store, audio_store,
+                                            text_store, family_stores, tmp_path):
+    out = tmp_path / "run_root"
+    build_composed([events], [visual_store, audio_store, text_store], out, window=W)
+    feat = out / "features"
+    before = {p.name: p.stat().st_mtime_ns for p in feat.iterdir()}
+    summary = build_composed([events], list(family_stores), out, window=W,
+                             family="fam")
+    # the battery tables are untouched; three family tables are added
+    assert {p.name: p.stat().st_mtime_ns for p in feat.iterdir()
+            if p.name in before} == before
+    assert sorted(summary["streams"]) == [
+        "movies_fam_audio_frames", "movies_fam_frames",
+        "movies_fam_transcript_chunks"]
+    # the relation composes once per side, each into its side's stream
+    assert summary["models"]["pvl@movies_fam_frames"]["store"] == "fam_img_features.parquet"
+    assert summary["models"]["pvl@movies_fam_transcript_chunks"]["store"] == "fam_word_features.parquet"
+    assert summary["models"]["pv"]["stream"] == "movies_fam_frames"
+    fr = pd.read_parquet(feat / "movies_fam_frames_features.parquet")
+    a = fr[(fr["source_stimulus_id"] == "imgA") & (fr["model"] == "pvl")]
+    assert a["time"].tolist() == [9.0, 9.5, 10.0, 10.5, 11.0, 11.5]
+    assert (a["value"] == 10.0).all()
+    tx = pd.read_parquet(feat / "movies_fam_transcript_chunks_features.parquet")
+    vl = tx[tx["model"] == "pvl"].sort_values("onset")
+    assert vl["value"].tolist() == [-0.1, -0.2]
+    assert vl["chunk_idx"].tolist() == [0, 1]
+
+
+def test_family_signature_leaves_battery_params_alone(img_events, visual_store,
+                                                      tmp_path):
+    out = tmp_path / "sig_root"
+    build_composed([img_events], [visual_store], out, window=W)
+    meta = json.loads((out / "features" / "movies_frames_features.meta.json").read_text())
+    assert "family" not in meta["inputs_signature"]["params"]
+
+
+def test_grid_stamp_follows_a_start_stamped_store(events, family_stores, tmp_path):
+    out = tmp_path / "stamp_root"
+    build_composed([events], list(family_stores), out, window=W, family="fam")
+    aud = pd.read_parquet(out / "features" / "movies_fam_audio_frames_features.parquet")
+    # fill rows and items alike on bin starts: no 0.25 offsets mixed in
+    assert set(np.round((aud["time"] % W).unique(), 6)) == {0.0}
+    cabin = aud[aud["source_stimulus_id"] == "cabin"]
+    assert cabin["time"].tolist() == [9.0] and cabin["value"].tolist() == [0.1]
+    meta = json.loads((out / "features" / "movies_fam_audio_frames_features.meta.json").read_text())
+    assert meta["grid"]["stamp"] == "start"
+
+
+def test_grid_stamp_refuses_mixed_stores(events, audio_store, family_stores,
+                                         tmp_path):
+    _, _, fam_aud = family_stores
+    # same stream, one store on centers and one on starts
+    with pytest.raises(InputError, match="disagree on stamping"):
+        build_composed([events], [audio_store, fam_aud], tmp_path / "mix",
+                       window=W, models=["loudness", "pa"])
+
+
+def test_grid_stamp_refuses_off_grid():
+    from psytwill.compose import grid_stamp
+    assert grid_stamp(np.array([0.0, 0.5]), W) == "start"
+    assert grid_stamp(np.array([0.25, 0.75]), W) == "center"
+    assert grid_stamp(np.array([np.nan]), W) is None
+    with pytest.raises(InputError, match="neither on bin starts"):
+        grid_stamp(np.array([0.1]), W)
+
+
+def test_comparability_per_stream_and_explicit_null(events, family_stores,
+                                                    tmp_path):
+    tsv = tmp_path / "comp.tsv"
+    pd.DataFrame([
+        {"model": "pv", "stream": "", "comparable": "item", "note": "all item"},
+        {"model": "pvl", "stream": "movies_fam_frames", "comparable": "item",
+         "note": "V side"},
+        {"model": "pvl", "stream": "movies_fam_transcript_chunks",
+         "comparable": "", "note": "L side unmeasured"},
+        {"model": "pl", "stream": "", "comparable": "", "note": "unmeasured"},
+        {"model": "pa", "stream": "", "comparable": "window", "note": "w"},
+    ]).to_csv(tsv, sep="\t", index=False)
+    out = tmp_path / "comp_root"
+    summary = build_composed([events], list(family_stores), out, window=W,
+                             family="fam", comparability=tsv)
+    assert summary["comparability"]["unlabelled"] == []
+    feat = out / "features"
+    fr = json.loads((feat / "movies_fam_frames_features.meta.json").read_text())
+    tx = json.loads((feat / "movies_fam_transcript_chunks_features.meta.json").read_text())
+    assert fr["models"]["pvl"]["comparable"] == "item"
+    assert fr["models"]["pv"]["comparable"] == "item"
+    assert tx["models"]["pvl"]["comparable"] is None
+    assert tx["models"]["pvl"]["comparability_note"] == "L side unmeasured"
+    assert tx["models"]["pl"]["comparable"] is None
+
+
+def test_family_name_is_checked(img_events, visual_store, tmp_path):
+    with pytest.raises(InputError, match="--family"):
+        build_composed([img_events], [visual_store], tmp_path / "x",
+                       window=W, family="Bad-Name")
