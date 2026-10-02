@@ -1563,6 +1563,10 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("release", help="release .json")
     rv.set_defaults(func=_run_release_verify)
 
+    from psytwill.bench.cli import register as _register_bench
+
+    _register_bench(sub)
+
     return parser
 
 

@@ -33,3 +33,7 @@ class CorpusError(PsytwillError):
 
 class BatteryError(PsytwillError):
     """The clamped battery is inconsistent, or an input violates it."""
+
+
+class BenchError(PsytwillError):
+    """A benchmark task's inputs are inconsistent, too small, or overlap a fit."""
