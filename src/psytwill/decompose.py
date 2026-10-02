@@ -28,10 +28,11 @@ Method: **cross-validated CCA**.
 
 The same three conventions as :mod:`psytwill.compare` apply (aligned rows,
 grouped folds on temporal grids, block nulls to match, NaN rows dropped and
-counted). No fitted transform leaves this module: the decomposition is a
+counted). This module persists no fitted transform: the decomposition is a
 *measurement* on the stimuli it ran on. A reusable basis is a derived space
-and ships as a versioned checkpoint with fit provenance, from a fit corpus —
-that is :mod:`psytwill.fitcorpus` territory, deliberately not this.
+and ships as a versioned checkpoint with fit provenance, from a fit corpus.
+:func:`fit_cca` is the one fit both paths share; :mod:`psytwill.relate`
+freezes it between two fitted blocks, deliberately not this module.
 """
 
 from __future__ import annotations
@@ -116,6 +117,40 @@ def _fit_whitener(X: np.ndarray, rank_cap: int, rel_tol: float = 1e-8) -> _White
     return _Whitener(mean=mean, components=Vt[:r].T, scale=scale)
 
 
+@dataclass
+class CcaMap:
+    """One CCA fit: both whiteners and the paired canonical directions.
+
+    ``transform_a`` / ``transform_b`` give canonical variates (unit variance on
+    the fit rows; column j of one side correlates ``r[j]`` with column j of
+    the other there). This module only measures with it; persisting a map is
+    :mod:`psytwill.relate`'s job.
+    """
+
+    wa: _Whitener
+    wb: _Whitener
+    U: np.ndarray  # (rank_a, C) a-side directions in a's whitened coordinates
+    Vt: np.ndarray  # (C, rank_b) b-side directions, rows
+    r: np.ndarray  # (C,) singular values: in-sample canonical r x (n - 1) / n, unclipped
+    # (whiteners scale by the ddof=1 sd, the cross-covariance divides by n; the
+    # directions are unaffected, and cv_cca's r_train has always carried the factor)
+
+    def transform_a(self, X: np.ndarray, k: int | None = None) -> np.ndarray:
+        return self.wa.transform(X) @ self.U[:, :k]
+
+    def transform_b(self, Y: np.ndarray, k: int | None = None) -> np.ndarray:
+        return self.wb.transform(Y) @ self.Vt[:k].T
+
+
+def fit_cca(A: np.ndarray, B: np.ndarray, rank_cap: int) -> CcaMap:
+    """Whiten each side (PCA to ``rank_cap``) and SVD the cross-covariance."""
+    wa = _fit_whitener(A, rank_cap)
+    wb = _fit_whitener(B, rank_cap)
+    Za, Zb = wa.transform(A), wb.transform(B)
+    U, s, Vt = np.linalg.svd(Za.T @ Zb / len(A), full_matrices=False)
+    return CcaMap(wa=wa, wb=wb, U=U, Vt=Vt, r=s)
+
+
 def _colwise_corr(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """Pearson r between column i of A and column i of B, vectorized."""
     Ac = A - A.mean(axis=0, keepdims=True)
@@ -137,6 +172,19 @@ def shared_prefix(r_cv: np.ndarray, null_q: np.ndarray) -> int:
         else:
             break
     return m
+
+
+def cv_splits(n: int, groups: np.ndarray | None, n_splits: int, random_state: int) -> list:
+    """The folds :func:`cv_cca` uses: whole groups held out, else shuffled rows."""
+    if groups is not None:
+        n_groups = len(np.unique(groups))
+        if n_groups < 2:
+            raise SpaceError(
+                "'groups' has a single group, so no split holds a group out. "
+                "Drop groups, or decompose on a set spanning several clips."
+            )
+        return list(GroupKFold(n_splits=min(n_splits, n_groups)).split(np.zeros(n), groups=groups))
+    return list(KFold(n_splits=min(n_splits, n), shuffle=True, random_state=random_state).split(np.zeros(n)))
 
 
 @dataclass
@@ -193,20 +241,8 @@ def cv_cca(
     if n < 6:
         raise SpaceError(f"Need at least 6 usable rows; {n} survived NaN removal.")
 
-    if g is not None:
-        n_groups = len(np.unique(g))
-        if n_groups < 2:
-            raise SpaceError(
-                "'groups' has a single group, so no split holds a group out. "
-                "Drop groups, or decompose on a set spanning several clips."
-            )
-        n_splits_used = min(n_splits, n_groups)
-        splits = list(GroupKFold(n_splits=n_splits_used).split(A, B, groups=g))
-    else:
-        n_splits_used = min(n_splits, n)
-        splits = list(
-            KFold(n_splits=n_splits_used, shuffle=True, random_state=random_state).split(A)
-        )
+    splits = cv_splits(n, g, n_splits, random_state)
+    n_splits_used = len(splits)
 
     # Fit per fold; the component count is the smallest rank any fold reaches,
     # so every averaged component exists in every fold.
@@ -214,15 +250,10 @@ def cv_cca(
     ranks_x: list[int] = []
     ranks_y: list[int] = []
     for train, test in splits:
-        wx = _fit_whitener(A[train], rank_cap)
-        wy = _fit_whitener(B[train], rank_cap)
-        Za, Zb = wx.transform(A[train]), wy.transform(B[train])
-        U, s, Vt = np.linalg.svd(Za.T @ Zb / len(train), full_matrices=False)
-        Pa = wx.transform(A[test]) @ U
-        Pb = wy.transform(B[test]) @ Vt.T
-        per_fold.append((np.clip(s, 0.0, 1.0), Pa, Pb))
-        ranks_x.append(wx.rank)
-        ranks_y.append(wy.rank)
+        cm = fit_cca(A[train], B[train], rank_cap)
+        per_fold.append((np.clip(cm.r, 0.0, 1.0), cm.transform_a(A[test]), cm.transform_b(B[test])))
+        ranks_x.append(cm.wa.rank)
+        ranks_y.append(cm.wb.rank)
 
     C = min(min(len(s), Pa.shape[1], Pb.shape[1]) for s, Pa, Pb in per_fold)
     r_train = np.mean([s[:C] for s, _, _ in per_fold], axis=0)

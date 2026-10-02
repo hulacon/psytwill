@@ -857,6 +857,92 @@ def _run_space_check(args: argparse.Namespace) -> None:
         raise SpaceError("no member could be scored on this table")
 
 
+def _read_ids(path: str | None) -> set[str] | None:
+    if not path:
+        return None
+    return {line.strip() for line in Path(path).read_text().splitlines() if line.strip()}
+
+
+def _run_relate_fit(args: argparse.Namespace) -> None:
+    from psytwill.relate import read_scores, relate_tables, save_relation
+
+    a, b = read_scores(args.a), read_scores(args.b)
+    fit = relate_tables(a, b, name=args.name, join=args.join.split(","), pool_a=args.pool_a, pool_b=args.pool_b,
+                        exclude_ids=_read_ids(args.exclude_ids), exclude_ids_file=args.exclude_ids,
+                        groups_from_label=args.groups_from_label, scope=args.scope, n_splits=args.n_splits,
+                        n_perm=args.n_perm, block_size=args.block_size, r_min=args.r_min,
+                        rank_cap=args.rank_cap, random_state=args.seed)
+    npz, manifest = save_relation(fit, args.output, stem=args.stem)
+    m = fit.manifest
+    st = m["subspace_stability"]
+    print(f"psytwill space relate fit [{m['name']}: {a.block} <-> {b.block}] on {m['n_rows']} paired rows: "
+          f"k = {fit.k} (prefix at r >= {m['r_min']:.3f}; {m['count_r_ge_min']} components reach it)")
+    print(f"  held-out r: first {m['r_cv'][0]:.3f}, k-th {m['r_cv'][fit.k - 1]:.3f}, next {m['r_cv'][fit.k]:.3f}"
+          if fit.k < len(m['r_cv']) else f"  held-out r: first {m['r_cv'][0]:.3f}")
+    print(f"  subspace stability (fold vs full, mean sq. canonical r): a {st['a']['mean']:.3f} (min {st['a']['min']:.3f}), "
+          f"b {st['b']['mean']:.3f} (min {st['b']['min']:.3f})")
+    print(f"  {manifest}\n  {npz}")
+
+
+def _relate_pair(args: argparse.Namespace):
+    from psytwill.relate import load_relation, pair_tables, read_scores, require_side
+
+    fit = load_relation(args.relation)
+    a, b = read_scores(args.a), read_scores(args.b)
+    require_side(fit, a, "a")
+    require_side(fit, b, "b")
+    sides = fit.manifest["sides"]
+    idx, X, Y, _ = pair_tables(a, b, fit.manifest["join"], pool_a=sides["a"]["pool"], pool_b=sides["b"]["pool"],
+                               exclude_ids=_read_ids(args.exclude_ids))
+    return fit, X, Y
+
+
+def _run_relate_check(args: argparse.Namespace) -> None:
+    import pandas as pd
+
+    from psytwill.relate import check_relation
+
+    fit, X, Y = _relate_pair(args)
+    res = check_relation(fit, X, Y, n_perm=args.n_perm, block_size=args.block_size, random_state=args.seed)
+    rm = fit.manifest["r_min"]
+    print(f"psytwill space relate check [{fit.name}, k={fit.k}] on {res.n} paired rows: "
+          f"{res.count} of {fit.k} components at r >= {rm:.3f}, prefix {res.prefix} "
+          f"(fit: k = {fit.k}); first r {res.r[0]:.3f}, k-th {res.r[-1]:.3f}, null q99 max {res.null_q.max():.3f}")
+    if args.output:
+        cv = fit.manifest["r_cv"][: fit.k]
+        pd.DataFrame({"component": range(1, fit.k + 1), "r": res.r, "null_q": res.null_q,
+                      "r_fit_cv": cv}).to_csv(args.output, index=False)
+        print(f"  {args.output}")
+
+
+def _run_relate_project(args: argparse.Namespace) -> None:
+    import numpy as np
+
+    from psytwill.relate import load_relation, read_scores, require_side
+
+    fit = load_relation(args.relation)
+    t = read_scores(args.scores)
+    require_side(fit, t, args.side)
+    X = t.frame[t.columns].to_numpy(float)
+    ok = np.isfinite(X).all(axis=1)
+    P = fit.project(X[ok], args.side)
+    import pandas as pd
+
+    df = pd.DataFrame(P, columns=[f"{fit.name}_{j:03d}" for j in range(fit.k)])
+    for j, kname in enumerate(t.key):
+        df.insert(j, kname, t.frame.loc[ok, kname].to_numpy())
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out, index=False) if out.suffix == ".parquet" else df.to_csv(out, index=False)
+    from psytwill.relate import sha256_file
+
+    meta = {"relation": str(args.relation), "relation_sha256": sha256_file(args.relation), "name": fit.name,
+            "side": args.side, "block": t.block, "k": fit.k, "r": fit.manifest["r_insample"],
+            "scores": str(t.path), "key": ",".join(t.key), "rows": int(len(df)), "n_dropped_nan": int((~ok).sum())}
+    (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
+    print(f"psytwill space relate project [{fit.name} side {args.side} ({t.block}), k={fit.k}] -> {out}  ({len(df)} rows)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -1236,7 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "space",
-        help="Private-block fits (psytwill-space v0.1): fit | project | check",
+        help="Private-block fits and relations (psytwill-space): fit | project | check | relate",
     )
     spsub = sp.add_subparsers(dest="space_verb", required=True)
 
@@ -1302,6 +1388,50 @@ def build_parser() -> argparse.ArgumentParser:
     _space_criterion(ck)
     ck.add_argument("-o", "--output", help="per-member CSV")
     ck.set_defaults(func=_run_space_check)
+
+    rel = spsub.add_parser("relate", help="relations between fitted blocks: fit | check | project")
+    relsub = rel.add_subparsers(dest="relate_verb", required=True)
+
+    def _relate_pair_args(q: argparse.ArgumentParser) -> None:
+        q.add_argument("--a", required=True, help="side-a block score table (`space project` output)")
+        q.add_argument("--b", required=True, help="side-b block score table")
+        q.add_argument("--exclude-ids", help="file of stimulus_ids to drop (one per line), matched on the first join column")
+
+    rf = relsub.add_parser("fit", help="count the shared prefix by CV-CCA and freeze the top-k map")
+    _relate_pair_args(rf)
+    rf.add_argument("--name", required=True, help="relation name, e.g. VL")
+    rf.add_argument("--join", default="stimulus_id", help="comma-separated key columns the two tables pair on")
+    rf.add_argument("--pool-a", choices=["none", "mean"], default="none",
+                    help="how side a's rows pool when several share a join key (refused if needed and unset)")
+    rf.add_argument("--pool-b", choices=["none", "mean"], default="none", help="as --pool-a, for side b")
+    rf.add_argument("--groups-from-label", action="store_true",
+                    help="grouped folds keyed on the first join column (clip id)")
+    rf.add_argument("--n-splits", type=int, default=5)
+    rf.add_argument("--n-perm", type=int, default=250)
+    rf.add_argument("--block-size", type=int, help="block-permutation width for temporal grids")
+    rf.add_argument("--r-min", type=float, default=0.5 ** 0.5, help="held-out r a component must reach (default sqrt(.5))")
+    rf.add_argument("--rank-cap", type=int, help="PCA rank per side before CCA (default: the wider side + 16)")
+    rf.add_argument("--scope", help="free-text caveat recorded in the manifest (what the pairing does and does not cover)")
+    rf.add_argument("--seed", type=int, default=0)
+    rf.add_argument("-o", "--output", required=True, help="output directory")
+    rf.add_argument("--stem", help="file stem (default <name>_v1)")
+    rf.set_defaults(func=_run_relate_fit)
+
+    rc = relsub.add_parser("check", help="per-component r of a frozen relation on any paired tables")
+    _relate_pair_args(rc)
+    rc.add_argument("--relation", required=True, help="the relation's .json manifest")
+    rc.add_argument("--n-perm", type=int, default=200)
+    rc.add_argument("--block-size", type=int)
+    rc.add_argument("--seed", type=int, default=0)
+    rc.add_argument("-o", "--output", help="per-component CSV")
+    rc.set_defaults(func=_run_relate_check)
+
+    rp = relsub.add_parser("project", help="place one side's rows in the relation's shared coordinates")
+    rp.add_argument("--relation", required=True, help="the relation's .json manifest")
+    rp.add_argument("--side", required=True, choices=["a", "b"], help="which side the score table belongs to")
+    rp.add_argument("--scores", required=True, help="block score table (`space project` output)")
+    rp.add_argument("-o", "--output", required=True, help="variates table (.parquet or .csv)")
+    rp.set_defaults(func=_run_relate_project)
 
     return parser
 
