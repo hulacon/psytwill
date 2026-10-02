@@ -185,6 +185,13 @@ def _melt_input(
 
     long["model"] = long["feature"].map(models)
     long["modality"] = modality
+    if modality is None and meta:
+        # An extractor outside MODALITY_MAP may declare modality per model
+        # (psytwill's own release families: pspace_v visual, pspace_vl shared).
+        per_model = {n: e["modality"] for n, e in meta.get("models", {}).items()
+                     if isinstance(e, dict) and e.get("modality")}
+        if per_model:
+            long["modality"] = long["model"].map(per_model)
     long["extractor"] = extractor
     long["extractor_version"] = meta.get("extractor_version") if meta else None
     for col in ("value", "value_str"):

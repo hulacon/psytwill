@@ -964,6 +964,56 @@ def _run_release_verify(args: argparse.Namespace) -> None:
           f"{len(m['absent'])} absences; every pinned file matches")
 
 
+def _run_release_project(args: argparse.Namespace) -> None:
+    import time
+
+    import pandas as pd
+
+    from psytwill.release import load_release
+    from psytwill.release_project import parse_grain, project_grain, registry_id_map, write_family
+
+    t0 = time.time()
+    rel = load_release(args.release)
+    key_maps = {}
+    for spec in args.key_map or []:
+        table, sep, path = spec.partition("=")
+        if not sep:
+            raise SpaceError(f"--key-map {spec!r}: write it as TABLE=FILE")
+        key_maps[table] = path
+    grains = [parse_grain(g, key_maps) for g in args.grain]
+    stray = set(key_maps) - {g[0] for g in args.grain}
+    if stray:
+        raise SpaceError(f"--key-map for table(s) {sorted(stray)} that no --grain writes")
+    reg = Path(args.registry)
+    registry = pd.read_csv(reg, sep="\t" if reg.suffix in (".tsv", ".tab") else ",")
+    results = []
+    for g in grains:
+        if g.block not in rel.meta["blocks"]:
+            raise SpaceError(f"block {g.block!r} is not in {rel.label} (blocks: {sorted(rel.meta['blocks'])})")
+        entry = rel.meta["blocks"][g.block]
+        window = json.loads(Path(entry["manifest"]).read_text()).get("window") if "time" in g.key else None
+        ns = argparse.Namespace(features=g.features, key=",".join(g.key), window=window,
+                                exclude_ids=None, exclude_rows=None)
+        spaces, _, _, _ = _space_load(ns, members=list(entry["members"]))
+        src = sorted({lab.split("|")[0] for sp in spaces.values() for lab in sp.labels})
+        id_map = registry_id_map(registry, src, join=args.registry_join, pattern=args.id_pattern)
+        results.append(project_grain(rel, g, spaces, id_map))
+    side = write_family(rel, results, args.output, set_name=args.set, registry=reg, id_join=args.registry_join,
+                        id_pattern=args.id_pattern, runtime_sec=round(time.time() - t0, 1))
+    meta = json.loads(side.read_text())
+    print(f"psytwill space release project [{rel.label} -> {args.set}]")
+    for table, out in meta["output"].items():
+        ms = [f"{m} k={e['count']} ({e['tables'][table]['n_unplaced']} unplaced)" for m, e in meta["models"].items()
+              if table in e["tables"]]
+        print(f"  {table}: {out['rows']} rows; {', '.join(ms)}\n    {out['path']}")
+    for m, e in meta["models"].items():
+        for table, te in e["tables"].items():
+            print(f"  leak guard {m} [{table}]: {te['leak_guard']['rule']}")
+    if meta["input"]["archived_previous"]:
+        print(f"  previous release's family moved to {meta['input']['archived_previous']}")
+    print(f"  {side}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="psytwill",
@@ -1466,6 +1516,23 @@ def build_parser() -> argparse.ArgumentParser:
     rw.add_argument("--note", help="free-text note recorded in the release")
     rw.add_argument("-o", "--output", required=True, help="output directory (file: <name>_<version>.json)")
     rw.set_defaults(func=_run_release_write)
+    rpj = rlsub.add_parser("project", help="place a stimulus set in a release, written as a Contract B family")
+    rpj.add_argument("--release", required=True, help="release .json (loaded tamper-evident)")
+    rpj.add_argument("--set", required=True, help="stimulus set name, e.g. shared1000 (recorded in the sidecar)")
+    rpj.add_argument("--registry", required=True, help="the set's registry (.tsv/.csv with stimulus_id); the family must cover it")
+    rpj.add_argument("--registry-join", help="registry column external source ids map onto (e.g. nsdId)")
+    rpj.add_argument("--id-pattern", help="regex with one capture group read from each source id and compared to "
+                                          "--registry-join (e.g. 'ext-nsd-(\\d+)'; numbers compare as numbers)")
+    rpj.add_argument("--grain", nargs="+", action="append", required=True, metavar="ARG",
+                     help="TABLE BLOCK KEY FEATURES...: one table of the family (TABLE '-' = <stem>.csv, else a "
+                          "§4.1 suffix such as chunks), the release block placing it, its comma-separated key, "
+                          "and the `psytwill features` table(s) to read. Repeat per table. Every relation side "
+                          "on BLOCK is written into the same table")
+    rpj.add_argument("--key-map", action="append", metavar="TABLE=FILE",
+                     help="for a table whose sub-stimulus key the source numbers differently: a table of "
+                          "src_<key> and <key> columns, one to one")
+    rpj.add_argument("-o", "--output", required=True, help="family stem, e.g. <store>/shared1000/psytwill_space")
+    rpj.set_defaults(func=_run_release_project)
     rv = rlsub.add_parser("verify", help="check every file a release pins is unchanged")
     rv.add_argument("release", help="release .json")
     rv.set_defaults(func=_run_release_verify)

@@ -1,3 +1,3 @@
 """psytwill: chunk-by-chunk relational matrices from word2psy / viz2psy CSVs."""
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
