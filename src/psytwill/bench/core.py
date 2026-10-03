@@ -84,14 +84,16 @@ def stimulus_of(label: str) -> str:
     return label.split("|")[0]
 
 
-def prototypes(sm: SpaceMatrix) -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Collapse replicate rows (e.g. 5 captions per image) to one per stimulus.
+def prototypes(sm: SpaceMatrix, id_of=stimulus_of) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Collapse replicate rows (e.g. 5 captions per image) to one per item.
 
     Each row is unit-normalised before averaging, so a long caption with a
-    large-norm embedding does not dominate its image's prototype. Returns
+    large-norm embedding does not dominate its image's prototype. ``id_of``
+    maps a row label to its item: the stimulus by default; the whole label
+    when each row is already one item (a film segment). Returns
     (ids, prototypes, n_rows_per_id).
     """
-    ids = np.array([stimulus_of(lab) for lab in sm.labels])
+    ids = np.array([id_of(lab) for lab in sm.labels])
     uniq, inv, counts = np.unique(ids, return_inverse=True, return_counts=True)
     norms = np.linalg.norm(sm.X, axis=1, keepdims=True)
     Xn = sm.X / np.where(norms == 0, 1.0, norms)
@@ -99,6 +101,51 @@ def prototypes(sm: SpaceMatrix) -> tuple[list[str], np.ndarray, np.ndarray]:
     np.add.at(P, inv, Xn)
     P /= counts[:, None]
     return list(uniq), P, counts
+
+
+def pool_segments(sm: SpaceMatrix, segments: pd.DataFrame) -> tuple[SpaceMatrix, dict]:
+    """Mean-pool a time grid (labels ``stimulus|time``) into segments.
+
+    ``segments`` has ``stimulus_id, chunk_idx, onset, offset``; a grid row
+    belongs to a segment when ``onset <= time < offset``. The pooled row is
+    labelled ``stimulus|chunk_idx``, the label a chunk table keyed on
+    ``stimulus_id,chunk_idx`` gives the same segment, so the two sides join
+    by label. A segment that no grid row falls in stops the run: dropping it
+    would quietly change the candidate set its film is scored against.
+    Returns the pooled matrix and the number of grid rows per segment.
+    """
+    need = {"stimulus_id", "chunk_idx", "onset", "offset"}
+    missing = sorted(need - set(segments.columns))
+    if missing:
+        raise BenchError(f"segments table lacks column(s) {missing}")
+    seg = segments.astype({"stimulus_id": str}).reset_index(drop=True)
+    if seg.duplicated(["stimulus_id", "chunk_idx"]).any():
+        raise BenchError("segments table repeats a (stimulus_id, chunk_idx)")
+    if (seg["offset"] <= seg["onset"]).any():
+        raise BenchError(f"{int((seg['offset'] <= seg['onset']).sum())} segment(s) end at or before they start")
+    sid = np.array([stimulus_of(lab) for lab in sm.labels])
+    t = np.array([float(lab.split("|")[1]) for lab in sm.labels])
+    by_stim: dict[str, np.ndarray] = {}
+    for s in np.unique(sid):
+        by_stim[s] = np.where(sid == s)[0]
+    labels, rows, counts, empty = [], [], [], []
+    for r in seg.itertuples(index=False):
+        idx = by_stim.get(r.stimulus_id, np.array([], int))
+        hit = idx[(t[idx] >= r.onset) & (t[idx] < r.offset)]
+        lab = f"{r.stimulus_id}|{int(r.chunk_idx)}"
+        if hit.size == 0:
+            empty.append(lab)
+            continue
+        labels.append(lab)
+        rows.append(sm.X[hit].mean(0))
+        counts.append(hit.size)
+    if empty:
+        raise BenchError(f"{len(empty)} segment(s) contain no grid row of {sm.name!r} (e.g. {empty[:3]}); "
+                         "is the grid keyed on stimulus_id,time and loaded with the right window?")
+    pooled = SpaceMatrix(name=sm.name, labels=labels, X=np.vstack(rows), features=sm.features,
+                         modality=sm.modality, extractor=sm.extractor, n_replicates=sm.n_replicates)
+    return pooled, {"n_segments": len(labels), "grid_rows_per_segment_min": int(min(counts)),
+                    "grid_rows_per_segment_median": float(np.median(counts))}
 
 
 # ---------------------------------------------------------------------------

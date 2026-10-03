@@ -69,20 +69,37 @@ def _run_retrieval(args) -> None:
 
     drop = _ids(args.drop_ids)
     q, qn = _load(args.query_features, args.query_model, args.query_key, drop=drop)
-    t, tn = _load(args.target_features, args.target_model, args.target_key, drop=drop)
+    pooling = None
+    if args.target_segments:
+        from .core import pool_segments
+
+        if args.target_window is None:
+            raise BenchError("--target-segments pools a time grid; give its --target-window (seconds)")
+        t, tn = _load(args.target_features, args.target_model, "stimulus_id,time", window=args.target_window,
+                      drop=drop)
+        t, pooling = pool_segments(t, _read_table(args.target_segments))
+        print(f"  pooled {args.target_model} into {pooling['n_segments']} segments "
+              f"(min {pooling['grid_rows_per_segment_min']} grid rows each)", flush=True)
+    else:
+        t, tn = _load(args.target_features, args.target_model, args.target_key, drop=drop)
     guard = refuse_overlap({lab.split("|")[0] for lab in q.labels}, args.fit_ids, what="retrieval")
     items, summary = retrieval(q, t, mode=args.mode, metric=args.metric, n_splits=args.n_splits, seed=args.seed,
-                               n_boot=args.n_boot)
+                               n_boot=args.n_boot, within_stimulus=args.within_stimulus)
     summary["leak_guard"] = guard
+    if pooling:
+        summary["target_pooling"] = pooling
     params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": {"query": qn, "target": tn}}
-    side = write_run(args.output, "retrieval", args.tag, items, summary, params=params,
-                     inputs=[*args.query_features, *args.target_features])
+    inputs = [*args.query_features, *args.target_features, *([args.target_segments] if args.target_segments else [])]
+    side = write_run(args.output, "retrieval", args.tag, items, summary, params=params, inputs=inputs)
     print(f"psytwill bench retrieval [{args.tag}, {args.mode}]: {summary['n_items']} items")
     print(f"  {side}")
     for d in ("query_to_target", "target_to_query"):
         s = summary[d]["pct_beaten"]
         print(f"  {d}: pct_beaten {s['mean']:.4f} [{s['lo']:.4f}, {s['hi']:.4f}]; "
               f"top1 {summary[d]['top1']['mean']:.4f} of ~{summary[d]['n_candidates_mean']:.0f}")
+    s = summary["both_directions"]["pct_beaten"]
+    print(f"  both directions: pct_beaten {s['mean']:.4f} [{s['lo']:.4f}, {s['hi']:.4f}] "
+          f"(CI unit: {summary['ci_unit']}, n={s['n_units']})")
 
 
 def _run_oddoneout(args) -> None:
@@ -170,9 +187,47 @@ def _run_congruence(args) -> None:
         print(f"  {oc}: mean within-subject rho {s['mean_rho']:+.4f} [{s['lo']:+.4f}, {s['hi']:+.4f}]")
 
 
+def _run_compare(args) -> None:
+    import json
+
+    import pandas as pd
+
+    from . import compare as C
+    from .core import write_run
+
+    sides = [json.loads(Path(p).read_text()) for p in (args.a, args.b)]
+    task = sides[0]["task"]
+    if sides[1]["task"] != task:
+        raise BenchError(f"cannot compare a {task} run with a {sides[1]['task']} run")
+    C.check_params(task, sides[0]["params"], sides[1]["params"])
+    items = [pd.read_csv(Path(p).parent / s["items_file"]) for p, s in zip((args.a, args.b), sides)]
+    if task == "retrieval":
+        within = bool(sides[0]["params"].get("within_stimulus"))
+        joined, summary = C.compare_retrieval(*items, within_stimulus=within, n_boot=args.n_boot, seed=args.seed)
+        stats = ["pct_beaten", "top1"]
+    elif task == "oddoneout":
+        joined, summary = C.compare_oddoneout(*items, n_boot=args.n_boot, seed=args.seed)
+        stats = ["accuracy"]
+    else:
+        outcomes = (args.outcomes or sides[0]["params"]["outcomes"]).split(",")
+        joined, summary = C.compare_congruence(*items, outcomes, n_boot=args.n_boot, seed=args.seed)
+        stats = outcomes
+    summary |= {"task": task, "a": {"tag": sides[0]["tag"], "sidecar": str(Path(args.a).resolve())},
+                "b": {"tag": sides[1]["tag"], "sidecar": str(Path(args.b).resolve())}}
+    params = {k: v for k, v in vars(args).items() if k != "func"}
+    side = write_run(args.output, f"compare_{task}", args.tag, joined, summary, params=params, inputs=[args.a, args.b])
+    print(f"psytwill bench compare [{task}]: {sides[0]['tag']} - {sides[1]['tag']} on {summary['n_items']} items "
+          f"(CI unit: {summary['ci_unit']})")
+    print(f"  {side}")
+    for st in stats:
+        d = summary[st]["diff"]
+        print(f"  {st}: a {summary[st]['a']:.4f}, b {summary[st]['b']:.4f}, a - b {d['mean']:+.4f} "
+              f"[{d['lo']:+.4f}, {d['hi']:+.4f}] -> {summary[st]['verdict']}")
+
+
 def register(sub) -> None:
     b = sub.add_parser("bench", help="Score embeddings on benchmark tasks: retrieval | oddoneout | nextwindow | "
-                                     "congruence")
+                                     "congruence; compare two runs")
     bsub = b.add_subparsers(dest="bench_task", required=True)
 
     r = bsub.add_parser("retrieval", help="cross-modal identification between two keyed sets")
@@ -187,6 +242,13 @@ def register(sub) -> None:
     r.add_argument("--metric", choices=["correlation", "cosine"], default="correlation",
                    help="similarity after the map (zero-shot always uses cosine)")
     r.add_argument("--n-splits", type=int, default=5)
+    r.add_argument("--within-stimulus", action="store_true",
+                   help="items are parts of a stimulus (labels stimulus|chunk_idx): candidates are the other parts "
+                        "of the same stimulus, folds and CIs are grouped by stimulus")
+    r.add_argument("--target-segments",
+                   help="table of stimulus_id, chunk_idx, onset, offset: the target is a time grid, mean-pooled "
+                        "into these segments (needs --target-window)")
+    r.add_argument("--target-window", type=float, help="the target grid's bin width in seconds")
     _common(r)
     r.set_defaults(func=_run_retrieval)
 
@@ -231,3 +293,13 @@ def register(sub) -> None:
     c.add_argument("--n-splits", type=int, default=5)
     _common(c)
     c.set_defaults(func=_run_congruence)
+
+    k = bsub.add_parser("compare", help="paired difference between two runs of one task, with a win/loss/tie verdict")
+    k.add_argument("a", help="sidecar JSON of run a")
+    k.add_argument("b", help="sidecar JSON of run b; the difference is a - b")
+    k.add_argument("--outcomes", help="congruence: outcome columns to compare (default: run a's)")
+    k.add_argument("-o", "--output", required=True, help="output directory")
+    k.add_argument("--tag", required=True, help="run name in the output filenames, e.g. pspace_v-vs-pca")
+    k.add_argument("--seed", type=int, default=0)
+    k.add_argument("--n-boot", type=int, default=2000)
+    k.set_defaults(func=_run_compare)
