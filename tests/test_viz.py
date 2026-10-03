@@ -245,3 +245,94 @@ def test_registry_titles(features_dir, films_dir, tmp_path):
     p = M.film_payload("film-a", tables, films_dir, rows["film-a"])
     assert p["title"] == "Film A"
     assert p["duration"] == 120.0
+
+
+# ---------------------------------------------------------------------------
+# projection families (movies_<family>_<stream>): trajectories, never lanes
+# ---------------------------------------------------------------------------
+
+def _family_rows(stimulus_id, model, dims, n, *, time0=0.0, chunk0=None,
+                 modality="visual"):
+    out = []
+    for d in range(dims):
+        if chunk0 is None:
+            pts = [(time0 + i * 0.5, float((i + 1) * (d + 2) % 7)) for i in range(n)]
+            out += _rows(stimulus_id, model, f"{model}_{d:03d}", pts, modality=modality)
+        else:
+            pts = [(None, float((i + 1) * (d + 2) % 7)) for i in range(n)]
+            out += _rows(stimulus_id, model, f"{model}_{d:03d}", pts, modality=modality,
+                         chunk_idx=[chunk0 + i for i in range(n)])
+    return out
+
+
+@pytest.fixture
+def family_dir(features_dir):
+    """A `fam` family beside the battery: frames + audio start-stamped,
+    chunks on word2psy's global chunk numbering (film-a starts at 100)."""
+    pd.DataFrame(_family_rows("film-a", "fam_v", 3, 6), columns=COLUMNS).to_parquet(
+        features_dir / "movies_fam_frames_features.parquet")
+    pd.DataFrame(_family_rows("film-a", "fam_a", 3, 6, modality="audio"),
+                 columns=COLUMNS).to_parquet(
+        features_dir / "movies_fam_audio_frames_features.parquet")
+    pd.DataFrame(_family_rows("film-a", "fam_l", 3, 3, chunk0=100, modality="text"),
+                 columns=COLUMNS).to_parquet(
+        features_dir / "movies_fam_transcript_chunks_features.parquet")
+    # not a family stream: a caption corpus table stays unread
+    pd.DataFrame(_family_rows("film-a", "other", 3, 6), columns=COLUMNS).to_parquet(
+        features_dir / "movies_caption_chunks_features.parquet")
+    return features_dir
+
+
+@pytest.fixture
+def films_three_chunks(films_dir):
+    path = films_dir / "film-a" / "transcribe_transcript.csv"
+    path.write_text(path.read_text() + "film-a,2,2.00,3.00,again,0.9\n")
+    return films_dir
+
+
+def test_discover_families_skips_battery_and_non_streams(family_dir):
+    found = [(f, s) for f, s, _ in M.discover_families(family_dir)]
+    assert sorted(found) == [("fam", "audio_frames"), ("fam", "frames"),
+                             ("fam", "transcript_chunks")]
+
+
+def test_family_trajectories_stamp_and_chunk_alignment(family_dir, films_three_chunks):
+    media = {"film-a": M.film_media(films_three_chunks / "film-a")}
+    proj = {e["model"]: e for e in
+            M.compute_family_projections(family_dir, media)["film-a"]}
+    assert set(proj) == {"fam_v", "fam_a", "fam_l"}
+    assert all(e["family"] == "fam" and e["align"] == "times" for e in proj.values())
+    # battery frames stamp bin starts: the family's frames stay put
+    assert proj["fam_v"]["t"] == [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    assert proj["fam_v"]["m"] == "visual"
+    # battery audio stamps centers: the start-stamped family moves +window/2
+    assert proj["fam_a"]["t"] == [0.25, 0.75, 1.25, 1.75, 2.25, 2.75]
+    # chunks 100-102 rebase to the CSV's 0-2 and sit at their midpoints
+    assert proj["fam_l"]["t"] == [0.5, 1.4, 2.5]
+    assert proj["fam_l"]["m"] == "text"
+
+
+def test_family_tables_never_become_lanes(family_dir, films_three_chunks):
+    tables = M.load_tables(family_dir)
+    assert not any("fam" in stem for stem in tables)
+    p = M.film_payload("film-a", tables, films_three_chunks)
+    assert not any(s["model"].startswith("fam_") for s in p["series"])
+
+
+def test_build_bundle_ships_family_trajectories(family_dir, films_three_chunks, tmp_path):
+    out = tmp_path / "bundle"
+    build_movies_bundle(family_dir, films_three_chunks, out_dir=out,
+                        projections={"visual": "clip"})
+    body = json.loads(re.search(
+        r"= (\{.*\});", (out / "data" / "film-a.js").read_text(), re.S).group(1))
+    assert [e["model"] for e in body["proj"]] == ["clip", "fam_a", "fam_v", "fam_l"]
+    meta = json.loads((out / "viewer.meta.json").read_text())
+    assert meta["family_tables"] == ["movies_fam_audio_frames",
+                                     "movies_fam_frames",
+                                     "movies_fam_transcript_chunks"]
+
+    build_movies_bundle(family_dir, films_three_chunks, out_dir=out,
+                        projections={"visual": "clip"}, families=False)
+    body = json.loads(re.search(
+        r"= (\{.*\});", (out / "data" / "film-a.js").read_text(), re.S).group(1))
+    assert [e["model"] for e in body["proj"]] == ["clip"]

@@ -476,6 +476,7 @@ def _run_viz_movies(args: argparse.Namespace) -> None:
         registry=args.registry,
         slugs=args.slugs.split(",") if args.slugs else None,
         projections=parse_projection_spec(args.projections),
+        families=not args.no_families,
     )
     print(f"psytwill viz movies -> {page}")
 
@@ -1411,6 +1412,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-modality embedding model for the 2D MDS trajectories, "
         "e.g. 'visual=clip,audio=clap,text=fasttext' (the default); "
         "'none' disables them",
+    )
+    vm.add_argument(
+        "--no-families",
+        action="store_true",
+        help="skip the projection-family tables (movies_<family>_<stream>, "
+        "e.g. psytwill_space), whose models otherwise each get a trajectory",
     )
     vm.add_argument(
         "-o",

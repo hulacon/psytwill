@@ -16,6 +16,11 @@ Assembles, for each film, everything the timeline viewer renders:
   *text* is an identity column of the extractor CSVs and is not carried
   by the features table, so this is the one place the viewer reads
   beside it.
+- **projection-family trajectories** — every model in every
+  ``movies_<family>_{frames,audio_frames,transcript_chunks}`` table (e.g.
+  the ``psytwill_space`` block scores) becomes a 2D MDS trajectory, found
+  by file name alone; family rows are embeddings, so they never become
+  lanes. Their time stamps are put on the battery table's convention.
 - **media references** — the ``frames/`` screengrab times and the
   ``audio.m4a`` track, both relative paths resolved by the page.
 
@@ -69,6 +74,15 @@ PROJECTION_STEMS = {"visual": "movies_frames",
                     "audio": "movies_audio_frames",
                     "text": "movies_transcript_words"}
 PROJECTION_DEFAULTS = {"visual": "clip", "audio": "clap", "text": "fasttext"}
+
+#: projection-family stream suffix -> (payload modality, alignment grain).
+#: A family table is ``movies_<family>_<stream>_features.parquet`` (what
+#: `space release project` and `compose --family` write); every model in it
+#: is an embedding and becomes a trajectory, never a lane. Longest suffix
+#: first, so ``..._audio_frames`` is not read as family ``..._audio``.
+FAMILY_STREAMS = {"transcript_chunks": ("text", "chunk"),
+                  "audio_frames": ("audio", "time"),
+                  "frames": ("visual", "time")}
 
 
 def _round5(x: float) -> float:
@@ -258,6 +272,106 @@ def compute_projections(features_dir: Path, spec: dict[str, str],
                       f"({len(entry['xy'])} points)")
         del df
     return out
+
+
+def discover_families(features_dir: Path) -> list[tuple[str, str, Path]]:
+    """``(family, stream, path)`` for every projection-family table under
+    ``features_dir``; the battery stems in :data:`TABLES` are never one."""
+    out = []
+    for path in sorted(Path(features_dir).glob("movies_*_features.parquet")):
+        stem = path.name.removesuffix("_features.parquet")
+        if stem in TABLES:
+            continue
+        rest = stem.removeprefix("movies_")
+        for stream in FAMILY_STREAMS:
+            if rest.endswith("_" + stream) and len(rest) > len(stream) + 1:
+                out.append((rest[: -len(stream) - 1], stream, path))
+                break
+    return out
+
+
+def _stamp_shift(features_dir: Path, stream: str, times: np.ndarray) -> float:
+    """Seconds to add to a family table's ``time`` so it uses the battery
+    table's stamp for the same stream (bin start vs bin center).
+
+    The stores disagree (visual groups stamp starts, audio groups centers)
+    and a projection family stamps starts everywhere, so a family audio
+    point would sit a quarter second before the battery lane it belongs
+    beside. The battery table is the reference; without one, no shift.
+    """
+    import pyarrow.parquet as pq
+
+    from psytwill.compose import grid_stamp
+
+    t = np.unique(np.asarray(times, dtype=float))
+    t = t[np.isfinite(t)]
+    if t.size < 2:
+        return 0.0
+    window = float(np.min(np.diff(t)))
+    ref_path = Path(features_dir) / f"movies_{stream}_features.parquet"
+    if not ref_path.exists():
+        return 0.0
+    ref = pq.ParquetFile(ref_path).read_row_group(0, columns=["time"])["time"]
+    ref_stamp = grid_stamp(ref.to_numpy(zero_copy_only=False), window)
+    stamp = grid_stamp(t, window)
+    if ref_stamp is None or stamp is None or ref_stamp == stamp:
+        return 0.0
+    return window / 2 if ref_stamp == "center" else -window / 2
+
+
+def compute_family_projections(features_dir: Path,
+                               slug_media: dict[str, dict]) -> dict[str, list[dict]]:
+    """Per-film 2D MDS trajectories of every model in every projection
+    family table (e.g. ``psytwill_space``: ``pspace_v``, ``pspace_a``, ...).
+
+    Rows are the payload — no family is named here. Time-grid streams are
+    put on the battery's stamp; chunk-grain rows are placed at their
+    transcript chunk's midpoint (same global-index rebase as the battery's
+    chunk lanes), so every family trajectory is ``align="times"``.
+    """
+    features_dir = Path(features_dir)
+    out: dict[str, list[dict]] = {slug: [] for slug in slug_media}
+    for family, stream, path in discover_families(features_dir):
+        modality, grain = FAMILY_STREAMS[stream]
+        cols = ["stimulus_id", "time", "chunk_idx", "model", "feature", "value"]
+        df = pd.read_parquet(path, columns=cols,
+                             filters=[("stimulus_id", "in", list(slug_media))])
+        if df.empty:
+            continue
+        shift = _stamp_shift(features_dir, stream, df["time"]) if grain == "time" else 0.0
+        if shift:
+            df["time"] = df["time"] + shift
+        for model, mdf in df.groupby("model", sort=True):
+            for slug, sub in mdf.groupby("stimulus_id", sort=True):
+                if grain == "time":
+                    entry = _project_times(sub, modality, model)
+                else:
+                    entry = _project_chunks(sub, modality, model, slug_media[slug])
+                if entry is None:
+                    continue
+                entry["family"] = family
+                out[slug].append(entry)
+                print(f"{slug}: {family} {modality}/{model} trajectory "
+                      f"({len(entry['xy'])} points)")
+        del df
+    return out
+
+
+def _project_chunks(sub: pd.DataFrame, modality: str, model: str,
+                    media: dict) -> dict | None:
+    """Chunk-grain trajectory placed at each transcript chunk's midpoint."""
+    sub = sub.assign(chunk_idx=sub["chunk_idx"].astype(int)
+                     - int(sub["chunk_idx"].min()))
+    wide = sub.pivot_table(index="chunk_idx", columns="feature",
+                           values="value", sort=True).dropna()
+    mid = {c[2]: (c[0] + c[1]) / 2 for c in media["chunks"]}
+    wide = wide[[c in mid for c in wide.index]]
+    if len(wide) < 3:
+        return None
+    xy = _mds_2d(wide.to_numpy(dtype=float))
+    return {"m": modality, "model": model, "align": "times",
+            "t": [_round5(mid[c]) for c in wide.index],
+            "xy": [[_round5(x), _round5(y)] for x, y in xy]}
 
 
 def _project_times(sub: pd.DataFrame, modality: str, model: str) -> dict | None:

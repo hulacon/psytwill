@@ -39,11 +39,14 @@ def build_movies_bundle(features_dir: Path, films_dir: Path,
                         out_dir: Path | None = None,
                         registry: Path | None = None,
                         slugs: list[str] | None = None,
-                        projections: dict[str, str] | None = None) -> Path:
+                        projections: dict[str, str] | None = None,
+                        families: bool = True) -> Path:
     """Build the bundle; returns the path of the written page.
 
     ``projections`` maps modality -> embedding model for the per-film 2D
     trajectories (default ``movies.PROJECTION_DEFAULTS``; ``{}`` disables).
+    ``families`` adds a trajectory for every model of every projection-family
+    table found beside the battery tables (``movies.discover_families``).
     """
     features_dir = Path(features_dir)
     films_dir = Path(films_dir)
@@ -76,6 +79,11 @@ def build_movies_bundle(features_dir: Path, films_dir: Path,
     proj_by_slug = (movies_mod.compute_projections(features_dir, projections,
                                                    slug_media)
                     if projections else {})
+    family_tables = movies_mod.discover_families(features_dir) if families else []
+    if family_tables:
+        fam_by_slug = movies_mod.compute_family_projections(features_dir, slug_media)
+        for slug, entries in fam_by_slug.items():
+            proj_by_slug.setdefault(slug, []).extend(entries)
 
     data_dir = out_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +119,8 @@ def build_movies_bundle(features_dir: Path, films_dir: Path,
         "films_dir": str(films_dir),
         "n_films": len(index),
         "tables": sorted(tables),
+        "family_tables": sorted(p.name.removesuffix("_features.parquet")
+                                for _, _, p in family_tables),
     }
     (out_dir / "viewer.meta.json").write_text(
         json.dumps(meta, indent=2) + "\n", encoding="utf-8")
