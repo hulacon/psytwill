@@ -235,3 +235,24 @@ def test_partial_coverage_lists_what_is_missing(space, tmp_path):
     assert main(_argv(space, out, registry=reg) + ["--partial-coverage"]) == 0
     meta = json.loads((out.parent / "psytwill_space.meta.json").read_text())
     assert meta["input"]["grains"]["base"]["registry_uncovered"] == ["img9999"]
+
+
+def test_baseline_release_writes_its_own_model_prefix(space, tmp_path, capsys):
+    sp = space["sp"]
+    rels = tmp_path / "rel"
+    assert main(["space", "release", "write", "--name", "b0", "--version", "0.1.0", "--model-prefix", "b0",
+                 "--blocks", str(sp / "V_t.json"), str(sp / "L_t.json"),
+                 "--relations", str(sp / "rel" / "VL_t.json"), "-o", str(rels)]) == 0
+    assert json.loads((rels / "b0_0.1.0.json").read_text())["model_prefix"] == "b0"
+    out = tmp_path / "store" / "toy" / "b0"
+    argv = _argv(space, out)
+    argv[argv.index("--release") + 1] = str(rels / "b0_0.1.0.json")
+    assert main(argv) == 0
+    img = pd.read_csv(out.parent / "b0.csv")
+    assert any(c.startswith("b0_v_") for c in img.columns) and any(c.startswith("b0_vl_") for c in img.columns)
+    assert not any(c.startswith("pspace_") for c in img.columns)
+    meta = json.loads((out.parent / "b0.meta.json").read_text())
+    assert set(meta["models"]) == {"b0_v", "b0_vl", "b0_l"}
+    capsys.readouterr()
+    assert main(["space", "release", "write", "--name", "x", "--version", "0.1.0", "--model-prefix", "B-0",
+                 "--blocks", str(sp / "V_t.json"), "-o", str(rels)]) == 1

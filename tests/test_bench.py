@@ -19,7 +19,7 @@ from psytwill.bench import compare as C
 from psytwill.bench.congruence import congruence
 from psytwill.bench.core import bootstrap_mean, identify, pool_segments, refuse_overlap
 from psytwill.bench.nextwindow import next_window
-from psytwill.bench.oddoneout import oddoneout
+from psytwill.bench.oddoneout import noise_ceiling, oddoneout
 from psytwill.bench.retrieval import retrieval
 from psytwill.cli import main
 from psytwill.exceptions import BenchError
@@ -396,3 +396,14 @@ def test_cli_compare_oddoneout(tmp_path):
     side = json.loads((out / "compare_oddoneout__g-b.json").read_text())
     assert side["summary"]["accuracy"]["verdict"] == "win"
     assert side["summary"]["accuracy"]["diff"]["mean"] == pytest.approx(0.5)
+
+
+def test_noise_ceiling_is_modal_share_over_repeated_triplets():
+    rows = [("a", "b", "c", "c")] * 3 + [("b", "a", "c", "a")]  # one triplet, order varies: modal share 3/4
+    rows += [("d", "e", "f", "d"), ("f", "e", "d", "e")]  # second triplet: 1/2
+    rows += [("x", "y", "z", "z")]  # answered once: left out
+    s = noise_ceiling(pd.DataFrame(rows, columns=["item1", "item2", "item3", "odd"]), n_boot=100)
+    assert s["ceiling"]["mean"] == pytest.approx((0.75 + 0.5) / 2)
+    assert s["n_triplets_repeated"] == 2 and s["n_triplets_single"] == 1
+    with pytest.raises(BenchError, match="more than once"):
+        noise_ceiling(pd.DataFrame([("x", "y", "z", "z")], columns=["item1", "item2", "item3", "odd"]))

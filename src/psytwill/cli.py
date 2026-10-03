@@ -694,9 +694,62 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
     return spaces, members, len(ids), rep
 
 
+#: what `space fit --like` copies from a manifest; passing any of these as well is refused
+_LIKE_OWNED = ("features", "block", "members", "defer_members", "key", "window", "exclude_ids",
+               "exclude_rows", "k_schedule")
+
+
+def _apply_like(args: argparse.Namespace) -> dict:
+    """Fill a fit's settings from another fit's manifest, so a variant differs only where asked.
+
+    The inputs, rows, members, deferrals, folds, corpus handling and criterion
+    all come from the manifest; ``--member-scaling``, ``--fixed-k`` (default:
+    the manifest's k) and ``--no-criterion`` are the caller's. Returns the
+    provenance recorded in the new manifest.
+    """
+    import hashlib
+    import json
+
+    path = Path(args.like)
+    raw = path.read_bytes()
+    m = json.loads(raw)
+    # --key has a default, so only a non-default value counts as given
+    given = [k for k in _LIKE_OWNED if getattr(args, k, None) not in (None, False)
+             and not (k == "key" and args.key == "stimulus_id")]
+    if given:
+        raise SpaceError(f"--like {path.name} sets {', '.join('--' + g.replace('_', '-') for g in given)} "
+                         "from the manifest; drop them, or fit without --like")
+    crit = m["criterion"]
+    args.features = list(m["inputs"])
+    args.block = m["block"]
+    args.members = ",".join(m["members"])
+    args.defer_members = ",".join(m.get("deferred_members") or [])
+    args.key = m["key"]
+    args.window = m["window"]
+    args.exclude_ids = m.get("exclude_ids_file")
+    args.exclude_rows = m.get("exclude_rows_file")
+    args.n_splits = m["n_splits"]
+    args.groups_from_label = bool(m["grouped"])
+    args.per_corpus = crit.get("scope") == "per_corpus"
+    args.corpus_weights = (m.get("corpus_weights") or {}).get("scheme")
+    args.corpora_from_label = bool(args.per_corpus or args.corpus_weights)
+    for a, c in (("r2_min", "r2_min"), ("alpha", "alpha"), ("k_nn", "k_nn"), ("n_perm", "n_perm"),
+                 ("eval_n", "eval_n"), ("block_size", "block_size"), ("seed", "random_state")):
+        setattr(args, a, crit[c])
+    if args.fixed_k is None:
+        args.fixed_k = int(m["k"])
+    return {"manifest": str(path.resolve()), "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "block": m["block"], "k": m["k"], "member_scaling": m.get("member_scaling", "pr")}
+
+
 def _run_space_fit(args: argparse.Namespace) -> None:
     from psytwill.space import DEFAULT_K_SCHEDULE, SPACE_SCHEMA_VERSION, fit_block, save_fit
 
+    like = _apply_like(args) if args.like else None
+    if not args.features or not args.block:
+        raise SpaceError("space fit needs --features and --block (or --like MANIFEST)")
+    if args.no_criterion and args.fixed_k is None:
+        raise SpaceError("--no-criterion leaves nothing to choose k: give --fixed-k (or --like)")
     spaces, members, n_excl, rep = _space_load(args)
     groups = None
     corpora = None
@@ -745,7 +798,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     random_state=args.seed, progress=progress, per_corpus=args.per_corpus,
                     corpus_weights=args.corpus_weights,
                     on_row=on_row,
-                    defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()])
+                    defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
+                    member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion)
     for m in members:
         pm = fit.manifest["per_member"][m]
         if pm["masked_columns"]:
@@ -769,9 +823,11 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit.manifest["exclude_ids_file"] = args.exclude_ids
     fit.manifest["exclude_rows_file"] = args.exclude_rows
     fit.manifest["n_excluded_rows"] = dict(rep.excluded_rows)
+    fit.manifest["like"] = like
     npz, manifest, curve = save_fit(fit, args.output, stem=args.stem)
     partial.unlink(missing_ok=True)
-    verdict = "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member"
+    verdict = ("criterion not scored" if fit.manifest["subsumes_all_members"] is None else
+               "SUBSUMES all members" if fit.manifest["subsumes_all_members"] else "does NOT subsume every member")
     failing = [m for m in fit.manifest["deferred_members"]
                if fit.manifest["per_member"][m]["passed_all_folds"] is not True]
     if fit.manifest["subsumes_non_deferred"] and failing:
@@ -874,7 +930,7 @@ def _run_relate_fit(args: argparse.Namespace) -> None:
                         exclude_ids=_read_ids(args.exclude_ids), exclude_ids_file=args.exclude_ids,
                         groups_from_label=args.groups_from_label, scope=args.scope, n_splits=args.n_splits,
                         n_perm=args.n_perm, block_size=args.block_size, r_min=args.r_min,
-                        rank_cap=args.rank_cap, random_state=args.seed)
+                        rank_cap=args.rank_cap, random_state=args.seed, fixed_k=args.fixed_k)
     npz, manifest = save_relation(fit, args.output, stem=args.stem)
     m = fit.manifest
     st = m["subspace_stability"]
@@ -950,7 +1006,8 @@ def _run_release_write(args: argparse.Namespace) -> None:
     from psytwill.release import build_release, parse_absent, write_release
 
     rel = build_release(name=args.name, version=args.version, blocks=args.blocks, relations=args.relations or [],
-                        absent=[parse_absent(a) for a in (args.absent or [])], note=args.note)
+                        absent=[parse_absent(a) for a in (args.absent or [])], note=args.note,
+                        model_prefix=args.model_prefix)
     path = write_release(rel, args.output)
     b = ", ".join(f"{n} k={e['k']}" for n, e in rel["blocks"].items())
     r = ", ".join(f"{n} ({e['a']}<->{e['b']}) k={e['k']}" for n, e in rel["relations"].items()) or "none"
@@ -1432,8 +1489,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     spsub = sp.add_subparsers(dest="space_verb", required=True)
 
-    def _space_common(q: argparse.ArgumentParser) -> None:
-        q.add_argument("--features", nargs="+", required=True, help="`psytwill features` table(s)")
+    def _space_common(q: argparse.ArgumentParser, features_required: bool = True) -> None:
+        q.add_argument("--features", nargs="+", required=features_required, help="`psytwill features` table(s)")
         q.add_argument("--key", default="stimulus_id", help="row grain, comma-separated (default stimulus_id)")
         q.add_argument("--window", type=float, help="bin `time` at this width (needs time in --key)")
         q.add_argument("--exclude-ids", help="file of stimulus_ids to drop (one per line)")
@@ -1454,8 +1511,9 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("--seed", type=int, default=0)
 
     f = spsub.add_parser("fit", help="fit one private block and freeze it")
-    _space_common(f)
-    f.add_argument("--block", required=True, help="V | A | L (battery modality) or a custom name with --members")
+    _space_common(f, features_required=False)
+    f.add_argument("--block", help="V | A | L (battery modality) or a custom name with --members (required "
+                                   "unless --like)")
     f.add_argument("--members", help="comma-separated member spaces (default: the block's battery members present)")
     f.add_argument("--k-schedule", help="comma-separated k candidates (default 8,16,...,256 below the PR bound)")
     f.add_argument("--n-splits", type=int, default=5)
@@ -1478,6 +1536,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "equally in the member whiteners and the block covariance; the criterion "
                         "is not weighted. For a mix whose corpora differ in size")
     _space_criterion(f)
+    f.add_argument("--member-scaling", choices=["pr", "zscore"], default="pr",
+                   help="pr: whiten each member to its participation ratio (psytwill-space); zscore: "
+                        "z-score only, so members weigh by width (the structure-free baseline)")
+    f.add_argument("--fixed-k", type=int,
+                   help="freeze at this k instead of walking the schedule; the criterion, when scored, "
+                        "is a diagnostic at k")
+    f.add_argument("--no-criterion", action="store_true",
+                   help="skip the criterion (needs --fixed-k or --like): fit the map on all rows only")
+    f.add_argument("--like", metavar="MANIFEST",
+                   help="copy inputs, rows, members, folds, corpus handling, criterion and k from this "
+                        "fit's manifest; only --member-scaling / --fixed-k / --no-criterion may differ")
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
     f.set_defaults(func=_run_space_fit)
@@ -1506,6 +1575,9 @@ def build_parser() -> argparse.ArgumentParser:
     rf = relsub.add_parser("fit", help="count the shared prefix by CV-CCA and freeze the top-k map")
     _relate_pair_args(rf)
     rf.add_argument("--name", required=True, help="relation name, e.g. VL")
+    rf.add_argument("--fixed-k", type=int,
+                    help="freeze at this k (a baseline matched to another relation's k); the prefix count "
+                         "is still measured and recorded")
     rf.add_argument("--join", default="stimulus_id", help="comma-separated key columns the two tables pair on")
     rf.add_argument("--pool-a", choices=["none", "mean"], default="none",
                     help="how side a's rows pool when several share a join key (refused if needed and unset)")
@@ -1549,6 +1621,9 @@ def build_parser() -> argparse.ArgumentParser:
     rw.add_argument("--absent", nargs="+", metavar="'X,Y: evidence'",
                     help="pairs measured to share nothing (k = 0), each with where the measurement is recorded")
     rw.add_argument("--note", help="free-text note recorded in the release")
+    rw.add_argument("--model-prefix", default="pspace",
+                    help="store model names a projection writes, <prefix>_<block> (default pspace); a "
+                         "baseline release takes its own, e.g. b0")
     rw.add_argument("-o", "--output", required=True, help="output directory (file: <name>_<version>.json)")
     rw.set_defaults(func=_run_release_write)
     rpj = rlsub.add_parser("project", help="place a stimulus set in a release, written as a Contract B family")

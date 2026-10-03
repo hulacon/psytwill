@@ -132,7 +132,11 @@ def split_members(models: Sequence[str]) -> list[str]:
 # 1.11: `min_support` and `per_member[m]["low_support_columns"]` (columns
 # dropped before whitening because too few fit rows leave their most common
 # value; see MIN_SUPPORT).
-SPACE_SCHEMA_VERSION = "1.11"
+# 1.12: `member_scaling` ("pr" | "zscore"), `fixed_k`, `criterion_scored` and
+# `like` (the manifest a variant copied its settings from). Absent = "pr",
+# walked k, scored, no source. With `criterion_scored` false the subsumption
+# fields are null, not false.
+SPACE_SCHEMA_VERSION = "1.12"
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
 #: placed by the fold map that did not see it (see :func:`fit_block`).
@@ -191,10 +195,19 @@ class SpaceWhitener:
         return out
 
 
+#: How each member is scaled before the block PCA. ``pr`` (psytwill-space):
+#: z-score, then PCA-whiten to ceil(PR) unit-variance directions, so every
+#: member weighs about its participation ratio whatever its width. ``zscore``:
+#: z-score only, so a member weighs by its column count and correlations --
+#: the structure-free baseline the benchmark panel compares against (B0).
+MEMBER_SCALINGS = ("pr", "zscore")
+
+
 def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
                  rel_tol: float = 1e-8,
                  structural_fill: dict | None = None,
-                 weights: np.ndarray | None = None) -> SpaceWhitener:
+                 weights: np.ndarray | None = None,
+                 scaling: str = "pr") -> SpaceWhitener:
     """Fit a whitener on ``X`` (training rows of ``space``).
 
     ``rank`` defaults to ``ceil(participation_ratio)`` of the training rows,
@@ -239,6 +252,14 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
     n_ok = int(keep.sum())
     if n_ok == 0:
         raise SpaceError(f"'{space.name}' is constant on the training rows; nothing to whiten.")
+    if scaling == "zscore":
+        # identity map on the z-scored columns: no rotation, no rescaling
+        dim = Z.shape[1]
+        return SpaceWhitener(name=space.name, features=list(space.features), mean=mean, std=std,
+                             components=np.eye(dim), scales=np.ones(dim), participation_ratio=pr,
+                             structural_fill=dict(structural_fill or {}))
+    if scaling != "pr":
+        raise SpaceError(f"unknown member scaling {scaling!r}; use one of {MEMBER_SCALINGS}")
     r = min(n_ok, int(math.ceil(pr))) if rank is None else min(int(rank), n_ok)
     r = max(1, r)
     return SpaceWhitener(
@@ -390,7 +411,8 @@ def _pairwise_block_pca(W: np.ndarray, rel_tol: float = 1e-10, weights: np.ndarr
 
 
 def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: np.ndarray,
-                  *, k_max: int | None = None, weights: np.ndarray | None = None) -> BlockMap:
+                  *, k_max: int | None = None, weights: np.ndarray | None = None,
+                  member_scaling: str = "pr") -> BlockMap:
     """Whiteners and block PCA on ``rows``; ``weights`` (one per entry of
     ``rows``) weight both, see :func:`fit_whitener`."""
     rows = np.asarray(rows)
@@ -403,7 +425,8 @@ def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: 
         X = np.asarray(spaces[m].X, dtype=float)[rows]
         ok = ~np.isnan(X).any(axis=1)
         whiteners[m] = fit_whitener(spaces[m], X[ok],
-                                    weights=None if weights is None else weights[ok])
+                                    weights=None if weights is None else weights[ok],
+                                    scaling=member_scaling)
     parts = [whiteners[m].transform(spaces[m].X[rows]) for m in members]
     W = np.concatenate(parts, axis=1)
     w = None if weights is None else _normalized_weights(weights, W.shape[0])
@@ -1033,6 +1056,9 @@ def fit_block(
     min_support: int = MIN_SUPPORT,
     progress=None,
     on_row=None,
+    member_scaling: str = "pr",
+    fixed_k: int | None = None,
+    score: bool = True,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
@@ -1086,6 +1112,10 @@ def fit_block(
     as some corpus scores it; a non-deferred member no corpus can score
     blocks k. The pooled folds are scored as before.
     """
+    if member_scaling not in MEMBER_SCALINGS:
+        raise SpaceError(f"unknown member scaling {member_scaling!r}; use one of {MEMBER_SCALINGS}")
+    if not score and fixed_k is None:
+        raise SpaceError("without the criterion nothing can choose k: give fixed_k")
     _check_perm_floor(n_perm, alpha)
     _check_eval_blocks(eval_n, block_size)
     members = list(members)
@@ -1219,13 +1249,20 @@ def fit_block(
     def _weights(rows):
         return None if corp_all is None else corpus_row_weights(corp_all[rows], corpus_weights)
 
-    fold_maps = [fit_block_map(aligned, members, train, weights=_weights(train))
-                 for train, _ in folds]
-    k_top = min(fm.k_max for fm in fold_maps)
-    schedule = sorted({int(k) for k in k_schedule if 1 <= int(k) < k_top} | {k_top})
+    fold_maps = ([fit_block_map(aligned, members, train, weights=_weights(train), member_scaling=member_scaling)
+                  for train, _ in folds] if score else [])
+    k_top = min(fm.k_max for fm in fold_maps) if score else None
+    if fixed_k is not None:
+        # k is given (a baseline matched to another fit's k): the criterion,
+        # when scored, is a diagnostic at that k and does not move it
+        if score and int(fixed_k) > k_top:
+            raise SpaceError(f"fixed k {fixed_k} exceeds the concatenation's rank {k_top}")
+        schedule = [int(fixed_k)] if score else []
+    else:
+        schedule = sorted({int(k) for k in k_schedule if 1 <= int(k) < k_top} | {k_top})
     curve: list[dict] = []
     chosen: int | None = None
-    fold_concat = [fold_maps[i].concat(aligned, test) for i, (_, test) in enumerate(folds)]
+    fold_concat = [fm.concat(aligned, test) for fm, (_, test) in zip(fold_maps, folds)]
     masked = [bool(np.isnan(W).any()) for W in fold_concat]
     # a complete concatenation scores once at full k and is sliced (0.20.0);
     # with an absent member the least-squares placement depends on k
@@ -1235,7 +1272,7 @@ def fit_block(
     # aligned to fold 0's frame on the rows both trained on
     frames = ([None] + [_fold_frame(fold_maps[i], fold_maps[0], aligned,
                                     np.intersect1d(folds[0][0], folds[i][0]), k_top)
-                        for i in range(1, len(folds))]) if per_corpus else []
+                        for i in range(1, len(folds))]) if per_corpus and score else []
     frame_r2: dict[int, list[float]] = {}
     n_steps = len(schedule) * (len(folds) + int(per_corpus)) * len(members)
     step = 0
@@ -1307,14 +1344,17 @@ def fit_block(
         if all_pass:
             chosen = k
             break
-    if chosen is None:
+    if fixed_k is not None:
+        subsumed = (chosen is not None) if score else None
+        chosen = int(fixed_k)
+    elif chosen is None:
         chosen = schedule[-1]
         subsumed = False
     else:
         subsumed = True
 
     final = fit_block_map(aligned, members, np.arange(n), k_max=chosen,
-                          weights=_weights(np.arange(n)))
+                          weights=_weights(np.arange(n)), member_scaling=member_scaling)
     for m in members:
         final.whiteners[m].undefinable = sorted(
             f for f in final.whiteners[m].features if kinds[m].get(f) == "undefinable")
@@ -1358,8 +1398,8 @@ def fit_block(
             "r2_per_fold": [r["r2"] for r in rows],
             "overlap_per_fold": [r["overlap"] for r in rows],
             "overlap_p_per_fold": [r["overlap_p"] for r in rows],
-            # None: every deciding row was unscoreable, so there is no verdict
-            "passed_all_folds": (all(r["passed"] for r in scored) if scored
+            # None: every deciding row was unscoreable, or the criterion was not scored
+            "passed_all_folds": (None if not score else all(r["passed"] for r in scored) if scored
                                  else None if deciding else False),
         }
         if per_corpus:
@@ -1377,8 +1417,11 @@ def fit_block(
         "k": chosen,
         # never true while a deferred member fails at k: deferring changes
         # which members choose k, not what the block is claimed to cover
-        "subsumes_all_members": subsumed and all(per_member[m]["passed_all_folds"] is True
-                                                 for m in defer),
+        "subsumes_all_members": (None if subsumed is None else
+                                 subsumed and all(per_member[m]["passed_all_folds"] is True for m in defer)),
+        "member_scaling": member_scaling,
+        "fixed_k": None if fixed_k is None else int(fixed_k),
+        "criterion_scored": bool(score),
         "deferred_members": defer,
         "subsumes_non_deferred": subsumed,
         "pr_sum_bound": pr_sum,
@@ -1394,7 +1437,7 @@ def fit_block(
         "n_raw_columns": int(sum(aligned[m].dim for m in members)),
         # the fold maps' full rank (the walk's top), not the final map's k_max,
         # which is truncated to k; before 1.5 this field always equalled k
-        "concat_rank": int(k_top),
+        "concat_rank": None if k_top is None else int(k_top),
         "n_rows": n,
         # how rows were weighted in the whiteners and the block covariance
         # (None = every row counts once); the criterion is never weighted

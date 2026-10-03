@@ -187,6 +187,29 @@ def _run_congruence(args) -> None:
         print(f"  {oc}: mean within-subject rho {s['mean_rho']:+.4f} [{s['lo']:+.4f}, {s['hi']:+.4f}]")
 
 
+def _run_ceiling(args) -> None:
+    import pandas as pd
+
+    from .core import write_run
+    from .oddoneout import noise_ceiling
+
+    tri = pd.concat([_read_table(p) for p in args.triplets], ignore_index=True)
+    n_all = len(tri)
+    if args.only_ids:
+        keep = _ids(args.only_ids)
+        tri = tri[tri["item1"].astype(str).isin(keep) & tri["item2"].astype(str).isin(keep)
+                  & tri["item3"].astype(str).isin(keep)]
+    s = noise_ceiling(tri, n_boot=args.n_boot, seed=args.seed)
+    s["n_answers_before_only_ids"] = n_all
+    params = {k: v for k, v in vars(args).items() if k != "func"}
+    side = write_run(args.output, "ceiling", args.tag, tri, s, params=params, inputs=args.triplets)
+    c = s["ceiling"]
+    print(f"psytwill bench ceiling [{args.tag}]: {c['mean']:.4f} [{c['lo']:.4f}, {c['hi']:.4f}] over "
+          f"{s['n_triplets_repeated']} repeated triplets (median {s['answers_per_triplet_median']:.0f} answers each; "
+          f"{s['n_triplets_single']} answered once, left out)")
+    print(f"  {side}")
+
+
 def _run_compare(args) -> None:
     import json
 
@@ -293,6 +316,17 @@ def register(sub) -> None:
     c.add_argument("--n-splits", type=int, default=5)
     _common(c)
     c.set_defaults(func=_run_congruence)
+
+    e = bsub.add_parser("ceiling", help="odd-one-out noise ceiling from repeated triplets")
+    e.add_argument("--triplets", nargs="+", required=True,
+                   help="table(s) of item1, item2, item3, odd; tables are pooled, so a triplet's repeats may sit "
+                        "in different files (a test set and its repeat)")
+    e.add_argument("--only-ids", help="id file: use only triplets whose three items are all in it")
+    e.add_argument("-o", "--output", required=True, help="output directory")
+    e.add_argument("--tag", required=True)
+    e.add_argument("--seed", type=int, default=0)
+    e.add_argument("--n-boot", type=int, default=2000)
+    e.set_defaults(func=_run_ceiling)
 
     k = bsub.add_parser("compare", help="paired difference between two runs of one task, with a win/loss/tie verdict")
     k.add_argument("a", help="sidecar JSON of run a")

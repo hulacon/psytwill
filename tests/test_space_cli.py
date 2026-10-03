@@ -252,7 +252,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.11"
+    assert manifest["space_schema_version"] == "1.12"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
@@ -329,3 +329,31 @@ def test_partial_curve_is_removed_after_the_save(two_corpora, tmp_path):
     assert main(argv) == 0
     assert (out / "T_ok_curve.csv").exists()
     assert not (out / "T_ok_curve.partial.csv").exists()
+
+
+def test_like_reproduces_the_fit_and_varies_only_the_scaling(two_corpora, tmp_path, capsys):
+    out = tmp_path / "space"
+    base = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "--corpora-from-label", "--per-corpus",
+            "-o", str(out), "--stem", "P", *FIT_ARGS]
+    assert main(base) == 0
+    p = json.loads((out / "P.json").read_text())
+    # same settings, default scaling, no criterion: the map is the source fit's, bit for bit
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--no-criterion", "-o", str(out),
+                 "--stem", "P_again"]) == 0
+    again = json.loads((out / "P_again.json").read_text())
+    assert again["k"] == p["k"] and again["inputs"] == p["inputs"] and again["n_rows"] == p["n_rows"]
+    assert again["criterion"]["scope"] == "per_corpus" and again["grouped"] is True
+    assert again["like"]["k"] == p["k"] and len(again["like"]["manifest_sha256"]) == 64
+    a, b = np.load(out / "P.npz"), np.load(out / "P_again.npz")
+    np.testing.assert_allclose(a["block_components"], b["block_components"], atol=1e-10)
+    # the baseline: z-scored members, same everything else
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--member-scaling", "zscore",
+                 "--no-criterion", "-o", str(out), "--stem", "B0"]) == 0
+    b0 = json.loads((out / "B0.json").read_text())
+    assert b0["member_scaling"] == "zscore" and b0["k"] == p["k"] and b0["fixed_k"] == p["k"]
+    assert all(b0["per_member"][m]["whitened_rank"] == b0["per_member"][m]["dim"] for m in ("a", "b"))
+    # --like owns the inputs
+    capsys.readouterr()
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--block", "X", "-o", str(out)]) == 1
+    assert "--block" in capsys.readouterr().err

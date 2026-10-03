@@ -313,7 +313,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.11"
+        assert meta["space_schema_version"] == "1.12"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -681,7 +681,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.11"
+        assert meta["space_schema_version"] == "1.12"
 
 
 
@@ -1106,3 +1106,53 @@ class TestCorpusWeights:
             fit_whitener(sp["a"], sp["a"].X, weights=np.zeros(N))
         with pytest.raises(SpaceError, match="one entry per row"):
             fit_whitener(sp["a"], sp["a"].X, weights=np.ones(N - 1))
+
+
+class TestMemberScalingAndFixedK:
+    """The structure-free baseline (B0): z-score members only, at a k given from outside."""
+
+    def test_zscore_whitener_is_the_z_score(self, members):
+        spaces, _ = members
+        a = spaces["a"]
+        w = fit_whitener(a, a.X, scaling="zscore")
+        assert w.rank == a.dim
+        Z = (a.X - a.X.mean(0)) / a.X.std(0)
+        np.testing.assert_allclose(w.transform(a.X), Z, atol=1e-10)
+        with pytest.raises(SpaceError, match="unknown member scaling"):
+            fit_whitener(a, a.X, scaling="raw")
+
+    def test_zscore_weighs_members_by_width(self):
+        # two members on independent latents: a wide one (64 columns) and a narrow one (4)
+        rng = np.random.default_rng(1)
+        wide = _member("wide", rng, rng.normal(size=(N, 2)), 64)
+        narrow = _member("narrow", rng, rng.normal(size=(N, 2)), 4)
+        spaces = {"wide": wide, "narrow": narrow}
+        share = {}
+        for scaling in ("pr", "zscore"):
+            bm = fit_block_map(spaces, ["wide", "narrow"], np.arange(N), member_scaling=scaling)
+            top = bm.block_components[0]
+            n_wide = bm.whiteners["wide"].rank
+            share[scaling] = float((top[:n_wide] ** 2).sum())  # loading of the top component on "wide"
+        assert share["zscore"] > 0.95  # the wide member owns the top direction
+        assert share["pr"] < share["zscore"]
+
+    def test_fixed_k_holds_without_criterion(self, members):
+        spaces, _ = members
+        fit = fit_block(spaces, ["a", "b", "c"], member_scaling="zscore", fixed_k=5, score=False,
+                        **_fit_kwargs())
+        assert fit.k == 5 and fit.map.k_max == 5
+        m = fit.manifest
+        assert m["member_scaling"] == "zscore" and m["fixed_k"] == 5 and m["criterion_scored"] is False
+        assert m["subsumes_all_members"] is None and m["concat_rank"] is None
+        assert all(pm["passed_all_folds"] is None for pm in m["per_member"].values())
+        assert fit.curve == []
+        with pytest.raises(SpaceError, match="nothing can choose k"):
+            fit_block(spaces, ["a", "b", "c"], score=False, **_fit_kwargs())
+
+    def test_fixed_k_with_criterion_is_a_diagnostic(self, members):
+        spaces, _ = members
+        low = fit_block(spaces, ["a", "b", "c"], fixed_k=1, **_fit_kwargs())
+        assert low.k == 1 and low.manifest["subsumes_all_members"] is False  # k stays put though it fails
+        ok = fit_block(spaces, ["a", "b", "c"], fixed_k=8, **_fit_kwargs())
+        assert ok.k == 8 and ok.manifest["subsumes_all_members"] is True
+        assert {r["k"] for r in ok.curve} == {8}

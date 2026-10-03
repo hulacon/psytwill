@@ -6,8 +6,8 @@ coordinate traceable to a pinned release, the set's own registry ids, and
 proof that the stimuli it is about to analyse were not rows of the fit that
 made the coordinates (contracts §4.3 item 3). This module writes that: one
 §4.1 family (CSV tables + one ``.meta.json``) per stimulus set, with a model
-per block (``pspace_v``, ``pspace_a``, ``pspace_l``) and per relation side
-(``pspace_vl``).
+per block (``pspace_v``, ``pspace_a``, ``pspace_l``) and per relation side (``pspace_vl``);
+the prefix is the release's ``model_prefix`` (``pspace`` unless a baseline release names its own).
 
 Conventions (psytwill-space project-design, DECIDED 2026-10-02):
 
@@ -70,8 +70,8 @@ UNPLACED_WHEN = ("the block cannot place this row: its present members cannot de
                  "or (also counted here) a member holds an `undefinable` null")
 
 
-def model_name(name: str) -> str:
-    return f"pspace_{name.lower()}"
+def model_name(name: str, prefix: str = "pspace") -> str:
+    return f"{prefix}_{name.lower()}"
 
 
 def _key_value(x) -> float | str:
@@ -323,8 +323,9 @@ def project_grain(release: Release, grain: Grain, spaces: dict, id_map: dict[str
                                                          for v in keys[i]))
     res = GrainResult(grain=grain, keys=[keys[i] for i in order], src_ids=src_ids)
     full = full[order]
-    res.columns[model_name(grain.block)] = full
-    res.leak[model_name(grain.block)] = block_leak_guard(fit.manifest, grain.features, src_ids)
+    pre = release.model_prefix
+    res.columns[model_name(grain.block, pre)] = full
+    res.leak[model_name(grain.block, pre)] = block_leak_guard(fit.manifest, grain.features, src_ids)
 
     ok = np.isfinite(full).all(axis=1)
     for rname, rentry in release.meta["relations"].items():
@@ -337,8 +338,8 @@ def project_grain(release: Release, grain: Grain, spaces: dict, id_map: dict[str
                                  f"{grain.block}; the release is inconsistent")
             P = np.full((len(full), rel.k), np.nan)
             P[ok] = rel.project(full[ok], side)
-            res.columns[model_name(rname)] = P
-            res.leak[model_name(rname)] = {"side": side, **relation_leak_guard(rel.manifest, src_ids)}
+            res.columns[model_name(rname, pre)] = P
+            res.leak[model_name(rname, pre)] = {"side": side, **relation_leak_guard(rel.manifest, src_ids)}
     return res
 
 
@@ -402,8 +403,9 @@ def write_family(release: Release, results: Sequence[GrainResult], stem: str | P
         df.to_csv(path, index=False, float_format="%.6g")
         output[g.table or "base"] = {"path": str(path), "rows": int(len(df)), "columns": list(df.columns)}
         for model, X in r.columns.items():
-            is_block = model == model_name(g.block)
-            src = g.block if is_block else next(n for n in rel["relations"] if model_name(n) == model)
+            is_block = model == model_name(g.block, release.model_prefix)
+            src = g.block if is_block else next(n for n in rel["relations"]
+                                                if model_name(n, release.model_prefix) == model)
             entry = rel["blocks"][src] if is_block else rel["relations"][src]
             cols = _colnames(model, X.shape[1])
             if model not in models:

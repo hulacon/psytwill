@@ -52,7 +52,9 @@ from psytwill.decompose import (
 )
 from psytwill.exceptions import InputError, SpaceError
 
-RELATE_SCHEMA_VERSION = "1.0"
+#: 1.1: `fixed_k` (k given from outside, or null) and `prefix_k` (the measured
+#: prefix count, which equals k unless k was fixed).
+RELATE_SCHEMA_VERSION = "1.1"
 DEFAULT_R_MIN = math.sqrt(0.5)
 POOLS = ("none", "mean")
 
@@ -183,8 +185,14 @@ def _subspace_overlap(P: np.ndarray, Q: np.ndarray) -> float:
 def fit_relation(X: np.ndarray, Y: np.ndarray, *, name: str, groups: Sequence | None = None,
                  n_splits: int = 5, n_perm: int = 250, block_size: int | None = None,
                  r_min: float = DEFAULT_R_MIN, rank_cap: int | None = None,
-                 prefix_alpha: float = DEFAULT_PREFIX_ALPHA, random_state: int = 0) -> RelationFit:
-    """Count the shared prefix by CV-CCA, then freeze the top-k map on every row."""
+                 prefix_alpha: float = DEFAULT_PREFIX_ALPHA, random_state: int = 0,
+                 fixed_k: int | None = None) -> RelationFit:
+    """Count the shared prefix by CV-CCA, then freeze the top-k map on every row.
+
+    ``fixed_k`` freezes the map at a k given from outside (a baseline matched
+    to another relation's k); the prefix count is still measured and recorded,
+    as a diagnostic that does not move k.
+    """
     keep = np.isfinite(X).all(axis=1) & np.isfinite(Y).all(axis=1)
     X, Y = X[keep], Y[keep]
     g = None if groups is None else np.asarray(groups)[keep]
@@ -195,7 +203,9 @@ def fit_relation(X: np.ndarray, Y: np.ndarray, *, name: str, groups: Sequence | 
     ok = r_cv >= r_min
     if n_perm:
         ok &= r_cv > np.asarray(res.null_q)
-    k = _prefix(ok)
+    k = _prefix(ok) if fixed_k is None else int(fixed_k)
+    if fixed_k is not None and not 1 <= k <= len(r_cv):
+        raise SpaceError(f"{name}: fixed k {k} is outside 1..{len(r_cv)} canonical components")
     if k == 0:
         raise SpaceError(
             f"{name}: no component reaches held-out r >= {r_min:.3f} (first {r_cv[0]:.3f}), so the "
@@ -220,7 +230,10 @@ def fit_relation(X: np.ndarray, Y: np.ndarray, *, name: str, groups: Sequence | 
         "kind": "relation",
         "name": name,
         "k": k,
-        "k_rule": f"prefix: held-out r >= r_min{' and > null quantile' if n_perm else ''}",
+        "k_rule": ("fixed (given; the prefix count below is a diagnostic)" if fixed_k is not None else
+                   f"prefix: held-out r >= r_min{' and > null quantile' if n_perm else ''}"),
+        "fixed_k": None if fixed_k is None else int(fixed_k),
+        "prefix_k": int(_prefix(ok)),
         "r_min": r_min,
         "count_r_ge_min": int((r_cv >= r_min).sum()),
         "n_rows": int(len(X)),

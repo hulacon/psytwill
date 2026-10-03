@@ -9,6 +9,12 @@ Only the zero-shot reading is implemented. The learned linear probe of the
 human-alignment literature is a separate arm: it fits a transform on
 training triplets, so it needs object-disjoint folds, and it is not this
 module's to approximate.
+
+``noise_ceiling`` is the ceiling the triplet literature reports (Hebart et
+al.'s ``get_noiseceiling``): over triplets answered more than once, the share
+of answers that agree with the triplet's most common answer, averaged over
+triplets. A model that always names the most common answer scores exactly
+this, so no model can be expected to beat it on those triplets.
 """
 
 from __future__ import annotations
@@ -58,3 +64,27 @@ def oddoneout(emb: SpaceMatrix, triplets: pd.DataFrame, *, metric: str = "cosine
                "accuracy": bootstrap_mean(items["correct"].astype(float), n_boot=n_boot, seed=seed),
                "n_tied": int(tied.sum())}
     return items, summary
+
+
+def noise_ceiling(triplets: pd.DataFrame, *, n_boot: int = 2000, seed: int = 0) -> dict:
+    """Ceiling from repeated triplets: mean over triplets of the modal answer's share.
+
+    A triplet is its three items as a set, so the same triplet listed in a
+    different order counts as one. Triplets answered once carry no
+    information about agreement and are left out (and counted).
+    """
+    missing = [c for c in TRIPLET_COLUMNS if c not in triplets.columns]
+    if missing:
+        raise BenchError(f"triplet table lacks column(s) {missing}; expected {list(TRIPLET_COLUMNS)}")
+    tri = triplets.astype({c: str for c in TRIPLET_COLUMNS})
+    key = ["|".join(sorted(t)) for t in zip(tri["item1"], tri["item2"], tri["item3"])]
+    d = pd.DataFrame({"triplet": key, "odd": tri["odd"].to_numpy()})
+    counts = d.groupby(["triplet", "odd"]).size().unstack(fill_value=0)
+    n = counts.sum(axis=1)
+    rep = counts[n >= 2]
+    if rep.empty:
+        raise BenchError("no triplet is answered more than once; a noise ceiling needs repeats")
+    consistency = rep.max(axis=1) / rep.sum(axis=1)
+    return {"ceiling": bootstrap_mean(consistency.to_numpy(), n_boot=n_boot, seed=seed),
+            "n_triplets_repeated": int(len(rep)), "n_triplets_single": int((n < 2).sum()),
+            "answers_per_triplet_median": float(rep.sum(axis=1).median()), "unit": "triplet"}

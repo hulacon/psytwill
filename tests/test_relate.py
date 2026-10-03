@@ -198,3 +198,19 @@ def test_fit_cca_variates_are_unit_variance_and_paired():
     r = [np.corrcoef(Pa[:, j], Pb[:, j])[0, 1] for j in range(3)]
     n = len(A)
     np.testing.assert_allclose(r, cm.r[:3] * n / (n - 1), atol=1e-8)  # see CcaMap.r
+
+
+def test_fixed_k_freezes_the_map_and_still_records_the_prefix():
+    A, B, _ = _latents()
+    measured = fit_relation(A, B, name="PQ", n_perm=0)
+    k = measured.k
+    fixed = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=k + 2)
+    assert fixed.k == k + 2 and fixed.manifest["fixed_k"] == k + 2
+    assert fixed.manifest["prefix_k"] == k and measured.manifest["prefix_k"] == k
+    assert fixed.manifest["k_rule"].startswith("fixed")
+    with pytest.raises(SpaceError, match="outside"):
+        fit_relation(A, B, name="PQ", n_perm=0, fixed_k=10_000)
+    # a fixed k is honoured even where nothing is shared, so a baseline is never refused for it
+    rng = np.random.RandomState(1)
+    none = fit_relation(rng.randn(300, 8), rng.randn(300, 6), name="PQ", n_perm=0, fixed_k=2)
+    assert none.k == 2 and none.manifest["prefix_k"] == 0

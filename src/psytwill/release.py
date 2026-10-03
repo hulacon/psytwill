@@ -25,7 +25,9 @@ from psytwill import __version__
 from psytwill.exceptions import InputError, SpaceError
 from psytwill.relate import RelationFit, load_relation, sha256_file
 
-RELEASE_SCHEMA_VERSION = "1.0"
+#: 1.1: `model_prefix` -- the store model names a projection writes
+#: (`<prefix>_v`, `<prefix>_vl`, ...). Absent = "pspace".
+RELEASE_SCHEMA_VERSION = "1.1"
 
 
 def _pinned(manifest: Path) -> tuple[dict, dict]:
@@ -49,9 +51,12 @@ def parse_absent(spec: str) -> tuple[list[str], str]:
 
 
 def build_release(*, name: str, version: str, blocks: Sequence[str | Path], relations: Sequence[str | Path] = (),
-                  absent: Sequence[tuple[Sequence[str], str]] = (), note: str | None = None) -> dict:
+                  absent: Sequence[tuple[Sequence[str], str]] = (), note: str | None = None,
+                  model_prefix: str = "pspace") -> dict:
+    if not model_prefix.isidentifier() or model_prefix != model_prefix.lower():
+        raise SpaceError(f"model prefix {model_prefix!r} must be a lower-case identifier (it names store models)")
     out: dict = {"release_schema_version": RELEASE_SCHEMA_VERSION, "name": name, "version": version,
-                 "psytwill_version": __version__,
+                 "model_prefix": model_prefix, "psytwill_version": __version__,
                  "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                  "note": note, "blocks": {}, "relations": {}, "absent": []}
     by_sha: dict[str, str] = {}
@@ -109,6 +114,10 @@ def write_release(release: dict, out_dir: str | Path, *, stem: str | None = None
 class Release:
     path: Path
     meta: dict
+
+    @property
+    def model_prefix(self) -> str:
+        return self.meta.get("model_prefix", "pspace")
 
     @property
     def label(self) -> str:
