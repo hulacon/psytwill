@@ -36,14 +36,28 @@ def _keep(sm, drop: set[str]):
                        modality=sm.modality, extractor=sm.extractor, n_replicates=sm.n_replicates)
 
 
-def _load(features, model, key, window=None, drop=frozenset()):
-    from .core import drop_nan_rows, load_model
+#: arms built by `_load` from a `a+b+c` model spec, keyed by spec; read back into each run's sidecar
+CONCAT_INFO: dict = {}
 
-    sm = load_model(features, model, key=tuple(key.split(",")), window=window)
+
+def _load(features, model, key, window=None, drop=frozenset()):
+    from .core import drop_nan_rows, load_concat, load_model
+
+    if "+" in model:
+        sm, info = load_concat(features, model.split("+"), key=tuple(key.split(",")), window=window)
+        CONCAT_INFO[model] = info
+        print(f"  concatenated {len(info['members'])} members: {info['n_columns']} columns "
+              f"({sum(info['nan_columns_dropped'].values())} with NaN dropped)", flush=True)
+    else:
+        sm = load_model(features, model, key=tuple(key.split(",")), window=window)
     sm, n_nan = drop_nan_rows(_keep(sm, set(drop)))
     print(f"  loaded {model}: {sm.n} rows x {sm.dim}" + (f" ({n_nan} NaN rows dropped)" if n_nan else ""),
           flush=True)
     return sm, n_nan
+
+
+def _concat_record(*models) -> dict:
+    return {m: CONCAT_INFO[m] for m in models if m in CONCAT_INFO}
 
 
 def _read_table(path) -> "pd.DataFrame":  # noqa: F821
@@ -86,6 +100,7 @@ def _run_retrieval(args) -> None:
     items, summary = retrieval(q, t, mode=args.mode, metric=args.metric, n_splits=args.n_splits, seed=args.seed,
                                n_boot=args.n_boot, within_stimulus=args.within_stimulus)
     summary["leak_guard"] = guard
+    summary["concatenated"] = _concat_record(args.query_model, args.target_model)
     if pooling:
         summary["target_pooling"] = pooling
     params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": {"query": qn, "target": tn}}
@@ -124,6 +139,7 @@ def _run_oddoneout(args) -> None:
     guard = refuse_overlap(ids, args.fit_ids, what="triplet")
     items, summary = oddoneout(emb, tri, metric=args.metric, n_boot=args.n_boot, seed=args.seed)
     summary["leak_guard"] = guard
+    summary["concatenated"] = _concat_record(args.model)
     summary["n_triplets_before_only_ids"] = n_all
     params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": n_nan}
     side = write_run(args.output, "oddoneout", args.tag, items, summary, params=params,
@@ -207,6 +223,68 @@ def _run_ceiling(args) -> None:
     print(f"psytwill bench ceiling [{args.tag}]: {c['mean']:.4f} [{c['lo']:.4f}, {c['hi']:.4f}] over "
           f"{s['n_triplets_repeated']} repeated triplets (median {s['answers_per_triplet_median']:.0f} answers each; "
           f"{s['n_triplets_single']} answered once, left out)")
+    print(f"  {side}")
+
+
+def _run_select(args) -> None:
+    import json
+
+    import pandas as pd
+
+    from . import compare as C
+    from .core import write_run
+    from .select import select_best
+
+    sides = {p: json.loads(Path(p).read_text()) for p in args.runs}
+    first = next(iter(sides.values()))
+    task = first["task"]
+    for p, sd in sides.items():
+        if sd["task"] != task:
+            raise BenchError(f"{p} is a {sd['task']} run; every member run must be {task}")
+        C.check_params(task, first["params"], sd["params"])
+    runs = {}
+    for p, sd in sides.items():
+        name = sd["params"].get("query_model") or sd["params"].get("model") or sd["tag"]
+        if name in runs:
+            raise BenchError(f"two runs score member {name!r}")
+        runs[name] = pd.read_csv(Path(p).parent / sd["items_file"])
+    within = bool(first["params"].get("within_stimulus"))
+    items, summary = select_best(runs, task, statistic=args.statistic, within_stimulus=within,
+                                 n_splits=args.n_splits, seed=args.seed)
+    summary["member_runs"] = {n: str(Path(p).resolve()) for n, p in zip(runs, sides)}
+    params = dict(first["params"]) | {"arm": "B2", "select_statistic": args.statistic,
+                                       "select_n_splits": args.n_splits, "select_seed": args.seed}
+    for k in ("query_model", "model", "tag"):
+        if k in params:
+            params[k] = "B2"
+    side = write_run(args.output, task, args.tag, items, summary, params=params, inputs=args.runs)
+    print(f"psytwill bench select [{task}, B2 by {args.statistic}]: {len(summary['candidates'])} candidates; chose "
+          + ", ".join(f"fold {p['fold']} {p['member']}" for p in summary["folds"]))
+    if summary["not_candidates_incomplete"]:
+        print(f"  not candidates (some items unscored): {', '.join(summary['not_candidates_incomplete'])}")
+    print(f"  {side}")
+
+
+def _run_reconstruct(args) -> None:
+    from .core import load_model
+    from .reconstruct import fit_reconstruction, scores_matrix, write_reconstruction
+
+    scores = scores_matrix(args.scores, args.scores_key.split(","), _ids(args.exclude_ids) or None)
+    member = load_model(args.member_features, args.member, key=tuple(args.member_key.split(",")))
+    print(f"  fit rows: block scores {scores.n} x {scores.dim}; {args.member} {member.n} x {member.dim}", flush=True)
+    lm, fit = fit_reconstruction(scores, member, seed=args.seed)
+    apply = load_model(args.apply_features, args.apply_model, key=tuple(args.apply_key.split(",")),
+                       window=args.apply_window)
+    if apply.dim != scores.dim:
+        raise BenchError(f"{args.apply_model} has {apply.dim} columns but the block scores {scores.dim}; "
+                         "apply the map to the same block it was fit on")
+    prov = {"fit": fit, "scores": str(Path(args.scores).resolve()), "exclude_ids": args.exclude_ids,
+            "member_features": [str(p) for p in args.member_features], "apply_model": args.apply_model,
+            "apply_features": [str(p) for p in args.apply_features], "apply_window": args.apply_window}
+    side = write_reconstruction(lm, apply, name=args.name, member=member, key=args.apply_key.split(","),
+                                out=args.output, provenance=prov)
+    print(f"psytwill bench reconstruct [{args.name} = {args.member} from {args.apply_model}]: {apply.n} items; "
+          f"fit rows {fit['n_fit_rows']}, alpha {fit['alpha']:g}, out-of-fold R2 {fit['cv_r2_variance_weighted']:.3f}")
     print(f"  {side}")
 
 
@@ -316,6 +394,33 @@ def register(sub) -> None:
     c.add_argument("--n-splits", type=int, default=5)
     _common(c)
     c.set_defaults(func=_run_congruence)
+
+    rc = bsub.add_parser("reconstruct", help="rebuild a member from a space's block scores (arm R)")
+    rc.add_argument("--scores", required=True, help="block scores on the block's fit rows (`space project` parquet)")
+    rc.add_argument("--scores-key", default="stimulus_id")
+    rc.add_argument("--exclude-ids", help="id file of fit-row stimuli to leave out of the map")
+    rc.add_argument("--member-features", nargs="+", required=True, help="the member's features on those fit rows")
+    rc.add_argument("--member", required=True, help="member model to rebuild, e.g. ebind")
+    rc.add_argument("--member-key", default="stimulus_id")
+    rc.add_argument("--apply-features", nargs="+", required=True, help="the space's coordinates for the items")
+    rc.add_argument("--apply-model", required=True, help="e.g. pspace_v")
+    rc.add_argument("--apply-key", default="stimulus_id")
+    rc.add_argument("--apply-window", type=float, help="bin width when the items are a time grid")
+    rc.add_argument("--name", required=True, help="model name to write, e.g. r_ebind")
+    rc.add_argument("-o", "--output", required=True, help="output features table (.parquet)")
+    rc.add_argument("--seed", type=int, default=0)
+    rc.set_defaults(func=_run_reconstruct)
+
+    sel = bsub.add_parser("select", help="best single member (B2), chosen per outer fold on the other folds")
+    sel.add_argument("runs", nargs="+", help="sidecar JSON of each member's run of one task")
+    sel.add_argument("--statistic", required=True,
+                     help="what 'best' means: retrieval pct_beaten | top1 (both directions averaged); "
+                          "oddoneout correct")
+    sel.add_argument("--n-splits", type=int, default=5, help="outer folds over the task's unit")
+    sel.add_argument("-o", "--output", required=True, help="output directory")
+    sel.add_argument("--tag", required=True)
+    sel.add_argument("--seed", type=int, default=0)
+    sel.set_defaults(func=_run_select)
 
     e = bsub.add_parser("ceiling", help="odd-one-out noise ceiling from repeated triplets")
     e.add_argument("--triplets", nargs="+", required=True,

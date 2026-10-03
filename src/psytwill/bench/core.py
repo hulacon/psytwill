@@ -65,6 +65,49 @@ def load_model(
     return sm
 
 
+def load_concat(
+    features: Sequence[str | Path],
+    models: Sequence[str],
+    *,
+    key: Sequence[str] = ("stimulus_id",),
+    window: float | None = None,
+) -> tuple[SpaceMatrix, dict]:
+    """Several models side by side on their shared rows: the full-battery arm (B1).
+
+    Each member's columns are z-scored over the loaded rows, so no member
+    weighs by its raw units. A column holding any NaN on those rows is
+    DROPPED, never filled (a member's declared nulls would otherwise have to
+    be given a value, and no consumer creates one); so is a constant column.
+    Both are counted per member in the returned record. Rows a member lacks
+    are not invented either: the result keeps the rows every member has.
+    """
+    parts = {m: load_model(features, m, key=key, window=window) for m in models}
+    common = set.intersection(*(set(p.labels) for p in parts.values()))
+    if not common:
+        raise BenchError(f"models {list(models)} share no row label")
+    labels = sorted(common)
+    blocks, names, info = [], [], {"members": list(models), "n_rows": len(labels), "rows_lost": {},
+                                   "nan_columns_dropped": {}, "constant_columns_dropped": {}}
+    for m, p in parts.items():
+        pos = {lab: i for i, lab in enumerate(p.labels)}
+        X = p.X[[pos[lab] for lab in labels]]
+        info["rows_lost"][m] = len(p.labels) - len(labels)
+        nan_col = np.isnan(X).any(axis=0)
+        sd = np.nanstd(X, axis=0)
+        const = ~nan_col & (sd == 0)
+        keep = ~nan_col & ~const
+        info["nan_columns_dropped"][m] = int(nan_col.sum())
+        info["constant_columns_dropped"][m] = int(const.sum())
+        if not keep.any():
+            raise BenchError(f"member {m!r} keeps no column on these rows (all NaN or constant)")
+        Xk = X[:, keep]
+        blocks.append((Xk - Xk.mean(0)) / Xk.std(0))
+        names += [f"{m}:{f}" for f, k in zip(p.features, keep) if k]
+    sm = SpaceMatrix(name="+".join(models), labels=labels, X=np.hstack(blocks), features=names)
+    info["n_columns"] = sm.dim
+    return sm, info
+
+
 def drop_nan_rows(sm: SpaceMatrix) -> tuple[SpaceMatrix, int]:
     """Rows with any NaN are dropped and counted, never filled.
 

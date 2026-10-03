@@ -19,7 +19,9 @@ from psytwill.bench import compare as C
 from psytwill.bench.congruence import congruence
 from psytwill.bench.core import bootstrap_mean, identify, pool_segments, refuse_overlap
 from psytwill.bench.nextwindow import next_window
+from psytwill.bench.core import load_concat
 from psytwill.bench.oddoneout import noise_ceiling, oddoneout
+from psytwill.bench.select import select_best
 from psytwill.bench.retrieval import retrieval
 from psytwill.cli import main
 from psytwill.exceptions import BenchError
@@ -407,3 +409,72 @@ def test_noise_ceiling_is_modal_share_over_repeated_triplets():
     assert s["n_triplets_repeated"] == 2 and s["n_triplets_single"] == 1
     with pytest.raises(BenchError, match="more than once"):
         noise_ceiling(pd.DataFrame([("x", "y", "z", "z")], columns=["item1", "item2", "item3", "odd"]))
+
+
+# ------------------------------------------------------- arms B1 and B2
+
+
+def test_load_concat_zscores_drops_nan_columns_and_keeps_shared_rows(tmp_path):
+    pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(12)
+    a = _sm("a", [f"s{i}" for i in range(20)], rng.normal(size=(20, 3)) * 100)
+    Xb = rng.normal(size=(19, 2))
+    Xb[4, 1] = np.nan  # a declared null in one column
+    b = _sm("b", [f"s{i}" for i in range(19)], Xb)
+    fp = tmp_path / "x_features.parquet"
+    pd.concat([_long(a, "v").drop(columns="chunk_idx"), _long(b, "v").drop(columns="chunk_idx")]).to_parquet(fp)
+    sm, info = load_concat([fp], ["a", "b"])
+    assert sm.n == 19 and info["rows_lost"] == {"a": 1, "b": 0}
+    assert info["nan_columns_dropped"] == {"a": 0, "b": 1} and sm.dim == 4
+    np.testing.assert_allclose(sm.X.mean(0), 0, atol=1e-12)
+    np.testing.assert_allclose(sm.X.std(0), 1, atol=1e-12)
+
+
+def test_select_best_chooses_out_of_fold_and_covers_every_item():
+    rng = np.random.default_rng(13)
+    q, t = _segment_sets(rng)
+    good, _ = retrieval(q, t, within_stimulus=True, n_boot=20)
+    bad, _ = retrieval(_sm("q", q.labels, rng.normal(size=q.X.shape)), t, within_stimulus=True, n_boot=20)
+    partial = good[good["stimulus_id"] != good["stimulus_id"].iloc[0]]
+    items, s = select_best({"good": good, "bad": bad, "partial": partial}, "retrieval", statistic="pct_beaten",
+                           within_stimulus=True, n_splits=4)
+    assert s["members_chosen"] == ["good"] and s["not_candidates_incomplete"] == ["partial"]
+    assert set(items["stimulus_id"]) == set(good["stimulus_id"]) and len(items) == len(good)
+    # each film's items sit in one outer fold
+    film_folds = items.assign(f=items["stimulus_id"].str.split("|").str[0]).groupby("f")["b2_fold"].nunique()
+    assert (film_folds == 1).all()
+    _, cmp = C.compare_retrieval(items, good, within_stimulus=True, n_boot=50)
+    assert cmp["pct_beaten"]["diff"]["mean"] == pytest.approx(0.0)
+    with pytest.raises(BenchError, match="no best-member selection"):
+        select_best({"x": good}, "congruence", statistic="rho")
+
+
+
+def test_reconstruct_rebuilds_a_member_from_block_scores(tmp_path):
+    pytest.importorskip("pyarrow")
+    from psytwill.bench.reconstruct import fit_reconstruction, scores_matrix
+    rng = np.random.default_rng(14)
+    n, k = 400, 6
+    S = rng.normal(size=(n, k))
+    W = rng.normal(size=(k, 10))
+    ids = [f"img{i:04d}" for i in range(n)]
+    sp = tmp_path / "V_scores.parquet"
+    pd.DataFrame(S, columns=[f"V_{j:03d}" for j in range(k)]).assign(stimulus_id=ids).to_parquet(sp)
+    member = _sm("ebind", ids, S @ W + 0.01 * rng.normal(size=(n, 10)))
+    lm, fit = fit_reconstruction(scores_matrix(sp, ["stimulus_id"]), member, cv_rows=300)
+    assert fit["cv_r2_variance_weighted"] > 0.99 and fit["n_fit_rows"] == n
+    # through the CLI: items carry the block's coordinates as a store model, output is a store model
+    fp = tmp_path / "m_features.parquet"
+    _long(member, "viz2psy").drop(columns="chunk_idx").to_parquet(fp)
+    items = _sm("pspace_v", [f"item{i}" for i in range(30)], rng.normal(size=(30, k)))
+    ap = tmp_path / "items_features.parquet"
+    _long(items, "psytwill").drop(columns="chunk_idx").to_parquet(ap)
+    out = tmp_path / "r" / "r_ebind_features.parquet"
+    assert main(["bench", "reconstruct", "--scores", str(sp), "--member-features", str(fp), "--member", "ebind",
+                 "--apply-features", str(ap), "--apply-model", "pspace_v", "--name", "r_ebind", "-o", str(out)]) == 0
+    from psytwill.bench.core import load_model
+    r = load_model([out], "r_ebind")
+    assert r.n == 30 and r.dim == 10
+    pos = {lab: i for i, lab in enumerate(r.labels)}
+    want = lm.predict(items.X)
+    np.testing.assert_allclose(r.X[[pos[f"item{i}"] for i in range(30)]], want, rtol=1e-6, atol=1e-6)
