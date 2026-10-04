@@ -24,7 +24,7 @@ import pandas as pd
 
 from psytwill.exceptions import BenchError
 
-from .core import stimulus_of
+from .core import bootstrap_mean, stimulus_of
 
 
 def _retrieval_item_scores(items: pd.DataFrame, statistic: str) -> pd.Series:
@@ -33,7 +33,7 @@ def _retrieval_item_scores(items: pd.DataFrame, statistic: str) -> pd.Series:
 
 
 def select_best(runs: dict[str, pd.DataFrame], task: str, *, statistic: str, within_stimulus: bool = False,
-                n_splits: int = 5, seed: int = 0) -> tuple[pd.DataFrame, dict]:
+                n_splits: int = 5, seed: int = 0, n_boot: int = 2000) -> tuple[pd.DataFrame, dict]:
     """B2's items (the chosen member's rows, fold by fold) and the per-fold choices."""
     if task == "retrieval":
         scores = {m: _retrieval_item_scores(d, statistic) for m, d in runs.items()}
@@ -80,7 +80,24 @@ def select_best(runs: dict[str, pd.DataFrame], task: str, *, statistic: str, wit
         part = d[d[item_col].isin(held)] if item_col else d.iloc[sorted(held)]
         rows.append(part.assign(b2_member=best, b2_fold=f))
     out_items = pd.concat(rows).sort_index(kind="stable").reset_index(drop=True)
-    summary = {"statistic": statistic, "n_splits": n_splits, "seed": seed,
+    # the same score summary a run of the task carries, so B2 reads like any other arm
+    if item_col:
+        unit = (lambda d: d["stimulus_id"].map(stimulus_of)) if within_stimulus else (lambda d: None)
+        scored: dict = {"n_items": int(out_items["stimulus_id"].nunique()), "chance_pct_beaten": 0.5,
+                        "within_stimulus": within_stimulus, "ci_unit": "stimulus" if within_stimulus else "item"}
+        for direction, d in out_items.groupby("direction"):
+            scored[direction] = {
+                "pct_beaten": bootstrap_mean(d["pct_beaten"], unit(d), n_boot=n_boot, seed=seed),
+                "top1": bootstrap_mean(d["top1"].astype(float), unit(d), n_boot=n_boot, seed=seed),
+                "n_candidates_mean": float(d["n_candidates"].mean())}
+        both = out_items.assign(top1=out_items["top1"].astype(float)).groupby("stimulus_id", as_index=False)[
+            ["pct_beaten", "top1"]].mean()
+        scored["both_directions"] = {st: bootstrap_mean(both[st], unit(both), n_boot=n_boot, seed=seed)
+                                     for st in ("pct_beaten", "top1")}
+    else:
+        scored = {"n_triplets": int(len(out_items)), "chance": 1 / 3,
+                  "accuracy": bootstrap_mean(out_items["correct"].astype(float), n_boot=n_boot, seed=seed)}
+    summary = {**scored, "statistic": statistic, "n_splits": n_splits, "seed": seed,
                "unit": "stimulus" if within_stimulus else ("item" if item_col else "triplet"),
                "candidates": sorted(complete), "not_candidates_incomplete": excluded, "folds": picks,
                "members_chosen": sorted({p["member"] for p in picks})}

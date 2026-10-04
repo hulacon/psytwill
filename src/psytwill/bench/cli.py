@@ -253,7 +253,7 @@ def _run_select(args) -> None:
         runs[name] = pd.read_csv(Path(p).parent / sd["items_file"])
     within = bool(first["params"].get("within_stimulus"))
     items, summary = select_best(runs, task, statistic=args.statistic, within_stimulus=within,
-                                 n_splits=args.n_splits, seed=args.seed)
+                                 n_splits=args.n_splits, seed=args.seed, n_boot=args.n_boot)
     summary["member_runs"] = {n: str(Path(p).resolve()) for n, p in zip(runs, sides)}
     params = dict(first["params"]) | {"arm": "B2", "select_statistic": args.statistic,
                                        "select_n_splits": args.n_splits, "select_seed": args.seed}
@@ -423,6 +423,7 @@ def register(sub) -> None:
     sel.add_argument("-o", "--output", required=True, help="output directory")
     sel.add_argument("--tag", required=True)
     sel.add_argument("--seed", type=int, default=0)
+    sel.add_argument("--n-boot", type=int, default=2000)
     sel.set_defaults(func=_run_select)
 
     e = bsub.add_parser("ceiling", help="odd-one-out noise ceiling from repeated triplets")

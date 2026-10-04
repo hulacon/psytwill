@@ -496,4 +496,7 @@ def test_cli_select_names_cross_modal_members_by_pair(tmp_path):
                  "--statistic", "pct_beaten", "-o", str(out), "--tag", "b2"]) == 0
     side = json.loads((out / "retrieval__b2.json").read_text())
     assert side["summary"]["members_chosen"] == ["q->t"]
+    good = json.loads((out / "retrieval__m_q.json").read_text())["summary"]
+    assert side["summary"]["both_directions"]["pct_beaten"]["mean"] == pytest.approx(
+        good["both_directions"]["pct_beaten"]["mean"])
     assert side["params"]["query_model"] == "B2" and side["params"]["arm"] == "B2"
