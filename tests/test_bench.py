@@ -478,3 +478,22 @@ def test_reconstruct_rebuilds_a_member_from_block_scores(tmp_path):
     pos = {lab: i for i, lab in enumerate(r.labels)}
     want = lm.predict(items.X)
     np.testing.assert_allclose(r.X[[pos[f"item{i}"] for i in range(30)]], want, rtol=1e-6, atol=1e-6)
+
+
+def test_cli_select_names_cross_modal_members_by_pair(tmp_path):
+    pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(15)
+    q, t, _ = _pair_sets(rng, n=60)
+    noisy = _sm("qn", q.labels, rng.normal(size=q.X.shape))
+    qp, tp = tmp_path / "q_features.parquet", tmp_path / "t_chunks_features.parquet"
+    pd.concat([_long(q, "viz2psy"), _long(noisy, "viz2psy")]).drop(columns="chunk_idx").to_parquet(qp, index=False)
+    _long(t, "word2psy").to_parquet(tp, index=False)
+    out = tmp_path / "out"
+    for m in ("q", "qn"):
+        assert main(["bench", "retrieval", "--query-features", str(qp), "--query-model", m, "--target-features",
+                     str(tp), "--target-model", "t", "-o", str(out), "--tag", f"m_{m}", "--n-boot", "20"]) == 0
+    assert main(["bench", "select", str(out / "retrieval__m_q.json"), str(out / "retrieval__m_qn.json"),
+                 "--statistic", "pct_beaten", "-o", str(out), "--tag", "b2"]) == 0
+    side = json.loads((out / "retrieval__b2.json").read_text())
+    assert side["summary"]["members_chosen"] == ["q->t"]
+    assert side["params"]["query_model"] == "B2" and side["params"]["arm"] == "B2"

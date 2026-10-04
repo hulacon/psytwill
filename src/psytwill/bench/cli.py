@@ -244,7 +244,10 @@ def _run_select(args) -> None:
         C.check_params(task, first["params"], sd["params"])
     runs = {}
     for p, sd in sides.items():
-        name = sd["params"].get("query_model") or sd["params"].get("model") or sd["tag"]
+        pr = sd["params"]
+        # a cross-modal run's member is the pair it read, query side -> target side
+        name = (f"{pr['query_model']}->{pr['target_model']}" if pr.get("query_model") and pr.get("target_model")
+                else pr.get("model") or sd["tag"])
         if name in runs:
             raise BenchError(f"two runs score member {name!r}")
         runs[name] = pd.read_csv(Path(p).parent / sd["items_file"])
