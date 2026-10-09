@@ -122,6 +122,26 @@ CORPORA: dict[str, CorpusSpec] = {
                   "live action; ratified 2026-09-07",
         ),
         CorpusSpec(
+            "clotho",
+            tier="a",
+            serves="A<->L (audio-only captions: annotators heard the clip, saw nothing)",
+            notes="Clotho v2.1, Zenodo 4783391; captions non-commercial, audio "
+                  "per-clip Freesound CC; research use, never redistributed. "
+                  "Native id = '<dev|eval>-' + 10 hex of sha1(file_name): file "
+                  "names collide once slugged. One clip ships in both splits "
+                  "(drop it from eval). Ratified 2026-10-09 (l-hub)",
+        ),
+        CorpusSpec(
+            "avcaps",
+            tier="a",
+            serves="V<->A<->L evaluation: separate audio-only / visual-only "
+                   "captions per clip; held out from every block and relation fit",
+            notes="AVCaps, Zenodo 14536325 (VidOR clips); licence CC-BY 4.0 on "
+                  "Zenodo vs CC-BY-NC on HF, treated as research-only, never "
+                  "redistributed. Native id = the VidOR video id. Ratified "
+                  "2026-10-09 (l-hub)",
+        ),
+        CorpusSpec(
             "things",
             tier="validation",
             serves="external-brain validation for the V block",

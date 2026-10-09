@@ -16,6 +16,8 @@ from the table.
     stage.py musopen          ... [--budget-hours 8]
     stage.py narratives       ...   (stories are units already; no packing)
     stage.py twp-unpresented  ... --twp-root <bids>/stimuli
+    stage.py clotho           ...   (dev + eval clips; also writes captions.csv)
+    stage.py avcaps           ...   (MP4 soundtracks; also writes captions.csv)
 
 Writes (idempotent; a unit whose wav and tables exist is skipped unless
 --force):
@@ -30,6 +32,12 @@ Writes (idempotent; a unit whose wav and tables exist is skipped unless
                                                    the word2psy input)
     <durable>/<corpus>/inputs/units.csv            the unit manifest the
                                                    driver reads
+    <durable>/<corpus>/inputs/captions.csv         (captioned corpora only:
+                                                   one row per human caption,
+                                                   keyed by the clip's id; the
+                                                   word2psy input. Dropped
+                                                   captions are listed in
+                                                   captions_dropped.csv)
 
 `stimulus_id` is the unit's `ext-<corpus>-<unit>` id throughout: audio
 frames and transcript rows share it, and the segments table is the join
@@ -44,7 +52,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
+import json
 import os
 import re
 import subprocess
@@ -70,7 +80,14 @@ TARGET_MIN = 25.0  # minutes of audio per packed unit (≈ one CNeuroMod segment
 # A packed unit carries the corpus's native rate; speech corpora are 16 kHz
 # (LibriSpeech, GigaSpeech), music 44.1 kHz, the twp recordings 24 kHz.
 RATES = {"librispeech": 16000, "gigaspeech": 16000, "fma": 44100,
-         "musopen": 44100, "twp-unpresented": 24000}
+         "musopen": 44100, "twp-unpresented": 24000, "clotho": 44100, "avcaps": 44100}
+
+# Silence between packed files. 0.5 s keeps one empty frame between files,
+# which is enough when files are pooled at frame level. Corpora pooled per
+# CLIP need the widest A-member context (10 s: clap / sound_events /
+# music_emotion), or edge windows hear the neighbouring clip and clip-pooled
+# A carries its neighbour's content (l-hub, DECIDED 2026-10-09).
+GAPS = {"clotho": 10.0, "avcaps": 10.0}
 
 
 def slug(s: str) -> str:
@@ -287,8 +304,163 @@ def adapt_twp(args) -> tuple[int, list[tuple[str, list]], object]:
     return RATES["twp-unpresented"], plans, lambda seg, sr: ffmpeg_decode(Path(seg.extra["path"]), sr)
 
 
+CLOTHO_SPLITS = {"development": "dev", "evaluation": "eval"}
+
+
+def clotho_native(tag: str, file_name: str) -> str:
+    """``<dev|eval>-`` + 10 hex of sha1(file_name).
+
+    Slugged names collide (names that differ only in case or punctuation, e.g.
+    a "Car Wash" and a "car_wash" file) and Freesound ``sound_id`` is "Not
+    found" for some clips, so the exact file name is hashed instead.
+    """
+    return f"{tag}-{hashlib.sha1(file_name.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _clotho_rows(root: Path, kind: str, split: str) -> list[dict]:
+    path = root / f"clotho_{kind}_{split}.csv"
+    if not path.exists():
+        sys.exit(f"ERROR: {path} missing — fetch.py clotho first")
+    # errors="replace": one development metadata row carries a Latin-1 byte in
+    # an uploader name; file names and captions are clean UTF-8.
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        return list(csv.DictReader(f))
+
+
+def _clotho_clips(root: Path):
+    """(tag, native, file_name, row) per kept clip; eval clips whose file name
+    also ships in development are dropped, so eval stays held out."""
+    dev_names: set[str] = set()
+    for split, tag in CLOTHO_SPLITS.items():
+        for r in _clotho_rows(root, "metadata", split):
+            fn = r["file_name"]
+            if tag == "dev":
+                dev_names.add(fn)
+            elif fn in dev_names:
+                print(f"  clotho: {fn!r} ships in development AND evaluation — dropped from eval")
+                continue
+            yield split, tag, clotho_native(tag, fn), fn, r
+
+
+def adapt_clotho(args) -> tuple[int, list[tuple[str, list]], object]:
+    root = args.scratch_root / "clotho"
+    plans: dict[str, list] = {tag: [] for tag in CLOTHO_SPLITS.values()}
+    for split, tag, native, fn, r in _clotho_clips(root):
+        path = root / split / fn
+        if not path.exists():
+            sys.exit(f"ERROR: {path} listed in metadata but missing — re-run fetch.py clotho")
+        plans[tag].append((native, [Segment(segment=native, group=native, duration=media_duration(path),
+                                            extra={"path": str(path), "split": split, "file_name": fn,
+                                                   "sound_id": r["sound_id"]})]))
+    for tag, groups in plans.items():
+        print(f"clotho {tag}: {len(groups)} clips")
+    return RATES["clotho"], [(f"{t}-", g) for t, g in plans.items()], \
+        lambda seg, sr: ffmpeg_decode(Path(seg.extra["path"]), sr)
+
+
+AVCAPS_SPLITS = ("train", "val", "test")
+# Human caption fields only; the GPT-4 syntheses are not observations.
+AVCAPS_CAPTION_TYPES = {"audio_captions": "audio", "visual_captions": "visual",
+                        "audio_visual_captions": "audio_visual"}
+
+
+def _avcaps_captions(root: Path, split: str) -> dict:
+    path = root / f"{split}_captions.json"
+    if not path.exists():
+        sys.exit(f"ERROR: {path} missing — fetch.py avcaps first")
+    return json.loads(path.read_text())
+
+
+def _avcaps_videos(root: Path, split: str) -> dict[str, Path]:
+    vids = {p.stem: p for p in (root / f"{split}_videos").rglob("*.mp4")}
+    caps = _avcaps_captions(root, split)
+    keys = {Path(k).stem for k in caps}
+    if keys != set(vids):
+        sys.exit(f"ERROR: avcaps {split}: {len(set(vids) - keys)} videos without captions, "
+                 f"{len(keys - set(vids))} captioned ids without a video")
+    return dict(sorted(vids.items()))
+
+
+def adapt_avcaps(args) -> tuple[int, list[tuple[str, list]], object]:
+    root = args.scratch_root / "avcaps"
+    plans = []
+    for split in AVCAPS_SPLITS:
+        groups = []
+        for native, path in _avcaps_videos(root, split).items():
+            groups.append((native, [Segment(segment=native, group=native, duration=media_duration(path),
+                                            extra={"path": str(path), "split": split})]))
+        print(f"avcaps {split}: {len(groups)} clips")
+        plans.append((f"{split}-", groups))
+    return RATES["avcaps"], plans, lambda seg, sr: ffmpeg_decode(Path(seg.extra["path"]), sr)
+
+
 ADAPTERS = {"librispeech": adapt_librispeech, "gigaspeech": adapt_gigaspeech, "fma": adapt_fma,
-            "musopen": adapt_musopen, "twp-unpresented": adapt_twp}
+            "musopen": adapt_musopen, "twp-unpresented": adapt_twp, "clotho": adapt_clotho,
+            "avcaps": adapt_avcaps}
+
+
+# ---------------------------------------------------------------------------
+# Captions (word2psy input for captioned corpora)
+# ---------------------------------------------------------------------------
+
+def caption_drop_reason(text: str) -> str:
+    """Why a human caption is not used, or "" to keep it.
+
+    Any caption with an internal line break is dropped: in AVCaps these are a
+    mix of LLM-style pastes ("Revised: ...", numbered lists, invented scenes)
+    and two-line entries, and one declared rule is safer than judging each.
+    """
+    if not text.strip():
+        return "empty"
+    if "\n" in text.strip() or "\r" in text.strip():
+        return "multi-line entry"
+    return ""
+
+
+def caption_rows(corpus: str, args) -> list[dict]:
+    rows = []
+    if corpus == "clotho":
+        root = args.scratch_root / "clotho"
+        kept = {(split, fn): native for split, _, native, fn, _ in _clotho_clips(root)}
+        for split in CLOTHO_SPLITS:
+            for r in _clotho_rows(root, "captions", split):
+                native = kept.get((split, r["file_name"]))
+                if native is None:
+                    continue
+                for k in range(1, 6):
+                    rows.append({"stimulus_id": ext_id("clotho", native), "split": split,
+                                 "caption_type": "audio", "caption_idx": k - 1,
+                                 "caption": r[f"caption_{k}"]})
+    elif corpus == "avcaps":
+        root = args.scratch_root / "avcaps"
+        for split in AVCAPS_SPLITS:
+            for key, entry in sorted(_avcaps_captions(root, split).items()):
+                sid = ext_id("avcaps", Path(key).stem)
+                for field_name, ctype in AVCAPS_CAPTION_TYPES.items():
+                    for k, text in enumerate(entry.get(field_name, [])):
+                        rows.append({"stimulus_id": sid, "split": split, "caption_type": ctype,
+                                     "caption_idx": k, "caption": text})
+    return rows
+
+
+def write_captions(corpus: str, args) -> None:
+    rows = caption_rows(corpus, args)
+    if not rows:
+        return
+    keep = [r for r in rows if not caption_drop_reason(r["caption"])]
+    drop = [{**r, "reason": caption_drop_reason(r["caption"])} for r in rows if caption_drop_reason(r["caption"])]
+    inputs = args.durable_root / corpus / "inputs"
+    if args.dry_run:
+        print(f"{corpus}: {len(keep)} captions kept, {len(drop)} dropped (dry run; nothing written)")
+        return
+    inputs.mkdir(parents=True, exist_ok=True)
+    for name, data, cols in (("captions.csv", keep, list(keep[0])),
+                             ("captions_dropped.csv", drop, [*keep[0], "reason"])):
+        with open(inputs / name, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(data)
+    print(f"wrote {inputs / 'captions.csv'} ({len(keep)} captions; {len(drop)} dropped -> captions_dropped.csv)")
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +513,8 @@ def stage_packed(corpus: str, args) -> list[dict]:
     sr, plans, decode = ADAPTERS[corpus](args)
     units: list[Unit] = []
     for prefix, groups in plans:
-        units.extend(pack_groups(groups, target=args.target_minutes * 60, hop=HOP, gap=GAP,
-                                 unit_prefix=prefix))
+        units.extend(pack_groups(groups, target=args.target_minutes * 60, hop=HOP,
+                                 gap=GAPS.get(corpus, GAP), unit_prefix=prefix))
     audio_h = sum(s.duration for u in units for s in u.segments) / 3600
     print(f"{corpus}: {len(units)} units, {sum(len(u.segments) for u in units)} segments, "
           f"{audio_h:.2f} h of audio, {sr} Hz, target {args.target_minutes:g} min/unit")
@@ -413,6 +585,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--force", action="store_true", help="rewrite units that already exist")
     ap.add_argument("--dry-run", action="store_true", help="plan and report; write nothing")
+    ap.add_argument("--captions-only", action="store_true",
+                    help="clotho / avcaps: write captions.csv and stop (no audio units)")
     args = ap.parse_args()
     for name in ("durable_root", "scratch_root"):
         v = getattr(args, name)
@@ -421,6 +595,10 @@ def main() -> int:
         setattr(args, name, Path(v))
     if args.twp_root:
         args.twp_root = Path(args.twp_root)
+    if args.corpus in ("clotho", "avcaps"):
+        write_captions(args.corpus, args)
+        if args.captions_only:
+            return 0
     rows = stage_narratives(args) if args.corpus == "narratives" else stage_packed(args.corpus, args)
     if rows and not args.dry_run:
         write_manifest(args.corpus, rows, args)
