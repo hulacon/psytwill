@@ -457,8 +457,14 @@ def stage_avcaps_frames(args) -> None:
     if args.dry_run:
         return
     inputs.mkdir(parents=True, exist_ok=True)
+    lo, hi = 0, len(units)
+    if args.frame_units:  # "START:END" slice of unit indices, for array tasks
+        a, _, b = args.frame_units.partition(":")
+        lo, hi = int(a or 0), min(int(b or len(units)), len(units))
     manifest = []
     for k, unit_clips in enumerate(units):
+        if not lo <= k < hi:
+            continue
         uid = f"f{k:03d}"
         table = inputs / f"{uid}.csv"
         out_dir = args.scratch_root / "avcaps" / "frames" / uid
@@ -475,8 +481,10 @@ def stage_avcaps_frames(args) -> None:
             n_rows = len(rows)
         manifest.append({"unit": uid, "n_clips": len(unit_clips), "n_frames": n_rows,
                          "first_clip": unit_clips[0][1], "last_clip": unit_clips[-1][1]})
-        if (k + 1) % 10 == 0 or k + 1 == len(units):
-            print(f"  {k + 1}/{len(units)} frame units staged", flush=True)
+        print(f"  {uid}: {n_rows} frames", flush=True)
+    if (lo, hi) != (0, len(units)):
+        print(f"staged units [{lo}, {hi}) of {len(units)}; run without --frame-units to write the manifest")
+        return
     with open(inputs.parent / "frames_units.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(manifest[0]))
         w.writeheader()
@@ -672,6 +680,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="plan and report; write nothing")
     ap.add_argument("--frames", action="store_true",
                     help="avcaps: write V frames (PNG) + frame tables instead of audio units")
+    ap.add_argument("--frame-units", default=None, metavar="START:END",
+                    help="avcaps --frames: stage only these unit indices (array tasks); no manifest")
     ap.add_argument("--captions-only", action="store_true",
                     help="clotho / avcaps: write captions.csv and stop (no audio units)")
     args = ap.parse_args()

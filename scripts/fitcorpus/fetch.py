@@ -392,7 +392,10 @@ def fetch_clotho(scratch_root: Path, splits: tuple[str, ...] = CLOTHO_DEFAULT_SP
     if bad:
         raise SystemExit(f"unknown clotho split(s) {sorted(bad)}; choose from {CLOTHO_SPLITS}")
     corpus_dir = scratch_root / "clotho"
-    if manifest_ok(corpus_dir) and all((corpus_dir / s).is_dir() for s in splits):
+    listed = (corpus_dir / MANIFEST).read_text() if (corpus_dir / MANIFEST).exists() else ""
+    # a manifest written by a one-split run must not vouch for the other split
+    if (manifest_ok(corpus_dir) and all((corpus_dir / s).is_dir() for s in splits)
+            and all(f"clotho_audio_{s}.7z" in listed for s in splits)):
         print(f"clotho already present and verified at {corpus_dir}")
         return corpus_dir
     corpus_dir.mkdir(parents=True, exist_ok=True)
