@@ -411,6 +411,12 @@ ADAPTERS = {"librispeech": adapt_librispeech, "gigaspeech": adapt_gigaspeech, "f
 # clip: llstat and gist identical, clip within 2e-7 (l-hub log, 2026-10-09).
 # Each file is named by its own stimulus id, ``ext-avcaps-<clip>-t<ms:07d>``,
 # so viz2psy's default (filename stem) id is the frame id.
+#
+# A unit never mixes frame sizes. Some viz2psy preprocessors keep aspect ratio
+# (depth: a 640x360 frame -> 294x518, a 480x640 one -> 518x686), so a mixed
+# batch cannot be stacked, and a model that pads a batch to its largest image
+# would make one frame's output depend on its neighbours. Within one size every
+# batch looks like the video path's (one clip, one size).
 FRAME_UNIT = 1000
 
 
@@ -418,42 +424,74 @@ def frame_id(corpus: str, clip_native: str, t: float) -> str:
     return ext_id(corpus, f"{clip_native}-t{int(round(t * 1000)):07d}")
 
 
-def _clip_frames(path: Path, out_dir: Path, corpus: str, native: str) -> list[dict]:
-    """Write one clip's frames into ``out_dir``; returns their table rows."""
+def plan_frame_units(clips: list[tuple[str, str, float]], per_unit: int = FRAME_UNIT,
+                     hop: float = HOP) -> list[tuple[str, list[str]]]:
+    """``clips`` = [(native, "<w>x<h>", duration)] -> [(unit_id, [native, ...])].
+
+    Whole clips, grouped by frame size, about ``per_unit`` frames per unit;
+    unit ids are ``<w>x<h>-<k:03d>``.
+    """
+    by_size: dict[str, list[tuple[str, float]]] = {}
+    for native, size, dur in clips:
+        by_size.setdefault(size, []).append((native, dur))
+    units = []
+    for size in sorted(by_size):
+        cur, n, k = [], 0.0, 0
+        for native, dur in by_size[size]:
+            est = dur / hop + 1
+            if cur and n + est > per_unit:
+                units.append((f"{size}-{k:03d}", cur))
+                cur, n, k = [], 0.0, k + 1
+            cur.append(native)
+            n += est
+        if cur:
+            units.append((f"{size}-{k:03d}", cur))
+    return units
+
+
+def _clip_frames(path: Path, clip_dir: Path, corpus: str, native: str, force: bool = False) -> list[dict]:
+    """One clip's frames in ``clip_dir`` (its own directory, so units are just
+    lists); ``frames.csv`` there is the done-marker. Returns the table rows."""
     import shutil
     import tempfile
 
     from viz2psy.video import extract_frames
 
-    with tempfile.TemporaryDirectory(prefix="frames_", dir=out_dir) as tmp:
+    done = clip_dir / "frames.csv"
+    if done.exists() and not force:
+        with open(done, newline="") as f:
+            return list(csv.DictReader(f))
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="frames_", dir=clip_dir) as tmp:
         frames = extract_frames(path, frame_interval=HOP, save_dir=Path(tmp), quiet=True, frame_format="png")
         rows = []
         for t, src in frames:
             sid = frame_id(corpus, native, t)
-            dst = out_dir / f"{sid}.png"
+            dst = clip_dir / f"{sid}.png"
             shutil.move(str(src), dst)
             rows.append({"stimulus_id": sid, "clip_stimulus_id": ext_id(corpus, native),
                          "time": f"{t:.3f}", "path": str(dst)})
+    with open(done, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
     return rows
 
 
 def stage_avcaps_frames(args) -> None:
+    from viz2psy.video import get_video_info
+
     root = args.scratch_root / "avcaps"
     inputs = args.durable_root / "avcaps" / "inputs" / "frames"
-    clips = [(split, native, path) for split in AVCAPS_SPLITS
-             for native, path in _avcaps_videos(root, split).items()]
-    # whole clips per unit, ~FRAME_UNIT frames each (2 frames per second at HOP 0.5)
-    units, cur, n = [], [], 0.0
-    for c in clips:
-        est = media_duration(c[2]) / HOP + 1
-        if cur and n + est > FRAME_UNIT:
-            units.append(cur)
-            cur, n = [], 0.0
-        cur.append(c)
-        n += est
-    if cur:
-        units.append(cur)
-    print(f"avcaps frames: {len(clips)} clips -> {len(units)} units of ~{FRAME_UNIT} frames")
+    paths, plan_in = {}, []
+    for split in AVCAPS_SPLITS:
+        for native, path in _avcaps_videos(root, split).items():
+            info = get_video_info(path)
+            paths[native] = path
+            plan_in.append((native, f"{info['width']}x{info['height']}", media_duration(path)))
+    units = plan_frame_units(plan_in)
+    print(f"avcaps frames: {len(paths)} clips, {len({s for _, s, _ in plan_in})} frame sizes "
+          f"-> {len(units)} units of <= ~{FRAME_UNIT} frames")
     if args.dry_run:
         return
     inputs.mkdir(parents=True, exist_ok=True)
@@ -462,25 +500,24 @@ def stage_avcaps_frames(args) -> None:
         a, _, b = args.frame_units.partition(":")
         lo, hi = int(a or 0), min(int(b or len(units)), len(units))
     manifest = []
-    for k, unit_clips in enumerate(units):
+    for k, (uid, natives) in enumerate(units):
         if not lo <= k < hi:
             continue
-        uid = f"f{k:03d}"
         table = inputs / f"{uid}.csv"
-        out_dir = args.scratch_root / "avcaps" / "frames" / uid
         if table.exists() and not args.force:
             with open(table, newline="") as f:
                 n_rows = sum(1 for _ in csv.DictReader(f))
         else:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            rows = [r for _, native, path in unit_clips for r in _clip_frames(path, out_dir, "avcaps", native)]
+            rows = [r for native in natives
+                    for r in _clip_frames(paths[native], root / "frames" / native, "avcaps", native,
+                                          force=args.force)]
             with open(table, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0]))
                 w.writeheader()
                 w.writerows(rows)
             n_rows = len(rows)
-        manifest.append({"unit": uid, "n_clips": len(unit_clips), "n_frames": n_rows,
-                         "first_clip": unit_clips[0][1], "last_clip": unit_clips[-1][1]})
+        manifest.append({"unit": uid, "n_clips": len(natives), "n_frames": n_rows,
+                         "first_clip": natives[0], "last_clip": natives[-1]})
         print(f"  {uid}: {n_rows} frames", flush=True)
     if (lo, hi) != (0, len(units)):
         print(f"staged units [{lo}, {hi}) of {len(units)}; run without --frame-units to write the manifest")

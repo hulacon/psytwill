@@ -109,3 +109,14 @@ def test_frame_ids_parse_back_to_their_clip():
     assert sid == "ext-avcaps-10001787725-t0012500"
     corpus, native = parse_ext_id(sid)
     assert corpus == "avcaps" and native.rsplit("-t", 1) == ["10001787725", "0012500"]
+
+
+def test_frame_units_never_mix_sizes():
+    clips = [("a", "640x480", 300.0), ("b", "480x640", 30.0), ("c", "640x480", 300.0),
+             ("d", "640x480", 10.0), ("e", "480x640", 20.0)]
+    units = stage.plan_frame_units(clips, per_unit=1000)
+    size = {n: s for n, s, _ in clips}
+    for uid, natives in units:
+        assert {size[n] for n in natives} == {uid.rsplit("-", 1)[0]}
+    assert [u for u, _ in units] == ["480x640-000", "640x480-000", "640x480-001"]
+    assert sorted(n for _, ns in units for n in ns) == list("abcde")
