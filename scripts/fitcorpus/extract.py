@@ -256,6 +256,43 @@ def _staged_transcript_units(corpus: str) -> list[Unit]:
     return out
 
 
+# Clip corpora (l-hub): audio packed with a 10 s gap by stage.py, AVCaps frames
+# staged as PNG (stage.py avcaps --frames), human captions as word2psy text.
+# No transcript source: what is said is not the caption's register.
+STAGED_CLIPS = {
+    "clotho": "Freesound clips with audio-only captions (dev + eval), packed with a 10 s gap",
+    "avcaps": "AVCaps soundtracks (VidOR clips), packed with a 10 s gap",
+}
+CAPTION_SHARD = 5000  # caption rows per word2psy call
+CAPTION_TYPES = {"clotho": ("audio",), "avcaps": ("audio", "visual", "audio_visual")}
+_CAPTION_PREFIX = {"audio": "audiocap_", "visual": "viscap_", "audio_visual": "avcap_"}
+
+
+def _avcaps_frame_units() -> list[Unit]:
+    manifest = ROOTS.durable / "avcaps" / "inputs" / "frames_units.csv"
+    if not manifest.exists():
+        return []
+    out = []
+    with open(manifest, newline="") as f:
+        for row in csv.DictReader(f):
+            table = ROOTS.durable / "avcaps" / "inputs" / "frames" / f"{row['unit']}.csv"
+            with open(table, newline="") as g:
+                paths = [r["path"] for r in csv.DictReader(g)]
+            out.append(Unit(id=row["unit"], out_dir=ROOTS.durable / "avcaps" / "features" / "frames" / row["unit"],
+                            inputs=paths))
+    return out
+
+
+def _caption_shards(corpus: str, ctype: str) -> list[Path]:
+    return sorted((ROOTS.durable / corpus / "inputs" / "captions").glob(f"{ctype}-*.csv"))
+
+
+def _caption_units(corpus: str, ctype: str) -> list[Unit]:
+    return [Unit(id=p.stem, out_dir=ROOTS.durable / corpus / "features" / "captions" / p.stem,
+                 inputs=[str(p)], extra=["--text-column", "caption", "--id-column", "stimulus_id"])
+            for p in _caption_shards(corpus, ctype)]
+
+
 def build_sources() -> list[Source]:
     S: list[Source] = []
     S.append(Source(
@@ -308,6 +345,25 @@ def build_sources() -> list[Source]:
             lambda c=corpus: _staged_transcript_units(c),
             depends=f"{corpus}/audio/transcribe",
         ))
+    for corpus, what in STAGED_CLIPS.items():
+        S.append(Source(
+            corpus, "audio", "aud2psy", "", _ordered_audio(),
+            f"{what}; {GRID_HOP} s hop; diarize/transcribe run before conversation/speech_rate",
+            lambda c=corpus: _staged_units(c),
+        ))
+        for ctype in CAPTION_TYPES[corpus]:
+            S.append(Source(
+                corpus, f"{ctype}cap", "word2psy", _CAPTION_PREFIX[ctype], L_MODELS,
+                f"{corpus} human {ctype.replace('_', '-')} captions, {CAPTION_SHARD} rows per shard, scored as text",
+                lambda c=corpus, t=ctype: _caption_units(c, t),
+                depends="inputs",
+            ))
+    S.append(Source(
+        "avcaps", "frames", "viz2psy", "", [m for m in V_MODELS if m != "motion"],
+        f"AVCaps frames every {GRID_HOP} s via viz2psy's video sampler, staged as PNG and scored "
+        "as images ~1,000 per call (motion is video-only and belongs to D, not V)",
+        _avcaps_frame_units,
+    ))
     return S
 
 
@@ -416,7 +472,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_inputs(args: argparse.Namespace) -> int:
-    """Derived input CSVs: NSD caption shards; CNeuroMod transcript inputs."""
+    """Derived input CSVs: NSD caption shards; transcript inputs; clip-corpus caption shards."""
     import pandas as pd
 
     n_written = 0
@@ -443,6 +499,27 @@ def cmd_inputs(args: argparse.Namespace) -> int:
     for corpus in STAGED_WHISPER:
         n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _staged_units(corpus))
         print(f"{corpus} transcripts: {n} input CSVs written")
+
+    # clip-corpus captions: stage.py's captions.csv, sharded per caption type
+    for corpus, ctypes in CAPTION_TYPES.items():
+        src = ROOTS.durable / corpus / "inputs" / "captions.csv"
+        if not src.exists():
+            print(f"{corpus} captions: {src} missing (stage.py {corpus} writes it)")
+            continue
+        df = pd.read_csv(src, keep_default_na=False)
+        out_dir = src.parent / "captions"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for ctype in ctypes:
+            sub = df[df.caption_type == ctype][["stimulus_id", "caption"]]
+            n_new = 0
+            for k in range(0, len(sub), CAPTION_SHARD):
+                p = out_dir / f"{ctype}-{k // CAPTION_SHARD:03d}.csv"
+                if p.exists() and not args.force:
+                    continue
+                sub.iloc[k:k + CAPTION_SHARD].to_csv(p, index=False)
+                n_new += 1
+            print(f"{corpus} {ctype} captions: {len(sub)} rows in {-(-len(sub) // CAPTION_SHARD)} shards "
+                  f"({n_new} written)")
     return 0
 
 

@@ -18,6 +18,7 @@ from the table.
     stage.py twp-unpresented  ... --twp-root <bids>/stimuli
     stage.py clotho           ...   (dev + eval clips; also writes captions.csv)
     stage.py avcaps           ...   (MP4 soundtracks; also writes captions.csv)
+    stage.py avcaps --frames  ...   (V frames as PNG, viz2psy's own sampler; see below)
 
 Writes (idempotent; a unit whose wav and tables exist is skipped unless
 --force):
@@ -400,6 +401,90 @@ ADAPTERS = {"librispeech": adapt_librispeech, "gigaspeech": adapt_gigaspeech, "f
 
 
 # ---------------------------------------------------------------------------
+# Frames (V input for clip corpora whose videos differ in size)
+# ---------------------------------------------------------------------------
+# viz2psy scores one video per call, so 2,061 short clips x the V battery would
+# be ~29k model loads. Instead each clip's frames are written with viz2psy's own
+# video sampler (`viz2psy.video.extract_frames`: t = k*hop, frame int(t*fps),
+# BGR->RGB, blank/frozen guards) as lossless PNG, and the image path scores
+# ~FRAME_UNIT of them per call. Checked against the video path on an AVCaps
+# clip: llstat and gist identical, clip within 2e-7 (l-hub log, 2026-10-09).
+# Each file is named by its own stimulus id, ``ext-avcaps-<clip>-t<ms:07d>``,
+# so viz2psy's default (filename stem) id is the frame id.
+FRAME_UNIT = 1000
+
+
+def frame_id(corpus: str, clip_native: str, t: float) -> str:
+    return ext_id(corpus, f"{clip_native}-t{int(round(t * 1000)):07d}")
+
+
+def _clip_frames(path: Path, out_dir: Path, corpus: str, native: str) -> list[dict]:
+    """Write one clip's frames into ``out_dir``; returns their table rows."""
+    import shutil
+    import tempfile
+
+    from viz2psy.video import extract_frames
+
+    with tempfile.TemporaryDirectory(prefix="frames_", dir=out_dir) as tmp:
+        frames = extract_frames(path, frame_interval=HOP, save_dir=Path(tmp), quiet=True, frame_format="png")
+        rows = []
+        for t, src in frames:
+            sid = frame_id(corpus, native, t)
+            dst = out_dir / f"{sid}.png"
+            shutil.move(str(src), dst)
+            rows.append({"stimulus_id": sid, "clip_stimulus_id": ext_id(corpus, native),
+                         "time": f"{t:.3f}", "path": str(dst)})
+    return rows
+
+
+def stage_avcaps_frames(args) -> None:
+    root = args.scratch_root / "avcaps"
+    inputs = args.durable_root / "avcaps" / "inputs" / "frames"
+    clips = [(split, native, path) for split in AVCAPS_SPLITS
+             for native, path in _avcaps_videos(root, split).items()]
+    # whole clips per unit, ~FRAME_UNIT frames each (2 frames per second at HOP 0.5)
+    units, cur, n = [], [], 0.0
+    for c in clips:
+        est = media_duration(c[2]) / HOP + 1
+        if cur and n + est > FRAME_UNIT:
+            units.append(cur)
+            cur, n = [], 0.0
+        cur.append(c)
+        n += est
+    if cur:
+        units.append(cur)
+    print(f"avcaps frames: {len(clips)} clips -> {len(units)} units of ~{FRAME_UNIT} frames")
+    if args.dry_run:
+        return
+    inputs.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for k, unit_clips in enumerate(units):
+        uid = f"f{k:03d}"
+        table = inputs / f"{uid}.csv"
+        out_dir = args.scratch_root / "avcaps" / "frames" / uid
+        if table.exists() and not args.force:
+            with open(table, newline="") as f:
+                n_rows = sum(1 for _ in csv.DictReader(f))
+        else:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rows = [r for _, native, path in unit_clips for r in _clip_frames(path, out_dir, "avcaps", native)]
+            with open(table, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0]))
+                w.writeheader()
+                w.writerows(rows)
+            n_rows = len(rows)
+        manifest.append({"unit": uid, "n_clips": len(unit_clips), "n_frames": n_rows,
+                         "first_clip": unit_clips[0][1], "last_clip": unit_clips[-1][1]})
+        if (k + 1) % 10 == 0 or k + 1 == len(units):
+            print(f"  {k + 1}/{len(units)} frame units staged", flush=True)
+    with open(inputs.parent / "frames_units.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(manifest[0]))
+        w.writeheader()
+        w.writerows(manifest)
+    print(f"wrote {inputs.parent / 'frames_units.csv'} ({sum(m['n_frames'] for m in manifest)} frames)")
+
+
+# ---------------------------------------------------------------------------
 # Captions (word2psy input for captioned corpora)
 # ---------------------------------------------------------------------------
 
@@ -585,6 +670,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--force", action="store_true", help="rewrite units that already exist")
     ap.add_argument("--dry-run", action="store_true", help="plan and report; write nothing")
+    ap.add_argument("--frames", action="store_true",
+                    help="avcaps: write V frames (PNG) + frame tables instead of audio units")
     ap.add_argument("--captions-only", action="store_true",
                     help="clotho / avcaps: write captions.csv and stop (no audio units)")
     args = ap.parse_args()
@@ -595,6 +682,11 @@ def main() -> int:
         setattr(args, name, Path(v))
     if args.twp_root:
         args.twp_root = Path(args.twp_root)
+    if args.frames:
+        if args.corpus != "avcaps":
+            sys.exit("ERROR: --frames is implemented for avcaps only")
+        stage_avcaps_frames(args)
+        return 0
     if args.corpus in ("clotho", "avcaps"):
         write_captions(args.corpus, args)
         if args.captions_only:

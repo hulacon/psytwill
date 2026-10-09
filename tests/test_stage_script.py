@@ -100,3 +100,12 @@ def test_captioned_corpora_pack_with_the_wide_gap():
     unit = stage.pack_groups([(s.group, [s]) for s in seg], target=3600, hop=stage.HOP,
                              gap=stage.GAPS["clotho"])[0]
     assert unit.onsets[1] - unit.offsets[0] >= 10.0
+
+
+def test_frame_ids_parse_back_to_their_clip():
+    from psytwill.fitcorpus import parse_ext_id
+
+    sid = stage.frame_id("avcaps", "10001787725", 12.5)
+    assert sid == "ext-avcaps-10001787725-t0012500"
+    corpus, native = parse_ext_id(sid)
+    assert corpus == "avcaps" and native.rsplit("-t", 1) == ["10001787725", "0012500"]
