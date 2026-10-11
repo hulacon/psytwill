@@ -696,7 +696,7 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
 
 #: what `space fit --like` copies from a manifest; passing any of these as well is refused
 _LIKE_OWNED = ("features", "block", "members", "defer_members", "key", "window", "exclude_ids",
-               "exclude_rows", "k_schedule")
+               "exclude_rows")
 
 
 def _apply_like(args: argparse.Namespace) -> dict:
@@ -704,8 +704,10 @@ def _apply_like(args: argparse.Namespace) -> dict:
 
     The inputs, rows, members, deferrals, folds, corpus handling and criterion
     all come from the manifest; ``--member-scaling``, ``--fixed-k`` (default:
-    the manifest's k) and ``--no-criterion`` are the caller's. Returns the
-    provenance recorded in the new manifest.
+    the manifest's k), ``--k-schedule`` and ``--no-criterion`` are the
+    caller's. A ``--k-schedule`` walks the variant to its OWN k under the
+    source's criterion (a variant's k need not be its source's), so k is then
+    not fixed. Returns the provenance recorded in the new manifest.
     """
     import hashlib
     import json
@@ -736,7 +738,11 @@ def _apply_like(args: argparse.Namespace) -> dict:
     for a, c in (("r2_min", "r2_min"), ("alpha", "alpha"), ("k_nn", "k_nn"), ("n_perm", "n_perm"),
                  ("eval_n", "eval_n"), ("block_size", "block_size"), ("seed", "random_state")):
         setattr(args, a, crit[c])
-    if args.fixed_k is None:
+    if args.k_schedule and args.fixed_k is not None:
+        raise SpaceError("--k-schedule walks to the variant's own k; --fixed-k freezes it: give one")
+    if args.k_schedule and args.no_criterion:
+        raise SpaceError("--k-schedule needs the criterion to choose k; drop --no-criterion")
+    if args.fixed_k is None and not args.k_schedule:
         args.fixed_k = int(m["k"])
     return {"manifest": str(path.resolve()), "manifest_sha256": hashlib.sha256(raw).hexdigest(),
             "block": m["block"], "k": m["k"], "member_scaling": m.get("member_scaling", "pr")}
@@ -1564,7 +1570,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the criterion (needs --fixed-k or --like): fit the map on all rows only")
     f.add_argument("--like", metavar="MANIFEST",
                    help="copy inputs, rows, members, folds, corpus handling, criterion and k from this "
-                        "fit's manifest; only --member-scaling / --fixed-k / --no-criterion may differ")
+                        "fit's manifest; only --member-scaling / --fixed-k / --k-schedule / --no-criterion "
+                        "may differ (--k-schedule walks the variant to its own k)")
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
     f.set_defaults(func=_run_space_fit)

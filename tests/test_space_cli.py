@@ -374,6 +374,20 @@ def test_like_reproduces_the_fit_and_varies_only_the_scaling(two_corpora, tmp_pa
     np.testing.assert_allclose(w[cols].to_numpy(), c[cols].to_numpy() / np.sqrt(a["block_eigenvalues"][:len(cols)]),
                                rtol=1e-8)
     assert json.loads((tmp_path / "wht.meta.json").read_text())["view"] == "whitened"
+    # a schedule walks the variant to its own k under the source's criterion
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--member-scaling", "zscore",
+                 "--k-schedule", "1,2", "-o", str(out), "--stem", "B0_walk"]) == 0
+    walk = json.loads((out / "B0_walk.json").read_text())
+    assert walk["fixed_k"] is None and walk["like"]["k"] == p["k"]
+    assert walk["criterion"]["scope"] == "per_corpus" and walk["grouped"] is True
+    assert set(pd.read_csv(out / "B0_walk_curve.csv")["k"]) <= {1, 2, walk["concat_rank"]}
+    capsys.readouterr()
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--k-schedule", "1", "--fixed-k", "1",
+                 "-o", str(out)]) == 1
+    assert "give one" in capsys.readouterr().err
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--k-schedule", "1", "--no-criterion",
+                 "-o", str(out)]) == 1
+    assert "drop --no-criterion" in capsys.readouterr().err
     # --like owns the inputs
     capsys.readouterr()
     assert main(["space", "fit", "--like", str(out / "P.json"), "--block", "X", "-o", str(out)]) == 1
