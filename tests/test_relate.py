@@ -214,3 +214,92 @@ def test_fixed_k_freezes_the_map_and_still_records_the_prefix():
     rng = np.random.RandomState(1)
     none = fit_relation(rng.randn(300, 8), rng.randn(300, 6), name="PQ", n_perm=0, fixed_k=2)
     assert none.k == 2 and none.manifest["prefix_k"] == 0
+
+
+# --- per-register coupling (relate schema 1.2) --------------------------------
+
+
+def _two_registers(n=300, seed=3):
+    """One shared latent block; register 'x' couples tightly, register 'y' loosely."""
+    rng = np.random.RandomState(seed)
+    z = rng.randn(2 * n, K_SHARED)
+    noise = np.r_[np.full(n, 0.2), np.full(n, 1.0)][:, None]
+    A = np.hstack([z, rng.randn(2 * n, D_A - K_SHARED)]) @ rng.randn(D_A, D_A)
+    zb = z + noise * rng.randn(2 * n, K_SHARED)
+    B = np.hstack([zb, rng.randn(2 * n, D_B - K_SHARED)]) @ rng.randn(D_B, D_B)
+    return A, B, np.r_[["x"] * n, ["y"] * n]
+
+
+def test_registers_keep_their_own_coupling_and_leave_the_map_alone():
+    A, B, reg = _two_registers()
+    plain = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED)
+    fit = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED, registers=reg, register_key="test")
+    np.testing.assert_allclose(fit.project(A, "a"), plain.project(A, "a"))
+    assert fit.manifest["r_cv"] == plain.manifest["r_cv"]
+    assert plain.manifest["per_register"] is None and plain.manifest["register_key"] is None
+    pr = fit.manifest["per_register"]
+    assert fit.manifest["register_key"] == "test" and set(pr) == {"x", "y"}
+    assert pr["x"]["n"] == pr["y"]["n"] == 300 and pr["x"]["full_rank"]
+    assert min(pr["x"]["r"]) > max(pr["y"]["r"])  # the tight register couples more strongly on every direction
+
+
+def test_conditional_is_the_within_register_regression():
+    A, B, reg = _two_registers()
+    fit = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED, registers=reg)
+    Pa, Pb = fit.project(A, "a"), fit.project(B, "b")
+    for r in ("x", "y"):
+        a, b = Pa[reg == r], Pb[reg == r]
+        # full: ordinary least squares of b on a within the register, residual covariance of its residuals
+        coef, icpt, resid = fit.conditional(r, given="a")
+        X1 = np.c_[np.ones(len(a)), a]
+        beta = np.linalg.lstsq(X1, b, rcond=None)[0]
+        np.testing.assert_allclose(icpt, beta[0], atol=1e-10)
+        np.testing.assert_allclose(coef, beta[1:].T, atol=1e-10)
+        np.testing.assert_allclose(resid, np.cov(b - X1 @ beta, rowvar=False), atol=1e-10)
+        # diagonal: l-hub settle 4's register model, mu = my + sy r (p - mp) / sp, var = sy^2 (1 - r^2)
+        coef_d, icpt_d, resid_d = fit.conditional(r, given="a", diagonal=True)
+        my, sy, mp, sp = b.mean(0), b.std(0, ddof=1), a.mean(0), a.std(0, ddof=1)
+        rr = np.array([np.corrcoef(a[:, j], b[:, j])[0, 1] for j in range(K_SHARED)])
+        np.testing.assert_allclose(icpt_d + a @ coef_d.T, my + sy * rr * (a - mp) / sp, atol=1e-10)
+        np.testing.assert_allclose(np.diag(resid_d), sy ** 2 * (1 - rr ** 2), atol=1e-10)
+        np.testing.assert_allclose(fit.manifest["per_register"][r]["r"], rr, atol=1e-10)
+        # and the other direction
+        coef_b, icpt_b, _ = fit.conditional(r, given="b")
+        beta_b = np.linalg.lstsq(np.c_[np.ones(len(b)), b], a, rcond=None)[0]
+        np.testing.assert_allclose(coef_b, beta_b[1:].T, atol=1e-10)
+
+
+def test_registers_round_trip_and_refuse_what_they_cannot_say(tmp_path):
+    A, B, reg = _two_registers()
+    reg = reg.astype(object)  # a "<U1" array would truncate the new label
+    reg[:5] = "tiny"  # 5 rows <= 2k: a singular joint covariance
+    fit = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED, registers=reg)
+    assert fit.manifest["per_register"]["tiny"]["full_rank"] is False
+    _, manifest = save_relation(fit, tmp_path, stem="PQ_v0.2")
+    back = load_relation(manifest)
+    for r in ("x", "y"):
+        for got, want in zip(back.conditional(r), fit.conditional(r)):
+            np.testing.assert_allclose(got, want, atol=1e-12)
+    with pytest.raises(SpaceError, match="singular"):
+        back.conditional("tiny")
+    back.conditional("tiny", diagonal=True)  # the per-direction coupling is still defined
+    with pytest.raises(SpaceError, match="no register 'z'"):
+        back.conditional("z")
+    with pytest.raises(SpaceError, match="one label per row"):
+        fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED, registers=reg[:-1])
+
+
+def test_cli_registers_from_label(tmp_path):
+    A, B, _ = _latents()
+    half = N_ITEMS // 2
+    ids = [f"ext-{'librispeech' if i < half else 'musopen'}-{i:04d}" for i in range(N_ITEMS)]
+    a = _write_block(tmp_path, "P", A, {"stimulus_id": ids})
+    b = _write_block(tmp_path, "Q", B, {"stimulus_id": ids})
+    out = tmp_path / "rel"
+    assert main(["space", "relate", "fit", "--a", str(a), "--b", str(b), "--name", "PQ", "--n-perm", "20",
+                 "--registers-from-label", "-o", str(out), "--stem", "PQ_v0.2"]) == 0
+    m = json.loads((out / "PQ_v0.2.json").read_text())
+    assert m["relate_schema_version"] == "1.2" and m["register_key"].startswith("corpus")
+    assert {r: v["n"] for r, v in m["per_register"].items()} == {"librispeech": half, "musopen": N_ITEMS - half}
+    w = np.load(out / "PQ_v0.2.npz")
+    assert w["reg::musopen::cov"].shape == (2 * m["k"], 2 * m["k"])

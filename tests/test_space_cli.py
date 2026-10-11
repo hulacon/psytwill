@@ -252,7 +252,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.13"
+    assert manifest["space_schema_version"] == "1.14"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
@@ -338,6 +338,7 @@ def test_like_reproduces_the_fit_and_varies_only_the_scaling(two_corpora, tmp_pa
             "-o", str(out), "--stem", "P", *FIT_ARGS]
     assert main(base) == 0
     p = json.loads((out / "P.json").read_text())
+    assert p["per_member"]["a"]["window_source"] == "undeclared" and p["per_member"]["a"]["window_sec"] is None
     # same settings, default scaling, no criterion: the map is the source fit's, bit for bit
     assert main(["space", "fit", "--like", str(out / "P.json"), "--no-criterion", "-o", str(out),
                  "--stem", "P_again"]) == 0

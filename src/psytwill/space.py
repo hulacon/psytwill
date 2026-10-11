@@ -107,6 +107,41 @@ def member_source(member: str) -> tuple[str, tuple[str, ...] | None]:
     return member, None
 
 
+def resolve_member_windows(members: Sequence[str],
+                           declared: dict[str, set[float]] | None = None) -> dict[str, dict]:
+    """``{member: {"window_sec", "window_source"}}`` -- the context window each
+    member's rows see (Contract B ``window_sec``; None = only its own grid step).
+
+    From the producers' sidecars when the inputs declare it (``declared``,
+    model -> values, as :func:`psytwill.features.group_window_sec` reads
+    them), else from the battery registry, else "undeclared". Refused: inputs
+    declaring two windows for one model, or a declaration contradicting the
+    registry -- either way the member's rows do not see one window.
+    """
+    from psytwill.battery import BATTERY
+
+    declared = declared or {}
+    out = {}
+    for m in members:
+        model = member_source(m)[0]
+        vals = declared.get(model, set())
+        pinned = BATTERY.get(model)
+        if len(vals) > 1:
+            raise SpaceError(f"member {m!r}: its inputs declare windows {sorted(vals)} s for {model!r}; "
+                             "a member's rows must all see one window")
+        if vals:
+            (w,) = vals
+            if pinned is not None and pinned.window_sec != w:
+                raise SpaceError(f"member {m!r}: the inputs declare window_sec {w} for {model!r} but the "
+                                 f"battery registry pins {pinned.window_sec}; fix whichever is wrong")
+            out[m] = {"window_sec": w, "window_source": "sidecar"}
+        elif pinned is not None:
+            out[m] = {"window_sec": pinned.window_sec, "window_source": "battery"}
+        else:
+            out[m] = {"window_sec": None, "window_source": "undeclared"}
+    return out
+
+
 def split_members(models: Sequence[str]) -> list[str]:
     """``models`` with each split model replaced by its members, in order."""
     out: list[str] = []
@@ -143,7 +178,12 @@ def split_members(models: Sequence[str]) -> list[str]:
 # for "pr" and "pcs" members, so either scaling's coordinates can be read from
 # one fit (absent = a "pr" fit, whose eigenvalues are 1/scales^2). The spread
 # floor reads the member in whitened coordinates whatever its scaling.
-SPACE_SCHEMA_VERSION = "1.13"
+# 1.14: `per_member[m]["window_sec"]` and `["window_source"]` ("sidecar" |
+# "battery" | "undeclared"): the context window each member's rows see
+# (DECIDED 2026-10-10, psytwill-space 0.2.0: each member's window declared in
+# its manifest; see :func:`resolve_member_windows`).
+SPACE_SCHEMA_VERSION = "1.14"
+WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
 #: placed by the fold map that did not see it (see :func:`fit_block`).

@@ -751,6 +751,14 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     if args.no_criterion and args.fixed_k is None:
         raise SpaceError("--no-criterion leaves nothing to choose k: give --fixed-k (or --like)")
     spaces, members, n_excl, rep = _space_load(args)
+    from psytwill.features import group_window_sec
+    from psytwill.space import resolve_member_windows
+
+    declared: dict = {}
+    for path in args.features:
+        for model, vals in group_window_sec(path).items():
+            declared.setdefault(model, set()).update(vals)
+    windows = resolve_member_windows(members, declared)  # refuses before the fit, not after
     groups = None
     corpora = None
     schedule = tuple(int(k) for k in args.k_schedule.split(",")) if args.k_schedule else DEFAULT_K_SCHEDULE
@@ -816,6 +824,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
 
     fit.manifest["member_sources"] = {m: member_source(m)[0] for m in members
                                       if member_source(m)[1] is not None}
+    for m, w in windows.items():
+        fit.manifest["per_member"][m].update(w)
     fit.manifest["inputs"] = [str(p) for p in args.features]
     fit.manifest["key"] = args.key
     fit.manifest["window"] = args.window
@@ -928,7 +938,8 @@ def _run_relate_fit(args: argparse.Namespace) -> None:
     a, b = read_scores(args.a), read_scores(args.b)
     fit = relate_tables(a, b, name=args.name, join=args.join.split(","), pool_a=args.pool_a, pool_b=args.pool_b,
                         exclude_ids=_read_ids(args.exclude_ids), exclude_ids_file=args.exclude_ids,
-                        groups_from_label=args.groups_from_label, scope=args.scope, n_splits=args.n_splits,
+                        groups_from_label=args.groups_from_label,
+                        registers_from_label=args.registers_from_label, scope=args.scope, n_splits=args.n_splits,
                         n_perm=args.n_perm, block_size=args.block_size, r_min=args.r_min,
                         rank_cap=args.rank_cap, random_state=args.seed, fixed_k=args.fixed_k)
     npz, manifest = save_relation(fit, args.output, stem=args.stem)
@@ -940,6 +951,10 @@ def _run_relate_fit(args: argparse.Namespace) -> None:
           if fit.k < len(m['r_cv']) else f"  held-out r: first {m['r_cv'][0]:.3f}")
     print(f"  subspace stability (fold vs full, mean sq. canonical r): a {st['a']['mean']:.3f} (min {st['a']['min']:.3f}), "
           f"b {st['b']['mean']:.3f} (min {st['b']['min']:.3f})")
+    if m["per_register"]:
+        print("  per-register r (first, k-th): " + "; ".join(
+            f"{r} n={v['n']} {v['r'][0]:.3f}, {v['r'][-1]:.3f}{'' if v['full_rank'] else ' (n <= 2k)'}"
+            for r, v in m["per_register"].items()))
     print(f"  {manifest}\n  {npz}")
 
 
@@ -1007,7 +1022,7 @@ def _run_release_write(args: argparse.Namespace) -> None:
 
     rel = build_release(name=args.name, version=args.version, blocks=args.blocks, relations=args.relations or [],
                         absent=[parse_absent(a) for a in (args.absent or [])], note=args.note,
-                        model_prefix=args.model_prefix)
+                        model_prefix=args.model_prefix, data_root=args.data_root)
     path = write_release(rel, args.output)
     b = ", ".join(f"{n} k={e['k']}" for n, e in rel["blocks"].items())
     r = ", ".join(f"{n} ({e['a']}<->{e['b']}) k={e['k']}" for n, e in rel["relations"].items()) or "none"
@@ -1021,7 +1036,9 @@ def _run_release_verify(args: argparse.Namespace) -> None:
     rel = load_release(args.release)
     m = rel.meta
     print(f"psytwill space release {rel.label}: {len(m['blocks'])} blocks, {len(m['relations'])} relations, "
-          f"{len(m['absent'])} absences; every pinned file matches")
+          f"{len(m['absent'])} absences"
+          + (f", {len(m['exclusions'])} exclusion lists" if m.get("exclusions") else "")
+          + "; every pinned file matches")
 
 
 def _run_release_project(args: argparse.Namespace) -> None:
@@ -1588,6 +1605,10 @@ def build_parser() -> argparse.ArgumentParser:
     rf.add_argument("--pool-b", choices=["none", "mean"], default="none", help="as --pool-a, for side b")
     rf.add_argument("--groups-from-label", action="store_true",
                     help="grouped folds keyed on the first join column (clip id)")
+    rf.add_argument("--registers-from-label", action="store_true",
+                    help="keep each register's coupling (joint moments of the top-k variates), the register "
+                         "read as the corpus of the first join column's ext-<corpus>-* id; k and the map are "
+                         "still fitted on all rows")
     rf.add_argument("--n-splits", type=int, default=5)
     rf.add_argument("--n-perm", type=int, default=250)
     rf.add_argument("--block-size", type=int, help="block-permutation width for temporal grids")
@@ -1628,6 +1649,8 @@ def build_parser() -> argparse.ArgumentParser:
     rw.add_argument("--model-prefix", default="pspace",
                     help="store model names a projection writes, <prefix>_<block> (default pspace); a "
                          "baseline release takes its own, e.g. b0")
+    rw.add_argument("--data-root", help="the fit-corpora directory: every exclusion file a pinned fit names must "
+                                        "lie under it (required when any does); each is pinned by sha256")
     rw.add_argument("-o", "--output", required=True, help="output directory (file: <name>_<version>.json)")
     rw.set_defaults(func=_run_release_write)
     rpj = rlsub.add_parser("project", help="place a stimulus set in a release, written as a Contract B family")

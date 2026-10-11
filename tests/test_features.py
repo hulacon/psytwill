@@ -511,3 +511,22 @@ def test_table_without_a_sidecar_declares_nothing(tmp_path):
 
     with pytest.warns(UserWarning, match="no sidecar"):
         assert group_nulls(tmp_path / "orphan.parquet") == {}
+
+
+def test_window_sec_is_carried_into_the_table_sidecar(tmp_path):
+    from psytwill.features import group_window_sec
+
+    f = frames_fixture(tmp_path)
+    side = f.with_suffix(".meta.json")
+    meta = json.loads(side.read_text())
+    meta["models"]["ebind_audio"]["window_sec"] = 2.0
+    side.write_text(json.dumps(meta))
+    build_features([f], tmp_path / "frames_features.csv")
+    out = json.loads((tmp_path / "frames_features.meta.json").read_text())
+    assert out["inputs"][0]["models"]["ebind_audio"]["window_sec"] == 2.0
+    assert group_window_sec(tmp_path / "frames_features.csv") == {"ebind_audio": {2.0}}
+    # a model whose rows see only their own grid step declares nothing, and nothing is written
+    build_features([image_fixture(tmp_path)], tmp_path / "img_features.csv")
+    img = json.loads((tmp_path / "img_features.meta.json").read_text())
+    assert all("window_sec" not in v for v in img["inputs"][0]["models"].values())
+    assert group_window_sec(tmp_path / "img_features.csv") == {}

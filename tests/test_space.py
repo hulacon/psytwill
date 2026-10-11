@@ -35,6 +35,7 @@ from psytwill.space import (
     block_view,
     load_fit,
     member_spread,
+    resolve_member_windows,
     save_fit,
     structural_fill_values,
     unscoreable_reason,
@@ -318,7 +319,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.13"
+        assert meta["space_schema_version"] == "1.14"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -686,7 +687,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.13"
+        assert meta["space_schema_version"] == "1.14"
 
 
 
@@ -1255,3 +1256,25 @@ class TestPcsScalingAndBlockViews:
         np.testing.assert_array_equal(block_view(S, fit.map.block_eigenvalues), S)
         with pytest.raises(SpaceError, match="unknown block view"):
             block_view(S, fit.map.block_eigenvalues, "correlation")
+
+
+class TestMemberWindows:
+    """0.2.0 format (DECIDED 2026-10-10): each member's context window is declared in its manifest."""
+
+    def test_battery_fallback_and_undeclared(self):
+        got = resolve_member_windows(["clap", "egemaps", "faces_extent", "a"])
+        assert got["clap"] == {"window_sec": 10.0, "window_source": "battery"}
+        assert got["egemaps"] == {"window_sec": None, "window_source": "battery"}  # its own grid step
+        assert got["faces_extent"]["window_source"] == "battery"  # a split member reads its source model
+        assert got["a"] == {"window_sec": None, "window_source": "undeclared"}
+
+    def test_sidecar_declaration_wins_when_it_agrees(self):
+        got = resolve_member_windows(["clap", "a"], {"clap": {10.0}, "a": {3.0}})
+        assert got["clap"] == {"window_sec": 10.0, "window_source": "sidecar"}
+        assert got["a"] == {"window_sec": 3.0, "window_source": "sidecar"}
+
+    def test_disagreements_are_refused(self):
+        with pytest.raises(SpaceError, match="battery registry pins 10.0"):
+            resolve_member_windows(["clap"], {"clap": {2.0}})
+        with pytest.raises(SpaceError, match="one window"):
+            resolve_member_windows(["a"], {"a": {1.0, 2.0}})

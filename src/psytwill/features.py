@@ -34,7 +34,7 @@ import pandas as pd
 from psytwill import __version__
 from psytwill.exceptions import EmptyInputError, InputError, SpaceError
 from psytwill.matrices import resolve_labels
-from psytwill.sidecar import load_sidecar, model_checkpoint, model_nulls
+from psytwill.sidecar import load_sidecar, model_checkpoint, model_nulls, model_window_sec
 from psytwill.spaces import INDEX_COLUMNS, detect_embedding_spaces
 
 # 1.1 (psytwill 0.20.0): each input's model entries carry the producer's
@@ -208,7 +208,9 @@ def _melt_input(
         "modality": modality,
         "n_feature_columns": len(feature_cols),
         "models": {
-            name: {"checkpoint": model_checkpoint(meta, name), "nulls": model_nulls(meta, name)}
+            name: {"checkpoint": model_checkpoint(meta, name), "nulls": model_nulls(meta, name),
+                   # only when declared: an absent key is what every older table holds
+                   **({"window_sec": w} if (w := model_window_sec(meta, name)) is not None else {})}
             for name in sorted(set(models.values()))
         },
     }
@@ -282,6 +284,20 @@ def group_nulls(table: str | Path) -> dict[str, Any]:
     if "model_nulls" in meta:
         return dict(meta["model_nulls"])
     return {m: None for m in meta.get("models", [])}
+
+
+def group_window_sec(table: str | Path) -> dict[str, set[float]]:
+    """``{model: {window_sec, ...}}`` declared by a group table's inputs (empty
+    when no input declares one; several values mean the inputs disagree)."""
+    meta_path = Path(table).with_suffix(".meta.json")
+    if not meta_path.exists():
+        return {}
+    out: dict[str, set[float]] = {}
+    for entry in json.loads(meta_path.read_text()).get("inputs", []):
+        for model, info in (entry.get("models") or {}).items():
+            if isinstance(info, dict) and info.get("window_sec") is not None:
+                out.setdefault(model, set()).add(float(info["window_sec"]))
+    return out
 
 
 def refresh_group_nulls(table: str | Path) -> dict[str, Any]:

@@ -76,7 +76,7 @@ def space(tmp_path_factory):
     for version in ("0.1.0", "0.2.0"):
         assert main(["space", "release", "write", "--name", "sp", "--version", version,
                      "--blocks", str(sp / "V_t.json"), str(sp / "L_t.json"),
-                     "--relations", str(sp / "rel" / "VL_t.json"), "-o", str(rels)]) == 0
+                     "--relations", str(sp / "rel" / "VL_t.json"), "--data-root", str(tmp), "-o", str(rels)]) == 0
     reg = tmp / "registry.tsv"
     pd.DataFrame({"stimulus_id": [f"img{i + 1:04d}" for i in range(N_HELD)], "tid": range(N_HELD)}).to_csv(
         reg, sep="\t", index=False)
@@ -242,7 +242,7 @@ def test_baseline_release_writes_its_own_model_prefix(space, tmp_path, capsys):
     rels = tmp_path / "rel"
     assert main(["space", "release", "write", "--name", "b0", "--version", "0.1.0", "--model-prefix", "b0",
                  "--blocks", str(sp / "V_t.json"), str(sp / "L_t.json"),
-                 "--relations", str(sp / "rel" / "VL_t.json"), "-o", str(rels)]) == 0
+                 "--relations", str(sp / "rel" / "VL_t.json"), "--data-root", str(space["tmp"]), "-o", str(rels)]) == 0
     assert json.loads((rels / "b0_0.1.0.json").read_text())["model_prefix"] == "b0"
     out = tmp_path / "store" / "toy" / "b0"
     argv = _argv(space, out)

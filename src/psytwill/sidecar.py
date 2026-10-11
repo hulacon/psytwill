@@ -102,6 +102,22 @@ def model_nulls(sidecar: dict[str, Any] | None, space_name: str) -> dict[str, An
     return entry["nulls"]
 
 
+def model_window_sec(sidecar: dict[str, Any] | None, space_name: str) -> float | None:
+    """The Contract B ``window_sec`` a model's entry declares, or ``None``.
+
+    ``None`` cannot tell "each row sees only its own grid step" (the contract
+    omits the key then) from a sidecar written before producers emitted it,
+    so a consumer falls back to the battery registry rather than read it as
+    either (see :func:`psytwill.space.resolve_member_windows`).
+    """
+    if not sidecar:
+        return None
+    entry = sidecar.get("models", {}).get(space_name)
+    if not isinstance(entry, dict) or entry.get("window_sec") is None:
+        return None
+    return float(entry["window_sec"])
+
+
 def model_checkpoint(sidecar: dict[str, Any] | None, space_name: str) -> str | None:
     """The checkpoint recorded for a space's model, if any.
 
