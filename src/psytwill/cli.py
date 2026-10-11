@@ -862,7 +862,7 @@ def _run_space_project(args: argparse.Namespace) -> None:
 
     fit = load_fit(args.space)
     spaces, _, _, _ = _space_load(args, members=fit.members)
-    S, labels = fit.project(spaces)
+    S, labels = fit.project(spaces, view=args.view)
     df = pd.DataFrame(S, columns=[f"{fit.block}_{j:03d}" for j in range(S.shape[1])])
     keys = args.key.split(",")
     parts = [lab.split("|") for lab in labels]
@@ -875,7 +875,7 @@ def _run_space_project(args: argparse.Namespace) -> None:
     else:
         df.to_csv(out, index=False)
     meta = {"space": str(args.space), "block": fit.block, "k": fit.k, "inputs": [str(p) for p in args.features],
-            "key": args.key, "window": args.window, "rows": int(len(df))}
+            "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view}
     (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
     print(f"psytwill space project [{fit.block}, k={fit.k}] -> {out}  ({len(df)} rows)")
 
@@ -1536,9 +1536,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "equally in the member whiteners and the block covariance; the criterion "
                         "is not weighted. For a mix whose corpora differ in size")
     _space_criterion(f)
-    f.add_argument("--member-scaling", choices=["pr", "zscore"], default="pr",
-                   help="pr: whiten each member to its participation ratio (psytwill-space); zscore: "
-                        "z-score only, so members weigh by width (the structure-free baseline)")
+    f.add_argument("--member-scaling", choices=["pr", "pcs", "zscore"], default="pr",
+                   help="pr: whiten each member to its participation ratio (psytwill-space); pcs: the "
+                        "same ceil(PR) directions kept at their own variance (variance-weighted block); "
+                        "zscore: z-score only, so members weigh by width (the structure-free baseline)")
     f.add_argument("--fixed-k", type=int,
                    help="freeze at this k instead of walking the schedule; the criterion, when scored, "
                         "is a diagnostic at k")
@@ -1554,6 +1555,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr = spsub.add_parser("project", help="apply a frozen block to a features table")
     _space_common(pr)
     pr.add_argument("--space", required=True, help="the fit's .json manifest")
+    pr.add_argument("--view", choices=["covariance", "whitened"], default="covariance",
+                    help="covariance: scores as stored, each component at its own variance (default); "
+                         "whitened: every component at unit variance on the fit rows")
     pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
     pr.set_defaults(func=_run_space_project)
 

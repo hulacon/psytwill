@@ -252,7 +252,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.12"
+    assert manifest["space_schema_version"] == "1.13"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
@@ -353,6 +353,26 @@ def test_like_reproduces_the_fit_and_varies_only_the_scaling(two_corpora, tmp_pa
     b0 = json.loads((out / "B0.json").read_text())
     assert b0["member_scaling"] == "zscore" and b0["k"] == p["k"] and b0["fixed_k"] == p["k"]
     assert all(b0["per_member"][m]["whitened_rank"] == b0["per_member"][m]["dim"] for m in ("a", "b"))
+    # the variance-weighted block: P's member directions, kept at their variance
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--member-scaling", "pcs",
+                 "--no-criterion", "-o", str(out), "--stem", "P_pcs"]) == 0
+    pcs = np.load(out / "P_pcs.npz")
+    assert json.loads((out / "P_pcs.json").read_text())["member_scaling"] == "pcs"
+    for m in ("a", "b"):
+        np.testing.assert_allclose(pcs[f"w::{m}::components"], a[f"w::{m}::components"], atol=1e-10)
+        np.testing.assert_allclose(pcs[f"w::{m}::eigenvalues"], 1.0 / a[f"w::{m}::scales"] ** 2, rtol=1e-8)
+        np.testing.assert_array_equal(pcs[f"w::{m}::scales"], 1.0)
+    # read-time views of one fit's scores
+    cov, wht = tmp_path / "cov.csv", tmp_path / "wht.csv"
+    proj = ["space", "project", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--space", str(out / "P.json")]
+    assert main([*proj, "-o", str(cov)]) == 0
+    assert main([*proj, "--view", "whitened", "-o", str(wht)]) == 0
+    c, w = pd.read_csv(cov), pd.read_csv(wht)
+    cols = [col for col in c.columns if col.startswith(p["block"] + "_")]
+    np.testing.assert_allclose(w[cols].to_numpy(), c[cols].to_numpy() / np.sqrt(a["block_eigenvalues"][:len(cols)]),
+                               rtol=1e-8)
+    assert json.loads((tmp_path / "wht.meta.json").read_text())["view"] == "whitened"
     # --like owns the inputs
     capsys.readouterr()
     assert main(["space", "fit", "--like", str(out / "P.json"), "--block", "X", "-o", str(out)]) == 1

@@ -5,10 +5,13 @@ the fitted block must subsume every member at a small k, and a member built
 from an independent latent must fail the criterion.
 """
 
+import json
+
 import numpy as np
 import pytest
 
 from psytwill.space import (
+    BLOCK_VIEWS,
     MIN_ROWS_PER_K,
     MIN_SUPPORT,
     MIN_SPREAD,
@@ -29,7 +32,9 @@ from psytwill.space import (
     fit_block,
     fit_block_map,
     fit_whitener,
+    block_view,
     load_fit,
+    member_spread,
     save_fit,
     structural_fill_values,
     unscoreable_reason,
@@ -313,7 +318,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.12"
+        assert meta["space_schema_version"] == "1.13"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -681,7 +686,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.12"
+        assert meta["space_schema_version"] == "1.13"
 
 
 
@@ -1156,3 +1161,97 @@ class TestMemberScalingAndFixedK:
         ok = fit_block(spaces, ["a", "b", "c"], fixed_k=8, **_fit_kwargs())
         assert ok.k == 8 and ok.manifest["subsumes_all_members"] is True
         assert {r["k"] for r in ok.curve} == {8}
+
+
+class TestPcsScalingAndBlockViews:
+    """0.2.0 format (DECIDED 2026-10-10): member PCs stored unscaled, block scores read in a view."""
+
+    def test_pcs_keeps_the_pr_directions_at_their_variance(self, members):
+        spaces, _ = members
+        a = spaces["a"]
+        pr = fit_whitener(a, a.X, scaling="pr")
+        pcs = fit_whitener(a, a.X, scaling="pcs")
+        assert pcs.rank == pr.rank and pcs.scaling == "pcs" and pr.scaling == "pr"
+        np.testing.assert_array_equal(pcs.components, pr.components)
+        np.testing.assert_array_equal(pcs.eigenvalues, pr.eigenvalues)
+        np.testing.assert_allclose(pcs.transform(a.X), pr.transform(a.X) * np.sqrt(pr.eigenvalues), atol=1e-10)
+        # the variance on the fit rows is each direction's eigenvalue
+        np.testing.assert_allclose(pcs.transform(a.X).var(axis=0, ddof=1), pcs.eigenvalues, rtol=1e-8)
+        # either scaling reads the same whitened coordinates
+        np.testing.assert_allclose(pcs.whiten(a.X), pr.transform(a.X), atol=1e-10)
+        np.testing.assert_allclose(pr.whiten(a.X), pr.transform(a.X), atol=1e-12)
+        # and converts to the other exactly
+        np.testing.assert_allclose(pcs.rescaled("pr").transform(a.X), pr.transform(a.X), atol=1e-10)
+        np.testing.assert_allclose(pr.rescaled("pcs").transform(a.X), pcs.transform(a.X), atol=1e-10)
+        z = fit_whitener(a, a.X, scaling="zscore")
+        assert z.eigenvalues is None
+        with pytest.raises(SpaceError, match="cannot rescale"):
+            z.rescaled("pr")
+        with pytest.raises(SpaceError, match="cannot rescale"):
+            pr.rescaled("zscore")
+
+    def test_pcs_weighs_strong_directions_like_zscore(self):
+        rng = np.random.default_rng(1)
+        wide = _member("wide", rng, rng.normal(size=(N, 2)), 64)
+        narrow = _member("narrow", rng, rng.normal(size=(N, 2)), 4)
+        spaces = {"wide": wide, "narrow": narrow}
+        share = {}
+        for scaling in ("pr", "pcs", "zscore"):
+            bm = fit_block_map(spaces, ["wide", "narrow"], np.arange(N), member_scaling=scaling)
+            n_wide = bm.whiteners["wide"].rank
+            share[scaling] = float((bm.block_components[0][:n_wide] ** 2).sum())
+        assert share["pcs"] > 0.95 and share["pr"] < share["pcs"]
+
+    def test_spread_floor_reads_whitened_coordinates(self, members):
+        spaces, _ = members
+        a = spaces["a"]
+        for scaling in ("pr", "pcs"):
+            w = fit_whitener(a, a.X, scaling=scaling)
+            assert member_spread(w, a.X) == pytest.approx(1.0, rel=1e-8), scaling
+        # z-scores use the population std, so the ddof=1 spread reads n/(n-1)
+        z = fit_whitener(a, a.X, scaling="zscore")
+        assert member_spread(z, a.X) == pytest.approx(N / (N - 1), rel=1e-8)
+
+    def test_pcs_fit_round_trips_with_its_eigenvalues(self, members, tmp_path):
+        spaces, _ = members
+        fit = fit_block(spaces, ["a", "b", "c"], member_scaling="pcs", fixed_k=4, score=False,
+                        **_fit_kwargs())
+        assert fit.manifest["member_scaling"] == "pcs"
+        npz, manifest, _ = save_fit(fit, tmp_path)
+        assert "w::a::eigenvalues" in np.load(npz).files
+        back = load_fit(manifest)
+        for m in ("a", "b", "c"):
+            w, wb = fit.map.whiteners[m], back.map.whiteners[m]
+            assert wb.scaling == "pcs"
+            np.testing.assert_array_equal(wb.eigenvalues, w.eigenvalues)
+            np.testing.assert_allclose(wb.transform(spaces[m].X), w.transform(spaces[m].X), atol=1e-12)
+        np.testing.assert_allclose(back.project(spaces)[0], fit.project(spaces)[0], atol=1e-10)
+
+    def test_a_pre_1_13_pr_fit_recovers_its_eigenvalues(self, members, tmp_path):
+        spaces, _ = members
+        fit = fit_block(spaces, ["a", "b", "c"], fixed_k=4, score=False, **_fit_kwargs())
+        npz, manifest, _ = save_fit(fit, tmp_path)
+        data = dict(np.load(npz))
+        for m in ("a", "b", "c"):
+            del data[f"w::{m}::eigenvalues"]
+        np.savez_compressed(npz, **data)
+        meta = json.loads(manifest.read_text())
+        del meta["member_scaling"]  # schema <= 1.11 wrote none
+        manifest.write_text(json.dumps(meta))
+        back = load_fit(manifest)
+        for m in ("a", "b", "c"):
+            np.testing.assert_allclose(back.map.whiteners[m].eigenvalues, fit.map.whiteners[m].eigenvalues,
+                                       rtol=1e-10)
+            assert back.map.whiteners[m].scaling == "pr"
+
+    def test_block_views(self, members):
+        spaces, _ = members
+        fit = fit_block(spaces, ["a", "b", "c"], fixed_k=4, score=False, **_fit_kwargs())
+        S, labels = fit.project(spaces)
+        Sw, labels_w = fit.project(spaces, view="whitened")
+        assert labels_w == labels and BLOCK_VIEWS == ("covariance", "whitened")
+        np.testing.assert_allclose(S.var(axis=0, ddof=1), fit.map.block_eigenvalues[:4], rtol=1e-8)
+        np.testing.assert_allclose(Sw.var(axis=0, ddof=1), np.ones(4), rtol=1e-8)
+        np.testing.assert_array_equal(block_view(S, fit.map.block_eigenvalues), S)
+        with pytest.raises(SpaceError, match="unknown block view"):
+            block_view(S, fit.map.block_eigenvalues, "correlation")

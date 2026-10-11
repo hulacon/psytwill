@@ -17,7 +17,9 @@ Pipeline (design on record in the psytwill-space workbench,
 1. member spaces are aligned on their shared labels;
 2. each space is z-scored per column and PCA-whitened to ``ceil(PR)``
    directions (its participation ratio), so every member contributes about
-   PR unit-variance directions regardless of its nominal width;
+   PR unit-variance directions regardless of its nominal width (the "pr"
+   member scaling; see MEMBER_SCALINGS for the variance-keeping "pcs" and the
+   z-score-only baseline);
 3. PCA on the concatenation gives nested block scores. A member with a
    null in a row is ABSENT from that row -- nothing is ever filled (see the
    NaN policy) -- and the PCA then runs on the pairwise-complete covariance;
@@ -38,7 +40,7 @@ from __future__ import annotations
 import json
 import math
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -136,7 +138,12 @@ def split_members(models: Sequence[str]) -> list[str]:
 # `like` (the manifest a variant copied its settings from). Absent = "pr",
 # walked k, scored, no source. With `criterion_scored` false the subsumption
 # fields are null, not false.
-SPACE_SCHEMA_VERSION = "1.12"
+# 1.13: `member_scaling` adds "pcs" (each member's top-ceil(PR) PCs kept at
+# their own variance, not whitened); the weights carry `w::<member>::eigenvalues`
+# for "pr" and "pcs" members, so either scaling's coordinates can be read from
+# one fit (absent = a "pr" fit, whose eigenvalues are 1/scales^2). The spread
+# floor reads the member in whitened coordinates whatever its scaling.
+SPACE_SCHEMA_VERSION = "1.13"
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
 #: placed by the fold map that did not see it (see :func:`fit_block`).
@@ -165,10 +172,32 @@ class SpaceWhitener:
     structural_fill: dict = field(default_factory=dict)
     #: columns declared `undefinable`: a row holding NaN in one is not projected
     undefinable: list = field(default_factory=list)
+    #: one of MEMBER_SCALINGS: how `transform` scales the member's directions
+    scaling: str = "pr"
+    #: (rank,) variance of each direction on the fit rows; None for "zscore"
+    #: (no rotation, so no per-direction variance to keep)
+    eigenvalues: np.ndarray | None = None
 
     @property
     def rank(self) -> int:
         return int(self.components.shape[0])
+
+    def whiten(self, X: np.ndarray) -> np.ndarray:
+        """Whitened coordinates (unit variance per direction on the fit rows),
+        whatever the member's scaling; a "zscore" member returns its z-scores."""
+        if self.eigenvalues is None:
+            return self.transform(X)
+        return self.transform(X) / (self.scales * np.sqrt(self.eigenvalues))
+
+    def rescaled(self, scaling: str) -> "SpaceWhitener":
+        """The same member at another scaling: same mean, scale, directions and
+        rank; only `scales` changes. "pr" <-> "pcs" only -- a "zscore" member
+        kept no rotation, so there is nothing to rescale."""
+        if scaling not in ("pr", "pcs") or self.eigenvalues is None:
+            raise SpaceError(f"'{self.name}': cannot rescale a {self.scaling!r} member to {scaling!r}; "
+                             f"only 'pr' <-> 'pcs' (a member that kept its eigenvalues)")
+        scales = 1.0 / np.sqrt(self.eigenvalues) if scaling == "pr" else np.ones(self.rank)
+        return replace(self, scaling=scaling, scales=scales)
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         """Whitened coordinates; a row with any NaN comes back all-NaN.
@@ -197,10 +226,16 @@ class SpaceWhitener:
 
 #: How each member is scaled before the block PCA. ``pr`` (psytwill-space):
 #: z-score, then PCA-whiten to ceil(PR) unit-variance directions, so every
-#: member weighs about its participation ratio whatever its width. ``zscore``:
-#: z-score only, so a member weighs by its column count and correlations --
-#: the structure-free baseline the benchmark panel compares against (B0).
-MEMBER_SCALINGS = ("pr", "zscore")
+#: member weighs about its participation ratio whatever its width. ``pcs``:
+#: the same ceil(PR) directions kept at their own variance, so a member weighs
+#: by how much of its z-scored variance they hold (about its column count) and
+#: its strong directions outweigh its weak ones -- the variance-weighted block,
+#: from the member geometry "pr" uses (DECIDED 2026-10-10, psytwill-space 0.2.0:
+#: member PCs stored unscaled). ``zscore``: z-score only, so a member weighs by
+#: its column count and correlations -- the structure-free baseline the
+#: benchmark panel compares against (B0); it differs from ``pcs`` only by the
+#: directions past ceil(PR).
+MEMBER_SCALINGS = ("pr", "pcs", "zscore")
 
 
 def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
@@ -257,8 +292,8 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
         dim = Z.shape[1]
         return SpaceWhitener(name=space.name, features=list(space.features), mean=mean, std=std,
                              components=np.eye(dim), scales=np.ones(dim), participation_ratio=pr,
-                             structural_fill=dict(structural_fill or {}))
-    if scaling != "pr":
+                             structural_fill=dict(structural_fill or {}), scaling="zscore")
+    if scaling not in ("pr", "pcs"):
         raise SpaceError(f"unknown member scaling {scaling!r}; use one of {MEMBER_SCALINGS}")
     r = min(n_ok, int(math.ceil(pr))) if rank is None else min(int(rank), n_ok)
     r = max(1, r)
@@ -268,9 +303,11 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
         mean=mean,
         std=std,
         components=vt[:r],
-        scales=1.0 / np.sqrt(eig[:r]),
+        scales=1.0 / np.sqrt(eig[:r]) if scaling == "pr" else np.ones(r),
         participation_ratio=pr,
         structural_fill=dict(structural_fill or {}),
+        scaling=scaling,
+        eigenvalues=eig[:r],
     )
 
 
@@ -766,7 +803,8 @@ MIN_SCORE_GROUPS = 5
 # A member is also unscoreable where the table holds almost none of its
 # variation (Ben 2026-09-29, "add variance floor"): `spread` is its mean
 # variance over its whitened directions on the scored rows, 1.0 on the fit
-# rows by construction. R^2 is a share of the table's own variance, so on a
+# rows by construction (whitened whatever the member's scaling, so a "pcs"
+# member's floor is the same share of its own fit-row variance). R^2 is a share of the table's own variance, so on a
 # table where the member is flat it scores noise below anything the block was
 # built to keep. MEASURED over every A/L/V transfer table (workbench
 # out/spread/): A's `speech` on musopen (music only) holds 0.0003 and read
@@ -781,7 +819,7 @@ def member_spread(whitener: "SpaceWhitener", X: np.ndarray) -> float:
     if X.shape[0] < 2:
         return float("nan")
     # ddof=1, as the whitener's eigenvalues, so the fit rows read exactly 1
-    return float(whitener.transform(X).var(axis=0, ddof=1).mean())
+    return float(whitener.whiten(X).var(axis=0, ddof=1).mean())
 
 
 def unscoreable_reason(n_rows: int, n_groups: int | None, k: int, block_size: int | None,
@@ -927,8 +965,12 @@ class BlockFit:
     curve: list[dict]  # one row per (k, member, fold)
     manifest: dict = field(default_factory=dict)
 
-    def project(self, spaces: dict[str, SpaceMatrix]) -> tuple[np.ndarray, list[str]]:
+    def project(self, spaces: dict[str, SpaceMatrix],
+                view: str = "covariance") -> tuple[np.ndarray, list[str]]:
         """Block scores for every aligned row the block can place.
+
+        ``view`` (see :func:`block_view`): "covariance" keeps each component's
+        variance (the stored scores); "whitened" divides it out.
 
         A row holding NaN in a member's `undefinable` column has no position
         in the space (it was dropped from the fit), and a row whose present
@@ -939,11 +981,30 @@ class BlockFit:
         picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
         aligned, labels = align_spaces(picked)
         aligned, labels, _ = _drop_undefinable(self, aligned, labels)
-        S = self.map.scores(aligned, k=self.k)
+        S = block_view(self.map.scores(aligned, k=self.k), self.map.block_eigenvalues, view)
         placed = np.isfinite(S).all(axis=1)
         if placed.all():
             return S, labels
         return S[placed], [lab for lab, p in zip(labels, placed) if p]
+
+
+#: Read-time views of block scores (DECIDED 2026-10-10, psytwill-space 0.2.0:
+#: scores are stored unwhitened, the metric is chosen when they are read).
+#: Block components are uncorrelated on the fit rows, so a correlation view of
+#: the scores is the whitened view; there is no third one to offer.
+BLOCK_VIEWS = ("covariance", "whitened")
+
+
+def block_view(S: np.ndarray, block_eigenvalues: np.ndarray, view: str = "covariance") -> np.ndarray:
+    """Block scores ``S`` (rows x k) in ``view``: "covariance" returns them as
+    stored (component j has variance ``block_eigenvalues[j]`` on the fit rows);
+    "whitened" scales every component to unit variance there."""
+    if view not in BLOCK_VIEWS:
+        raise SpaceError(f"unknown block view {view!r}; use one of {BLOCK_VIEWS}")
+    if view == "covariance":
+        return S
+    lam = np.asarray(block_eigenvalues, dtype=float)[: S.shape[1]]
+    return S / np.sqrt(lam)
 
 
 def _drop_undefinable(fit: "BlockFit", aligned: dict[str, SpaceMatrix], labels: list[str]):
@@ -1507,6 +1568,8 @@ def save_fit(fit: BlockFit, out_dir: str | Path, *, stem: str | None = None) -> 
         arrays[f"w::{m}::std"] = w.std
         arrays[f"w::{m}::components"] = w.components
         arrays[f"w::{m}::scales"] = w.scales
+        if w.eigenvalues is not None:
+            arrays[f"w::{m}::eigenvalues"] = w.eigenvalues
     npz = out / f"{stem}.npz"
     np.savez_compressed(npz, **arrays)
     meta = dict(fit.manifest)
@@ -1530,18 +1593,25 @@ def load_fit(manifest_path: str | Path) -> BlockFit:
     mp = Path(manifest_path)
     meta = json.loads(mp.read_text())
     data = np.load(mp.parent / meta["weights"])
+    scaling = meta.get("member_scaling", "pr")
     whiteners = {}
     for m in meta["members"]:
+        scales = data[f"w::{m}::scales"]
+        # schema < 1.13 stored no eigenvalues; a "pr" member's are 1/scales^2
+        eig = (data[f"w::{m}::eigenvalues"] if f"w::{m}::eigenvalues" in data.files
+               else 1.0 / scales ** 2 if scaling == "pr" else None)
         whiteners[m] = SpaceWhitener(
             name=m,
             features=list(meta["member_features"][m]),
             mean=data[f"w::{m}::mean"],
             std=data[f"w::{m}::std"],
             components=data[f"w::{m}::components"],
-            scales=data[f"w::{m}::scales"],
+            scales=scales,
             participation_ratio=float(meta["member_pr"][m]),
             structural_fill=dict(meta.get("member_structural_fill", {}).get(m, {})),
             undefinable=list(meta.get("member_undefinable", {}).get(m, [])),
+            scaling=scaling,
+            eigenvalues=eig,
         )
     bm = BlockMap(
         members=list(meta["members"]),
