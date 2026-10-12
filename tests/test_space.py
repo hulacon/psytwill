@@ -319,7 +319,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.14"
+        assert meta["space_schema_version"] == "1.15"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -687,7 +687,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.14"
+        assert meta["space_schema_version"] == "1.15"
 
 
 
@@ -1278,3 +1278,52 @@ class TestMemberWindows:
             resolve_member_windows(["clap"], {"clap": {2.0}})
         with pytest.raises(SpaceError, match="one window"):
             resolve_member_windows(["a"], {"a": {1.0, 2.0}})
+
+
+# --- outside targets (schema 1.15) ------------------------------------------
+
+
+def test_outside_target_is_scored_but_never_part_of_the_block(members):
+    spaces, _ = members
+    rng = np.random.default_rng(5)
+    spaces = dict(spaces, d=_member("d", rng, rng.normal(size=(N, LATENT)), 6))  # an unrelated latent
+    base = fit_block(spaces, ["a", "b"], random_state=0, **_fit_kwargs())
+    fit = fit_block(spaces, ["a", "b"], targets=["c", "d"], random_state=0, **_fit_kwargs())
+    # the targets change nothing about the block: same k, same map
+    assert fit.k == base.k and fit.members == ["a", "b"]
+    np.testing.assert_allclose(fit.map.block_components, base.map.block_components, atol=1e-10)
+    assert set(fit.map.whiteners) == {"a", "b"}
+    m = fit.manifest
+    assert m["outside_targets"] == ["c", "d"] and set(m["per_target"]) == {"c", "d"}
+    assert set(m["per_member"]) == {"a", "b"}
+    # c reads out the block's latent, d does not
+    assert m["per_target"]["c"]["covered_at_k"] is True
+    assert m["per_target"]["d"]["covered_at_k"] is False
+    assert max(m["per_target"]["d"]["r2_per_fold"]) < 0.2
+    roles = {(r["member"], r["role"]) for r in fit.curve}
+    assert ("c", "target") in roles and ("a", "member") in roles and ("c", "member") not in roles
+    # member rows are scored exactly as without targets
+    key = lambda r: (r["member"], r["k"], r["fold"])
+    want = {key(r): r["r2"] for r in base.curve}
+    for r in fit.curve:
+        if r["role"] == "member":
+            assert r["r2"] == pytest.approx(want[key(r)], abs=1e-12)
+
+
+def test_a_failing_target_never_moves_k(members):
+    spaces, _ = members
+    rng = np.random.default_rng(6)
+    spaces = dict(spaces, d=_member("d", rng, rng.normal(size=(N, LATENT)), 6))
+    fit = fit_block(spaces, ["a", "b", "c"], targets=["d"], random_state=0, **_fit_kwargs())
+    alone = fit_block(spaces, ["a", "b", "c"], random_state=0, **_fit_kwargs())
+    assert fit.k == alone.k and fit.manifest["subsumes_all_members"] is True
+
+
+def test_targets_are_refused_when_they_are_members_or_unscored(members):
+    spaces, _ = members
+    with pytest.raises(SpaceError, match="also block members"):
+        fit_block(spaces, ["a", "b"], targets=["b"], **_fit_kwargs())
+    with pytest.raises(SpaceError, match="not in the loaded spaces"):
+        fit_block(spaces, ["a", "b"], targets=["zz"], **_fit_kwargs())
+    with pytest.raises(SpaceError, match="scored by the criterion"):
+        fit_block(spaces, ["a", "b"], targets=["c"], fixed_k=4, score=False, **_fit_kwargs())

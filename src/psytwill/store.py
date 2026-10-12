@@ -215,10 +215,17 @@ def load_spaces(
     window: float | None = None,
     report: LoadReport | None = None,
     stimulus_ids: Iterable[str] | None = None,
+    keep_all_nan: bool = False,
 ) -> dict[str, SpaceMatrix]:
     """Load each model in a long-form table as a :class:`SpaceMatrix`.
 
     ``stimulus_ids`` restricts the read to those stimuli (None = all).
+
+    ``keep_all_nan`` returns a numeric model whose rows are all NaN as NaN
+    rows instead of skipping it. A whole-table read never meets that case for
+    a model with values somewhere; a read restricted to a slice of stimuli can
+    (a gated model on a slice where the gate never opens), and the slice must
+    hold the same NaN rows the whole table would.
 
     ``key`` is the row grain: ``("stimulus_id",)`` for an image set,
     ``("stimulus_id", "time")`` for a movie grid. Rows sharing a key are
@@ -280,7 +287,7 @@ def load_spaces(
         if row.is_string:
             rep.skipped_string.append(name)
             continue
-        if row.n_numeric == 0:
+        if row.n_numeric == 0 and not keep_all_nan:
             rep.skipped_empty.append(name)
             continue
 

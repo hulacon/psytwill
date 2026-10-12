@@ -588,10 +588,18 @@ def _exclude_rows(path: str | None, key: tuple[str, ...]) -> set[tuple]:
     return {tuple(_key_value(v) for v in row) for row in df[list(key)].itertuples(index=False)}
 
 
-def _space_load(args: argparse.Namespace, members: list[str] | None = None):
+def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
+                partial_features: dict[str, list[str]] | None = None, verbose: bool = True):
     """Load member spaces one model at a time (a 300 M-row group table does
     not fit in pandas whole), dropping --exclude-ids rows. Returns
     (spaces, members, n_excluded, report).
+
+    ``partial_features`` (member -> feature columns) marks a read of one slice
+    of the stimuli (``args.include_ids``), as chunked `space project` does: a
+    model with no rows in a table's slice contributes nothing from that table
+    (a member with none in any comes back with zero rows, carrying these
+    columns), and a model all NaN in the slice is kept as NaN rows. Both are
+    what the whole-table read holds for those stimuli.
 
     A member is read from EVERY table that carries it and the rows are
     stacked, so a fit over several corpora (one group table per corpus) sees
@@ -635,12 +643,19 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
             parts = []
             for path in where[model]:
                 got = load_spaces(path, key=key, models=[model], window=args.window, report=rep,
-                                  stimulus_ids=getattr(args, "include_ids", None))
+                                  stimulus_ids=getattr(args, "include_ids", None),
+                                  keep_all_nan=partial_features is not None)
                 if model not in got:
+                    if partial_features is not None:
+                        continue
                     raise SpaceError(f"model {model!r} in {path} loaded as none of {sorted(got)} "
                                      "(string-valued or empty?)")
                 parts.append(got[model])
             loaded[model] = parts
+        if not parts:
+            feats = list(partial_features[m])
+            spaces[m] = SpaceMatrix(name=m, labels=[], X=np.empty((0, len(feats))), features=feats)
+            continue
         if cols is not None:
             # a split member (space.MEMBER_SPLITS): its columns of the model
             parts = [select_features(part, cols) for part in parts]
@@ -690,7 +705,8 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None):
         rep.nulls[m] = nulls
         src = f" from {len(parts)} tables" if len(parts) > 1 else ""
         of = f" (split from {model})" if cols is not None else ""
-        print(f"  loaded {m}: {sm.n} rows x {sm.dim} features{src}{of}", flush=True)
+        if verbose:
+            print(f"  loaded {m}: {sm.n} rows x {sm.dim} features{src}{of}", flush=True)
     return spaces, members, len(ids), rep
 
 
@@ -724,15 +740,29 @@ def _apply_like(args: argparse.Namespace) -> dict:
     crit = m["criterion"]
     args.features = list(m["inputs"])
     args.block = m["block"]
-    args.members = ",".join(m["members"])
-    args.defer_members = ",".join(m.get("deferred_members") or [])
+    out = [x.strip() for x in (args.leave_out or "").split(",") if x.strip()]
+    unknown = [x for x in out if x not in m["members"]]
+    if unknown:
+        raise SpaceError(f"--leave-out {unknown}: not members of {path.name} ({', '.join(m['members'])})")
+    if out and len(out) == len(m["members"]):
+        raise SpaceError("--leave-out would leave the block no members")
+    args.members = ",".join(x for x in m["members"] if x not in out)
+    args.defer_members = ",".join(x for x in (m.get("deferred_members") or []) if x not in out)
+    # a left-out member is scored as an outside target (leave-one-member-out coverage)
+    args.targets = ",".join(dict.fromkeys(out + _split(args.targets)))
     args.key = m["key"]
     args.window = m["window"]
     args.exclude_ids = m.get("exclude_ids_file")
     args.exclude_rows = m.get("exclude_rows_file")
     args.n_splits = m["n_splits"]
     args.groups_from_label = bool(m["grouped"])
-    args.per_corpus = crit.get("scope") == "per_corpus"
+    # --per-corpus may ADD per-corpus scoring to a pooled source at a fixed k:
+    # it is then a read beside the pooled folds and cannot move k
+    added_per_corpus = bool(args.per_corpus) and crit.get("scope") != "per_corpus"
+    if added_per_corpus and args.k_schedule:
+        raise SpaceError("--per-corpus on a pooled --like source scores beside the source's criterion; "
+                         "it cannot choose k, so drop --k-schedule")
+    args.per_corpus = crit.get("scope") == "per_corpus" or added_per_corpus
     args.corpus_weights = (m.get("corpus_weights") or {}).get("scheme")
     args.corpora_from_label = bool(args.per_corpus or args.corpus_weights)
     for a, c in (("r2_min", "r2_min"), ("alpha", "alpha"), ("k_nn", "k_nn"), ("n_perm", "n_perm"),
@@ -745,7 +775,12 @@ def _apply_like(args: argparse.Namespace) -> dict:
     if args.fixed_k is None and not args.k_schedule:
         args.fixed_k = int(m["k"])
     return {"manifest": str(path.resolve()), "manifest_sha256": hashlib.sha256(raw).hexdigest(),
-            "block": m["block"], "k": m["k"], "member_scaling": m.get("member_scaling", "pr")}
+            "block": m["block"], "k": m["k"], "member_scaling": m.get("member_scaling", "pr"),
+            "left_out": out, "added_per_corpus": added_per_corpus}
+
+
+def _split(arg: str | None) -> list[str]:
+    return [x.strip() for x in (arg or "").split(",") if x.strip()]
 
 
 def _run_space_fit(args: argparse.Namespace) -> None:
@@ -756,7 +791,17 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         raise SpaceError("space fit needs --features and --block (or --like MANIFEST)")
     if args.no_criterion and args.fixed_k is None:
         raise SpaceError("--no-criterion leaves nothing to choose k: give --fixed-k (or --like)")
-    spaces, members, n_excl, rep = _space_load(args)
+    if args.leave_out and not args.like:
+        raise SpaceError("--leave-out takes members out of a --like fit; without one, list --members")
+    targets = _split(args.targets)
+    if targets and not args.members:
+        raise SpaceError("--targets needs the block's --members listed (or --like), so a target "
+                         "can never be read as a member")
+    if targets:
+        spaces, loaded, n_excl, rep = _space_load(args, members=_split(args.members) + targets)
+        members = [m for m in loaded if m not in targets]
+    else:
+        spaces, members, n_excl, rep = _space_load(args)
     from psytwill.features import group_window_sec
     from psytwill.space import resolve_member_windows
 
@@ -771,7 +816,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     if args.groups_from_label or args.corpora_from_label or args.per_corpus or args.corpus_weights:
         from psytwill.store import align_spaces
 
-        _, labels = align_spaces({m: spaces[m] for m in members})
+        _, labels = align_spaces({m: spaces[m] for m in members + targets})
         if args.groups_from_label:
             groups = [lab.split("|")[0] for lab in labels]
         if args.corpora_from_label or args.per_corpus or args.corpus_weights:
@@ -813,7 +858,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     corpus_weights=args.corpus_weights,
                     on_row=on_row,
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
-                    member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion)
+                    member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
+                    targets=targets)
     for m in members:
         pm = fit.manifest["per_member"][m]
         if pm["masked_columns"]:
@@ -864,6 +910,18 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                 continue
             print(f"      {c:<16} R2 {pc['r2']:.3f}  overlap p {pc['overlap_p']:.3f}  "
                   f"n {pc['n_rows']:>6}  {_verdict(pc['passed'])}  (out of fold)")
+    for t in targets:
+        pt = fit.manifest["per_target"][t]
+        r2s = pt["r2_per_fold"]
+        print(f"  TARGET {t:<11} (outside the block) R2 {min(r2s) if r2s else float('nan'):.3f}  "
+              f"{'covered' if pt['covered_at_k'] else 'UNSCOREABLE' if pt['covered_at_k'] is None else 'NOT covered'}"
+              f" at k={fit.k}")
+        for c, pc in pt.get("per_corpus", {}).items():
+            if pc["passed"] is None:
+                print(f"      {c:<16} n {pc['n_rows']:>6}  UNSCOREABLE  ({pc['unscoreable']})")
+                continue
+            print(f"      {c:<16} R2 {pc['r2']:.3f}  overlap p {pc['overlap_p']:.3f}  "
+                  f"n {pc['n_rows']:>6}  {_verdict(pc['passed'])}  (out of fold)")
     print(f"  weights {npz}\n  curve {curve}")
 
 
@@ -871,19 +929,48 @@ def _verdict(passed: bool | None) -> str:
     return "UNSCOREABLE" if passed is None else "pass" if passed else "FAIL"
 
 
+def _project_frame(fit, spaces: dict, key: str, view: str):
+    import pandas as pd
+
+    S, labels = fit.project(spaces, view=view)
+    df = pd.DataFrame(S, columns=[f"{fit.block}_{j:03d}" for j in range(S.shape[1])])
+    parts = [lab.split("|") for lab in labels]
+    for j, kname in enumerate(key.split(",")):
+        df.insert(j, kname, [p[j] if j < len(p) else None for p in parts])
+    return df
+
+
 def _run_space_project(args: argparse.Namespace) -> None:
     import pandas as pd
 
     from psytwill.space import load_fit
+    from psytwill.store import distinct_values
 
     fit = load_fit(args.space)
-    spaces, _, _, _ = _space_load(args, members=fit.members)
-    S, labels = fit.project(spaces, view=args.view)
-    df = pd.DataFrame(S, columns=[f"{fit.block}_{j:03d}" for j in range(S.shape[1])])
-    keys = args.key.split(",")
-    parts = [lab.split("|") for lab in labels]
-    for j, kname in enumerate(keys):
-        df.insert(j, kname, [p[j] if j < len(p) else None for p in parts])
+    chunked = {}
+    if args.chunk_size:
+        # Every step after the load is row-wise (frozen whiteners, inner row
+        # alignment, undefinable and unplaced rows dropped), so projecting
+        # disjoint stimulus_id slices and concatenating is the whole-table
+        # result; sorted ids keep the whole table's row order.
+        ids = sorted(set().union(*(distinct_values(f, "stimulus_id") for f in args.features)))
+        chunks = [ids[i:i + args.chunk_size] for i in range(0, len(ids), args.chunk_size)]
+        feats = {m: list(fit.map.whiteners[m].features) for m in fit.members}
+        frames = []
+        for i, chunk in enumerate(chunks):
+            ns = argparse.Namespace(**{**vars(args), "include_ids": set(chunk)})
+            spaces, _, _, _ = _space_load(ns, members=fit.members, partial_features=feats, verbose=False)
+            if min(sp.n for sp in spaces.values()) == 0:
+                continue  # a member with no rows here: the inner alignment places none of them
+            frames.append(_project_frame(fit, spaces, args.key, args.view))
+            del spaces
+            print(f"  chunk {i + 1}/{len(chunks)}: {len(frames[-1])} rows", flush=True)
+        cols = args.key.split(",") + [f"{fit.block}_{j:03d}" for j in range(fit.k)]
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=cols)
+        chunked = {"chunk_size": args.chunk_size, "chunks": len(chunks)}
+    else:
+        spaces, _, _, _ = _space_load(args, members=fit.members)
+        df = _project_frame(fit, spaces, args.key, args.view)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix == ".parquet":
@@ -891,7 +978,7 @@ def _run_space_project(args: argparse.Namespace) -> None:
     else:
         df.to_csv(out, index=False)
     meta = {"space": str(args.space), "block": fit.block, "k": fit.k, "inputs": [str(p) for p in args.features],
-            "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view}
+            "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view, **chunked}
     (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
     print(f"psytwill space project [{fit.block}, k={fit.k}] -> {out}  ({len(df)} rows)")
 
@@ -983,15 +1070,17 @@ def _run_relate_check(args: argparse.Namespace) -> None:
     from psytwill.relate import check_relation
 
     fit, X, Y = _relate_pair(args)
-    res = check_relation(fit, X, Y, n_perm=args.n_perm, block_size=args.block_size, random_state=args.seed)
+    res = check_relation(fit, X, Y, n_perm=args.n_perm, block_size=args.block_size, alpha=args.alpha,
+                         random_state=args.seed)
     rm = fit.manifest["r_min"]
+    q = f"q{100 * (1 - args.alpha):g}"
     print(f"psytwill space relate check [{fit.name}, k={fit.k}] on {res.n} paired rows: "
           f"{res.count} of {fit.k} components at r >= {rm:.3f}, prefix {res.prefix} "
-          f"(fit: k = {fit.k}); first r {res.r[0]:.3f}, k-th {res.r[-1]:.3f}, null q99 max {res.null_q.max():.3f}")
+          f"(fit: k = {fit.k}); first r {res.r[0]:.3f}, k-th {res.r[-1]:.3f}, null {q} max {res.null_q.max():.3f}")
     if args.output:
         cv = fit.manifest["r_cv"][: fit.k]
         pd.DataFrame({"component": range(1, fit.k + 1), "r": res.r, "null_q": res.null_q,
-                      "r_fit_cv": cv}).to_csv(args.output, index=False)
+                      "alpha": args.alpha, "r_fit_cv": cv}).to_csv(args.output, index=False)
         print(f"  {args.output}")
 
 
@@ -1540,6 +1629,13 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--members", help="comma-separated member spaces (default: the block's battery members present)")
     f.add_argument("--k-schedule", help="comma-separated k candidates (default 8,16,...,256 below the PR bound)")
     f.add_argument("--n-splits", type=int, default=5)
+    f.add_argument("--targets",
+                   help="comma-separated OUTSIDE targets: spaces scored by the block like members at "
+                        "every k it walks, but never part of it and never deciding k (needs --members "
+                        "or --like); the admission screen's question, `per_target` in the manifest")
+    f.add_argument("--leave-out",
+                   help="with --like: drop these members from the block and score each as an outside "
+                        "target at the source's k (leave-one-member-out coverage)")
     f.add_argument("--defer-members",
                    help="comma-separated members that are scored but do not decide k; the manifest "
                         "records them as not subsumed when they fail (a future version's work)")
@@ -1571,7 +1667,9 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--like", metavar="MANIFEST",
                    help="copy inputs, rows, members, folds, corpus handling, criterion and k from this "
                         "fit's manifest; only --member-scaling / --fixed-k / --k-schedule / --no-criterion "
-                        "may differ (--k-schedule walks the variant to its own k)")
+                        "may differ (--k-schedule walks the variant to its own k); --leave-out and "
+                        "--targets add outside targets, and --per-corpus adds per-corpus scoring to a "
+                        "pooled source at its fixed k")
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
     f.set_defaults(func=_run_space_fit)
@@ -1582,6 +1680,10 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--view", choices=["covariance", "whitened"], default="covariance",
                     help="covariance: scores as stored, each component at its own variance (default); "
                          "whitened: every component at unit variance on the fit rows")
+    pr.add_argument("--chunk-size", type=int,
+                    help="project this many stimulus_ids at a time and concatenate (same rows and "
+                         "scores, bounded memory; a whole-table load of ~500 M long-form rows "
+                         "passes 96 G)")
     pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
     pr.set_defaults(func=_run_space_project)
 
@@ -1631,6 +1733,8 @@ def build_parser() -> argparse.ArgumentParser:
     _relate_pair_args(rc)
     rc.add_argument("--relation", required=True, help="the relation's .json manifest")
     rc.add_argument("--n-perm", type=int, default=200)
+    rc.add_argument("--alpha", type=float, default=0.01,
+                    help="null quantile is 1 - alpha per component (default .01, i.e. q99)")
     rc.add_argument("--block-size", type=int)
     rc.add_argument("--seed", type=int, default=0)
     rc.add_argument("-o", "--output", help="per-component CSV")

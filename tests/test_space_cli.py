@@ -252,7 +252,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.14"
+    assert manifest["space_schema_version"] == "1.15"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
@@ -392,3 +392,102 @@ def test_like_reproduces_the_fit_and_varies_only_the_scaling(two_corpora, tmp_pa
     capsys.readouterr()
     assert main(["space", "fit", "--like", str(out / "P.json"), "--block", "X", "-o", str(out)]) == 1
     assert "--block" in capsys.readouterr().err
+
+
+# --- chunked `space project` -------------------------------------------------
+
+
+def _gate(path, model, nan_ids, absent_ids):
+    """Rewrite one table: `model` all NaN on nan_ids (a gate that never opened), no rows on absent_ids."""
+    df = pd.read_parquet(path)
+    df.loc[(df.model == model) & df.stimulus_id.isin(nan_ids), "value"] = np.nan
+    df = df[~((df.model == model) & df.stimulus_id.isin(absent_ids))]
+    df.to_parquet(path, index=False)
+
+
+@pytest.mark.parametrize("chunk", [1, 5])
+def test_chunked_project_equals_whole(two_corpora, tmp_path, chunk):
+    out = tmp_path / "space"
+    assert main(["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "-o", str(out), "--stem", "T_c", *FIT_ARGS]) == 0
+    _gate(two_corpora[0], "b", ["ext-librispeech-000", "ext-librispeech-001"], ["ext-librispeech-002"])
+    _gate(two_corpora[1], "b", [], ["ext-musopen-005", "ext-musopen-006"])
+    common = ["space", "project", "--space", str(out / "T_c.json"), "--features", *map(str, two_corpora),
+              "--key", "stimulus_id,time", "--window", "0.5"]
+    assert main([*common, "-o", str(tmp_path / "whole.parquet")]) == 0
+    assert main([*common, "--chunk-size", str(chunk), "-o", str(tmp_path / "chunked.parquet")]) == 0
+    whole, chunked = pd.read_parquet(tmp_path / "whole.parquet"), pd.read_parquet(tmp_path / "chunked.parquet")
+    # absent rows leave the inner alignment in both reads
+    assert not whole.stimulus_id.isin(["ext-librispeech-002", "ext-musopen-005"]).any()
+    pd.testing.assert_frame_equal(chunked, whole, check_exact=False, rtol=0, atol=1e-10)
+    meta = json.loads((tmp_path / "chunked.meta.json").read_text())
+    assert meta["chunk_size"] == chunk and meta["chunks"] == -(-2 * N_STIM // chunk)
+
+
+def test_chunked_project_equals_whole_on_split_members(faces_table, tmp_path):
+    path, _, _ = faces_table
+    out = tmp_path / "space"
+    main(["space", "fit", "--features", str(path), "-o", str(out), "--stem", "V_split", *SPLIT_ARGS])
+    common = ["space", "project", "--space", str(out / "V_split.json"), "--features", str(path)]
+    assert main([*common, "-o", str(tmp_path / "whole.parquet")]) == 0
+    assert main([*common, "--chunk-size", "7", "-o", str(tmp_path / "chunked.parquet")]) == 0
+    pd.testing.assert_frame_equal(pd.read_parquet(tmp_path / "chunked.parquet"),
+                                  pd.read_parquet(tmp_path / "whole.parquet"),
+                                  check_exact=False, rtol=0, atol=1e-10)
+
+
+# --- leave-one-member-out (outside targets) ---------------------------------
+
+
+def test_leave_out_scores_the_member_against_the_block_without_it(two_corpora, tmp_path, capsys):
+    out = tmp_path / "space"
+    assert main(["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "--corpora-from-label", "--per-corpus",
+                 "-o", str(out), "--stem", "P", *FIT_ARGS]) == 0
+    p = json.loads((out / "P.json").read_text())
+    capsys.readouterr()
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--leave-out", "b", "-o", str(out),
+                 "--stem", "P_minus_b"]) == 0
+    lo = json.loads((out / "P_minus_b.json").read_text())
+    assert lo["members"] == ["a"] and lo["outside_targets"] == ["b"]
+    assert lo["k"] == p["k"] and lo["fixed_k"] == p["k"] and lo["n_rows"] == p["n_rows"]
+    assert lo["like"]["left_out"] == ["b"]
+    pt = lo["per_target"]["b"]
+    assert set(pt["per_corpus"]) == {"librispeech", "musopen"} and pt["covered_at_k"] in (True, False)
+    assert "TARGET b" in capsys.readouterr().out
+    # the same thing spelled out: a block of the other members, the member as a target
+    assert main(["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "--corpora-from-label", "--per-corpus",
+                 "--members", "a", "--targets", "b", "--fixed-k", str(p["k"]), "-o", str(out),
+                 "--stem", "A_plus_b", *[x for x in FIT_ARGS if x not in ("--members", "a,b")]]) == 0
+    spelled = json.loads((out / "A_plus_b.json").read_text())
+    assert spelled["per_target"]["b"]["per_corpus"] == pt["per_corpus"]
+
+
+def test_leave_out_is_refused_without_like_or_for_a_non_member(two_corpora, tmp_path, capsys):
+    out = tmp_path / "space"
+    assert main(["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "-o", str(out), "--stem", "P", *FIT_ARGS]) == 0
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--leave-out", "zz", "-o", str(out)]) != 0
+    assert "not members" in capsys.readouterr().err
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--leave-out", "a,b", "-o", str(out)]) != 0
+    assert main(["space", "fit", "--features", str(two_corpora[0]), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--leave-out", "a", "-o", str(out), *FIT_ARGS]) != 0
+
+
+def test_like_can_add_per_corpus_scoring_to_a_pooled_source_at_its_k(two_corpora, tmp_path, capsys):
+    out = tmp_path / "space"
+    assert main(["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "-o", str(out), "--stem", "P", *FIT_ARGS]) == 0
+    p = json.loads((out / "P.json").read_text())
+    assert p["criterion"]["scope"] == "pooled"
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--per-corpus", "--leave-out", "b",
+                 "-o", str(out), "--stem", "P_pc_minus_b"]) == 0
+    m = json.loads((out / "P_pc_minus_b.json").read_text())
+    assert m["k"] == p["k"] and m["criterion"]["scope"] == "per_corpus" and m["like"]["added_per_corpus"]
+    assert set(m["per_target"]["b"]["per_corpus"]) == {"librispeech", "musopen"}
+    assert set(m["per_member"]["a"]["per_corpus"]) == {"librispeech", "musopen"}
+    # it is a read at the source's k, never a walk
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--per-corpus", "--k-schedule", "2,4",
+                 "-o", str(out), "--stem", "nope"]) != 0
+    assert "cannot choose k" in capsys.readouterr().err

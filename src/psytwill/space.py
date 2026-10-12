@@ -182,7 +182,12 @@ def split_members(models: Sequence[str]) -> list[str]:
 # "battery" | "undeclared"): the context window each member's rows see
 # (DECIDED 2026-10-10, psytwill-space 0.2.0: each member's window declared in
 # its manifest; see :func:`resolve_member_windows`).
-SPACE_SCHEMA_VERSION = "1.14"
+# 1.15: `outside_targets` + `per_target` -- spaces scored by the block at k
+# without being part of it (leave-one-member-out coverage and the admission
+# screen; DECIDED 2026-10-12, psytwill-space 0.2.0 step 1); curve rows carry
+# `role` ("member" | "target"). A fit with no targets differs from 1.14 only
+# by the two empty keys and the `role` column.
+SPACE_SCHEMA_VERSION = "1.15"
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
@@ -1120,6 +1125,15 @@ def _fold_frame(fm: BlockMap, ref: BlockMap, spaces: dict[str, SpaceMatrix],
                       ref_ss=(Sb ** 2).sum(axis=0), n_rows=int(ok.sum()))
 
 
+def _fit_target_whitener(space: SpaceMatrix, rows: np.ndarray, weights: np.ndarray | None,
+                         scaling: str) -> "SpaceWhitener":
+    """An outside target's whitener on ``rows``, fitted as :func:`fit_block_map` fits a member's."""
+    X = np.asarray(space.X, dtype=float)[rows]
+    ok = ~np.isnan(X).any(axis=1)
+    return fit_whitener(space, X[ok], weights=None if weights is None else np.asarray(weights)[ok],
+                        scaling=scaling)
+
+
 def _captured(bm: BlockMap, member: str, k: int) -> float:
     """Share of ``member``'s whitened slice spanned by the top-``k`` block components."""
     ranks = [bm.whiteners[m].rank for m in bm.members]
@@ -1160,8 +1174,18 @@ def fit_block(
     member_scaling: str = "pr",
     fixed_k: int | None = None,
     score: bool = True,
+    targets: Sequence[str] = (),
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
+
+    ``targets`` are OUTSIDE targets: spaces scored by the block exactly as a
+    member is (same folds, same per-corpus out-of-fold read, same criterion)
+    but never part of it -- no whitened slice in the block PCA -- and never
+    deciding k. A battery member left out of its own block and scored this
+    way asks whether the block covers it without it (leave-one-member-out);
+    a candidate member scored this way asks whether the block already covers
+    it (admission). The aligned rows are those every member AND target hold,
+    so a target can narrow the fit's rows; ``n_rows`` records what remained.
 
     ``defer`` names members that are fitted and scored but do not decide k:
     the walk stops at the first k where every OTHER member passes, and the
@@ -1231,11 +1255,22 @@ def fit_block(
         raise SpaceError("every member is deferred, so nothing can choose k")
     if len(members) < 1:
         raise SpaceError("a block needs at least one member space")
-    aligned, labels = align_spaces({m: spaces[m] for m in members})
+    targets = list(dict.fromkeys(targets))
+    clash = [t for t in targets if t in members]
+    if clash:
+        raise SpaceError(f"target(s) {clash} are also block members; an outside target is scored "
+                         "by a block it is not part of")
+    missing = [t for t in targets if t not in spaces]
+    if missing:
+        raise SpaceError(f"targets not in the loaded spaces: {missing}; have {sorted(spaces)}")
+    if targets and not score:
+        raise SpaceError("targets are scored by the criterion; drop them or score it")
+    every = members + targets
+    aligned, labels = align_spaces({m: spaces[m] for m in every})
     nulls = nulls or {}
-    kinds = {m: null_kinds(nulls.get(m)) for m in members}
+    kinds = {m: null_kinds(nulls.get(m)) for m in every}
     # 1. refuse any undeclared NaN (per member, on the table being fitted)
-    refused = {m: cols for m in members if (cols := undeclared_nan_columns(aligned[m], kinds[m]))}
+    refused = {m: cols for m in every if (cols := undeclared_nan_columns(aligned[m], kinds[m]))}
     if refused:
         detail = "; ".join(f"{m}: {', '.join(c[:6])}{' ...' if len(c) > 6 else ''} ({len(c)})"
                            for m, c in refused.items())
@@ -1265,7 +1300,7 @@ def fit_block(
         drop |= mask
     if drop.any():
         keep = ~drop
-        aligned = {m: _take_rows(aligned[m], keep) for m in members}
+        aligned = {m: _take_rows(aligned[m], keep) for m in every}
         labels = [lab for lab, k in zip(labels, keep) if k]
         if groups is not None:
             groups = [x for x, k in zip(groups, keep) if k]
@@ -1275,7 +1310,7 @@ def fit_block(
     # before any fill
     declared_never_null: dict[str, list[str]] = {}
     suspected_gated: dict[str, list[str]] = {}
-    for m in members:
+    for m in every:
         X = np.asarray(aligned[m].X, dtype=float)
         has_nan = dict(zip(aligned[m].features, np.isnan(X).any(axis=0))) if X.size else {}
         declared_never_null[m] = sorted(c for c in kinds[m] if c in has_nan and not has_nan[c])
@@ -1291,7 +1326,7 @@ def fit_block(
     # 3. missing -> max_nan_frac column drop; then undefined and missing are
     #    MASKED: the member is absent from every row where it holds a NaN
     dropped_columns: dict[str, list[str]] = {}
-    for m in members:
+    for m in every:
         undefined = [f for f in aligned[m].features if kinds[m].get(f) == "undefined"]
         aligned[m], dropped = prepare_member(aligned[m], max_nan_frac=max_nan_frac,
                                              exempt=undefined)
@@ -1299,11 +1334,11 @@ def fit_block(
             dropped_columns[m] = dropped
     # 3b. minimum support (see MIN_SUPPORT): drop, never rescale
     low_support: dict[str, list[str]] = {}
-    for m in members:
+    for m in every:
         aligned[m], dropped = drop_low_support(aligned[m], min_support)
         if dropped:
             low_support[m] = dropped
-    present = {m: member_present(aligned[m]) for m in members}
+    present = {m: member_present(aligned[m]) for m in every}
     n = len(labels)
     if n < 3 * n_splits:
         raise SpaceError(f"{n} aligned rows is too few for {n_splits} folds")
@@ -1352,6 +1387,11 @@ def fit_block(
 
     fold_maps = ([fit_block_map(aligned, members, train, weights=_weights(train), member_scaling=member_scaling)
                   for train, _ in folds] if score else [])
+    # a target's whitener, fitted as a member's would be on each fold's
+    # training rows: it sets the neighbour metric and the spread floor, and
+    # never enters the block
+    target_whiteners = [{t: _fit_target_whitener(aligned[t], train, _weights(train), member_scaling)
+                         for t in targets} for train, _ in folds] if score else []
     k_top = min(fm.k_max for fm in fold_maps) if score else None
     if fixed_k is not None:
         # k is given (a baseline matched to another fit's k): the criterion,
@@ -1375,19 +1415,22 @@ def fit_block(
                                     np.intersect1d(folds[0][0], folds[i][0]), k_top)
                         for i in range(1, len(folds))]) if per_corpus and score else []
     frame_r2: dict[int, list[float]] = {}
-    n_steps = len(schedule) * (len(folds) + int(per_corpus)) * len(members)
+    n_steps = len(schedule) * (len(folds) + int(per_corpus)) * len(every)
     step = 0
 
     def _record(mc: MemberCheck, scope: str) -> bool:
         row = asdict(mc)
         row["corpus"] = scope
+        row["role"] = "target" if mc.member in targets else "member"
         row["passed"] = mc.passes(r2_min, alpha)
         curve.append(row)
         if on_row is not None:
             on_row(row)
         decides = (scope != "all") if per_corpus else True
-        # an unscoreable row (passed None) neither passes nor blocks k
-        return not (decides and row["passed"] is False and mc.member not in defer)
+        # an unscoreable row (passed None) neither passes nor blocks k; a
+        # target never does either
+        return not (decides and row["passed"] is False and mc.member not in defer
+                    and mc.member not in targets)
 
     for k in schedule:
         all_pass = True
@@ -1413,6 +1456,15 @@ def fit_block(
                                     random_state=random_state,
                                     metric=metric_for_rank(fold_maps[fi].whiteners[m].rank))
                 all_pass &= _record(mc, "all")
+            for t in targets:
+                step += 1
+                if progress:
+                    progress(step, n_steps, f"k={k} fold={fi} target {t}")
+                _record(_check_present(S, aligned[t].X[test], present[t][test], placed, member=t,
+                                       k=k, fold=fi, groups=gt, k_nn=k_nn, n_perm=n_perm,
+                                       eval_n=eval_n, block_size=block_size,
+                                       random_state=random_state,
+                                       metric=metric_for_rank(target_whiteners[fi][t].rank)), "all")
         if per_corpus:
             placed = np.isfinite(S_oof).all(axis=1)
             for m in members:
@@ -1442,6 +1494,22 @@ def fit_block(
                 # so k cannot pass on its account (the floor only rises with k)
                 if not scored_somewhere and m not in defer:
                     all_pass = False
+            for t in targets:
+                step += 1
+                if progress:
+                    progress(step, n_steps, f"k={k} per-corpus target {t}")
+                for c in corpus_names:
+                    sel = corp == c
+                    mc = _check_present(S_oof[sel], aligned[t].X[sel], present[t][sel],
+                                        placed[sel], member=t, k=k, fold=0,
+                                        groups=None if g is None else g[sel], k_nn=k_nn,
+                                        n_perm=n_perm, eval_n=eval_n, block_size=block_size,
+                                        random_state=random_state,
+                                        metric=metric_for_rank(target_whiteners[0][t].rank),
+                                        min_rows_per_k=min_rows_per_k,
+                                        whitener=target_whiteners[0][t], min_spread=min_spread)
+                    mc.fold = OOF_FOLD
+                    _record(mc, c)
         if all_pass:
             chosen = k
             break
@@ -1505,6 +1573,34 @@ def fit_block(
         }
         if per_corpus:
             per_member[m]["per_corpus"] = {
+                r["corpus"]: {"n_rows": r["n_rows"], "r2": r["r2"], "overlap": r["overlap"],
+                              "overlap_p": r["overlap_p"], "passed": r["passed"],
+                              "unscoreable": r["unscoreable"], "spread": r["spread"]}
+                for r in deciding}
+    per_target = {}
+    for t in targets:
+        at_k = [r for r in curve if r["member"] == t and r["k"] == walked]
+        rows = [r for r in at_k if r["corpus"] == "all"]
+        deciding = [r for r in at_k if r["corpus"] != "all"] if per_corpus else rows
+        scored = [r for r in deciding if r["passed"] is not None]
+        per_target[t] = {
+            "whitened_rank": target_whiteners[0][t].rank,
+            "metric": metric_for_rank(target_whiteners[0][t].rank),
+            "dim": aligned[t].dim,
+            "dropped_columns": dropped_columns.get(t, []),
+            "low_support_columns": low_support.get(t, []),
+            "rows_present": int(present[t].sum()),
+            "n_rows_per_fold": [r["n_rows"] for r in rows],
+            "r2_per_fold": [r["r2"] for r in rows],
+            "overlap_per_fold": [r["overlap"] for r in rows],
+            "overlap_p_per_fold": [r["overlap_p"] for r in rows],
+            # covered by the block it is not part of, at k: the same verdict
+            # rule as a member's passed_all_folds
+            "covered_at_k": (all(r["passed"] for r in scored) if scored
+                             else None if deciding else False),
+        }
+        if per_corpus:
+            per_target[t]["per_corpus"] = {
                 r["corpus"]: {"n_rows": r["n_rows"], "r2": r["r2"], "overlap": r["overlap"],
                               "overlap_p": r["overlap_p"], "passed": r["passed"],
                               "unscoreable": r["unscoreable"], "spread": r["spread"]}
@@ -1583,6 +1679,8 @@ def fit_block(
         "k_schedule": schedule,
         "block_eigenvalues": [float(v) for v in final.block_eigenvalues],
         "per_member": per_member,
+        "outside_targets": targets,
+        "per_target": per_target,
     }
     return BlockFit(block=block, members=members, k=chosen, map=final, labels=labels,
                     curve=curve, manifest=manifest)

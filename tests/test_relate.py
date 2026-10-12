@@ -152,6 +152,15 @@ def test_cli_fit_check_project_and_provenance(tables, tmp_path, capsys):
                  "--n-perm", "20", "-o", str(out / "check.csv")]) == 0
     assert len(pd.read_csv(out / "check.csv")) == K_SHARED
 
+    # --alpha sets the null quantile: q95 sits at or below q99 on the same permutations
+    capsys.readouterr()
+    assert main(["space", "relate", "check", "--relation", str(out / "PQ_v0.1.json"), "--a", str(a), "--b", str(b),
+                 "--n-perm", "20", "--alpha", "0.05", "-o", str(out / "check95.csv")]) == 0
+    assert "null q95 max" in capsys.readouterr().out
+    q95, q99 = pd.read_csv(out / "check95.csv"), pd.read_csv(out / "check.csv")
+    assert (q95.alpha == 0.05).all() and (q99.alpha == 0.01).all()
+    assert (q95.null_q <= q99.null_q + 1e-12).all()
+
     proj = out / "P_in_PQ.parquet"
     assert main(["space", "relate", "project", "--relation", str(out / "PQ_v0.1.json"), "--side", "a",
                  "--scores", str(a), "-o", str(proj)]) == 0
