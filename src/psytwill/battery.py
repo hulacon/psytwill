@@ -131,8 +131,11 @@ BATTERY: dict[str, BatteryModel] = {
         _m("llstat", "viz2psy", "visual", "profile", 17, None),
         _m("motion", "viz2psy", "visual", "profile", 7, None,
            notes="video only (frame pairs); absent from image sources"),
-        _m("places", "viz2psy", "visual", "profile", 416,
-           "wideresnet18_places365", extra_prefixes=("sunattr",)),
+        _m("places", "viz2psy", "visual", "profile", 467,
+           "wideresnet18_places365", extra_prefixes=("sunattr",),
+           notes="365 scene + 102 sunattr columns; stores written before "
+                 "viz2psy's label fix (hulacon/viz2psy#4) carry 314 scene "
+                 "columns under the same checkpoint"),
         _m("resmem", "viz2psy", "visual", "profile", 1, "resmem-pretrained"),
         _m("saliency", "viz2psy", "visual", "embedding", 576,
            "DeepGazeIIE-pretrained", notes="saliency_{XX}_{YY} 24x24 grid"),
