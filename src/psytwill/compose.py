@@ -831,7 +831,11 @@ def build_composed(
     ids = sorted(pres["_sid"].unique())
     stamps = _stream_stamps(plans, window, ids)
     matched_sids: set[str] = set()
-    built: dict[str, pd.DataFrame] = {}
+    # stem -> (partial path, rows, columns): each stream is written as soon as
+    # it is built, so only one is held in memory, and published below only
+    # once every presentation is known to have composed
+    built: dict[str, tuple[Path, int, list[str]]] = {}
+    feat_dir.mkdir(parents=True, exist_ok=True)
 
     for stem in streams:
         stem_plans = [p for p in plans if p["stream"] == stem]
@@ -869,12 +873,17 @@ def build_composed(
             frame = fill_grid(frame, runs, window, stamps[stem])
             sort_cols = ["stimulus_id", "time", "model", "feature"]
             frame = frame.sort_values(sort_cols, kind="stable").reset_index(drop=True)
-        built[stem] = frame
+        partial = expected[stem].with_name(expected[stem].name + ".partial")
+        frame.to_parquet(partial, index=False)
+        built[stem] = (partial, int(len(frame)), list(frame.columns))
+        del frame, parts
 
-    # Refuse before writing anything: a table and its inputs_signature on
-    # disk would make the identical re-run report up_to_date instead.
+    # Refuse before publishing anything: a table and its inputs_signature in
+    # place would make the identical re-run report up_to_date instead.
     unmatched = sorted(set(ids) - matched_sids)
     if unmatched:
+        for partial, _, _ in built.values():
+            partial.unlink(missing_ok=True)
         shown = ", ".join(unmatched[:10])
         more = "" if len(unmatched) <= 10 else f" (+{len(unmatched) - 10} more)"
         raise InputError(
@@ -883,11 +892,10 @@ def build_composed(
             "add the store that covers them, or fix the events/registry."
         )
 
-    feat_dir.mkdir(parents=True, exist_ok=True)
-    for stem, frame in built.items():
+    for stem, (partial, n_rows, columns) in built.items():
         stem_plans = [p for p in plans if p["stream"] == stem]
         out_path = expected[stem]
-        frame.to_parquet(out_path, index=False)
+        partial.replace(out_path)
         key_cols = (["stimulus_id", "time", "model", "feature"]
                     if stem in stamps
                     else ["stimulus_id", "chunk_idx", "word_idx", "model", "feature"])
@@ -912,8 +920,8 @@ def build_composed(
             },
             "output": {
                 "path": str(out_path.resolve()),
-                "rows": int(len(frame)),
-                "columns": list(frame.columns),
+                "rows": n_rows,
+                "columns": columns,
                 "key_columns": key_cols,
             },
             "runs": runs,
@@ -949,7 +957,7 @@ def build_composed(
         summary["streams"][stem] = {
             "output": str(out_path),
             "meta_path": str(meta_path),
-            "rows": int(len(frame)),
+            "rows": n_rows,
             "models": sorted(p["model"] for p in stem_plans),
         }
     return summary

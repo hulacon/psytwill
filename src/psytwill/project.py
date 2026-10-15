@@ -38,6 +38,7 @@ the load report instead of the covariance matrix.
 
 from __future__ import annotations
 
+import heapq
 import json
 from pathlib import Path
 from typing import Iterable, Literal
@@ -117,11 +118,19 @@ def _assign_bins(
         reach = np.maximum.accumulate(offsets)
         ok = (pos >= 0) & (t < reach[np.clip(pos, 0, None)])
         owner = pos.copy()
-        for i in np.flatnonzero(ok & (t >= offsets[np.clip(pos, 0, None)])):
-            j = owner[i]
-            while offsets[j] <= t[i]:
-                j -= 1
-            owner[i] = j
+        # Bins whose latest-starting interval has ended: sweep them in time
+        # order with a max-heap of started intervals, dropping ended ones
+        # lazily (an interval ended at t stays ended later) — O(n log n).
+        walk = np.flatnonzero(ok & (t >= offsets[np.clip(pos, 0, None)]))
+        heap: list[int] = []
+        k = 0
+        for i in walk[np.argsort(t[walk], kind="stable")]:
+            while k <= pos[i]:
+                heapq.heappush(heap, -k)
+                k += 1
+            while offsets[-heap[0]] <= t[i]:
+                heapq.heappop(heap)
+            owner[i] = -heap[0]
         # overlap accounting: a bin some earlier interval also contains
         prev = owner - 1
         overlapped = ok & (prev >= 0) & (t < reach[np.clip(prev, 0, None)])
