@@ -42,16 +42,21 @@ from typing import Any, Iterable, Mapping
 
 from psytwill.exceptions import BatteryError
 
-BATTERY_VERSION = "0.1"
-BATTERY_CLAMPED_ON = "2026-09-07"
+#: 0.2 (2026-10-15): places 416 -> 467 columns, re-clamped against viz2psy
+#: 0.13.0, whose Places365 label fix changed the inventory under an unchanged
+#: checkpoint string. A fit founded on battery 0.1 saw 314 scene columns.
+BATTERY_VERSION = "0.2"
+BATTERY_CLAMPED_ON = "2026-10-15"
 
 #: Extractor versions the battery was clamped against. Outputs already in
 #: the mmmdata store span earlier versions of the same checkpoints (aud2psy
 #: 0.13.1-0.17.0, viz2psy 0.7.0-0.9.0, word2psy 0.6.0-0.9.0); their
 #: changelogs record no feature-output change across those ranges, and the
-#: pin that matters is the checkpoint, not the package version.
+#: pin that matters is the checkpoint, not the package version — except
+#: places, whose columns viz2psy 0.13.0 changed under the same checkpoint
+#: (battery 0.2): viz2psy stores older than 0.13.0 hold the 314-column form.
 EXTRACTOR_VERSIONS: dict[str, str] = {
-    "viz2psy": "0.9.0",
+    "viz2psy": "0.13.0",  # 0.9.0 in battery 0.1; registry and checkpoints unchanged
     "aud2psy": "0.17.0",
     "word2psy": "0.9.0",
 }
@@ -108,7 +113,7 @@ _FASTTEXT = "crawl-300d-2M-subword"
 BATTERY: dict[str, BatteryModel] = {
     m.model: m
     for m in (
-        # ---- viz2psy 0.9.0 (15) -------------------------------------------
+        # ---- viz2psy 0.13.0 (15) ------------------------------------------
         _m("aesthetics", "viz2psy", "visual", "profile", 1,
            "ViT-L-14/openai+sac+logos+ava1-l14-linearMSE"),
         _m("caption", "viz2psy", "visual", "text", None,
@@ -119,8 +124,8 @@ BATTERY: dict[str, BatteryModel] = {
            "depth-anything/Depth-Anything-V2-Small-hf",
            notes="relative depth, per-image normalized; stats only"),
         _m("dinov2", "viz2psy", "visual", "embedding", 768, "dinov2_vitb14",
-           notes="sidecar pattern string reads dinov_{NNN}; columns are "
-                 "dinov2_###"),
+           notes="sidecars before viz2psy 0.13.0 read the pattern as "
+                 "dinov_{NNN}; columns are dinov2_###"),
         _m("ebind", "viz2psy", "visual", "embedding", 1024, _EBIND),
         _m("emonet", "viz2psy", "visual", "profile", 20,
            "emonet-pytorch/osf-amdju"),
@@ -131,8 +136,11 @@ BATTERY: dict[str, BatteryModel] = {
         _m("llstat", "viz2psy", "visual", "profile", 17, None),
         _m("motion", "viz2psy", "visual", "profile", 7, None,
            notes="video only (frame pairs); absent from image sources"),
-        _m("places", "viz2psy", "visual", "profile", 416,
-           "wideresnet18_places365", extra_prefixes=("sunattr",)),
+        _m("places", "viz2psy", "visual", "profile", 467,
+           "wideresnet18_places365", extra_prefixes=("sunattr",),
+           notes="365 scene + 102 sunattr columns; stores written before "
+                 "viz2psy 0.13.0 carry 314 scene columns under the same "
+                 "checkpoint (battery 0.1)"),
         _m("resmem", "viz2psy", "visual", "profile", 1, "resmem-pretrained"),
         _m("saliency", "viz2psy", "visual", "embedding", 576,
            "DeepGazeIIE-pretrained", notes="saliency_{XX}_{YY} 24x24 grid"),
