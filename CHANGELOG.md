@@ -44,6 +44,9 @@ Outputs produced by 0.46.0 in the affected cases should be regenerated.
   stopped every `/x/<name>/indoor|outdoor` class collapsing onto bare
   `indoor`/`outdoor` (314 scene columns instead of 365). The checkpoint string
   is unchanged, so `battery --check` cannot tell old and new stores apart.
+  The battery is therefore re-clamped as **battery 0.2** (clamped
+  2026-10-15, viz2psy pinned at 0.13.0, the release carrying the fix); fits
+  and records citing battery 0.1 were founded on the 314-column inventory.
   **Fitted spaces whose members include `places` and were fitted on pre-fix
   Places columns must be refit**; projecting a new store through such a fit
   refuses (`lacks ... feature(s) the fit needs`).
