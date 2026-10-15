@@ -376,8 +376,8 @@ def store_checkpoints(path: str | Path) -> dict[str, str]:
         return {}
     try:
         meta = json.loads(meta_path.read_text())
-    except Exception:
-        return {}
+    except (OSError, ValueError) as exc:
+        raise InputError(f"Could not read store sidecar {meta_path}: {exc}") from exc
     out: dict[str, str] = {}
     for entry in meta.get("inputs", []) or []:
         for name, m in (entry.get("models") or {}).items():
@@ -495,6 +495,17 @@ def compose_chunked(pres: pd.DataFrame, store: pd.DataFrame) -> pd.DataFrame:
     out["offset"] = np.where(out["offset"].notna(),
                              out["_onset"] + out["offset"].astype(float),
                              out["_onset"] + out["_dur"])
+    return _number_chunks(out)
+
+
+def _number_chunks(out: pd.DataFrame) -> pd.DataFrame:
+    """``chunk_idx``/``word_idx`` from (run, presentation, source chunk/word).
+
+    Applied per store by :func:`compose_chunked` and again over a stream's
+    concatenated stores, so two stores covering different items still agree
+    on which item a ``chunk_idx`` names. The ``_src_*`` columns stay until
+    :func:`_finalize` drops them.
+    """
     out = out.sort_values(["_slug", "_ord", "_src_chunk", "_src_word"],
                           kind="stable").reset_index(drop=True)
     chunk_key = out[["_slug", "_ord", "_src_chunk"]].apply(tuple, axis=1)
@@ -502,7 +513,7 @@ def compose_chunked(pres: pd.DataFrame, store: pd.DataFrame) -> pd.DataFrame:
     for name, key in (("chunk_idx", chunk_key), ("word_idx", word_key)):
         codes = pd.Series(pd.factorize(key)[0], index=out.index)
         out[name] = codes - codes.groupby(out["_slug"]).transform("min")
-    return out.drop(columns=["_src_chunk", "_src_word"])
+    return out
 
 
 def fill_grid(frame: pd.DataFrame, runs: dict[str, dict[str, Any]],
@@ -524,17 +535,22 @@ def fill_grid(frame: pd.DataFrame, runs: dict[str, dict[str, Any]],
         n_bins = int(np.ceil(info["run_end"] / window - 1e-9))
         if n_bins <= 0:
             continue
-        all_bins = np.arange(n_bins)
-        have = frame.loc[frame["stimulus_id"] == slug, "time"]
-        occupied = set(np.floor(have.to_numpy(dtype=float) / window + 1e-9).astype(int))
-        missing = np.array(sorted(set(all_bins) - occupied))
-        if not len(missing):
-            continue
-        times = missing * window + offset
-        fills.append(pd.DataFrame({"stimulus_id": slug, "time": np.repeat(
-            times, len(feats))}).assign(**{
-                c: np.tile(feats[c].to_numpy(), len(times))
-                for c in feats.columns}))
+        have = frame.loc[frame["stimulus_id"] == slug, ["model", "time"]]
+        bins = np.floor(have["time"].to_numpy(dtype=float) / window + 1e-9).astype(int)
+        # Occupancy is per model: a bin another model covers is still empty
+        # for a model with no rows there (a model writes all its features
+        # per row, so per-model is per (model, feature)).
+        by_model = pd.Series(bins).groupby(have["model"].astype(str).to_numpy())
+        occupied = {m: set(b) for m, b in by_model}
+        for model, mfeats in feats.groupby(feats["model"].astype(str), sort=False):
+            missing = np.array(sorted(set(range(n_bins)) - occupied.get(model, set())))
+            if not len(missing):
+                continue
+            times = missing * window + offset
+            fills.append(pd.DataFrame({"stimulus_id": slug, "time": np.repeat(
+                times, len(mfeats))}).assign(**{
+                    c: np.tile(mfeats[c].to_numpy(), len(times))
+                    for c in mfeats.columns}))
     if not fills:
         return frame
     fill = pd.concat(fills, ignore_index=True)
@@ -815,7 +831,7 @@ def build_composed(
     ids = sorted(pres["_sid"].unique())
     stamps = _stream_stamps(plans, window, ids)
     matched_sids: set[str] = set()
-    feat_dir.mkdir(parents=True, exist_ok=True)
+    built: dict[str, pd.DataFrame] = {}
 
     for stem in streams:
         stem_plans = [p for p in plans if p["stream"] == stem]
@@ -844,11 +860,32 @@ def build_composed(
                     parts.append(part)
         if not parts:
             continue
-        frame = _finalize(pd.concat(parts, ignore_index=True))
+        frame = pd.concat(parts, ignore_index=True)
+        if stem not in stamps and "_src_chunk" in frame and frame["_src_chunk"].notna().all():
+            # number once over every store of the stream, not per store
+            frame = _number_chunks(frame)
+        frame = _finalize(frame)
         if stem in stamps and not sparse:
             frame = fill_grid(frame, runs, window, stamps[stem])
             sort_cols = ["stimulus_id", "time", "model", "feature"]
             frame = frame.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+        built[stem] = frame
+
+    # Refuse before writing anything: a table and its inputs_signature on
+    # disk would make the identical re-run report up_to_date instead.
+    unmatched = sorted(set(ids) - matched_sids)
+    if unmatched:
+        shown = ", ".join(unmatched[:10])
+        more = "" if len(unmatched) <= 10 else f" (+{len(unmatched) - 10} more)"
+        raise InputError(
+            f"{len(unmatched)} presented stimulus id(s) have no rows in any "
+            f"given store: {shown}{more}. Every presentation must compose — "
+            "add the store that covers them, or fix the events/registry."
+        )
+
+    feat_dir.mkdir(parents=True, exist_ok=True)
+    for stem, frame in built.items():
+        stem_plans = [p for p in plans if p["stream"] == stem]
         out_path = expected[stem]
         frame.to_parquet(out_path, index=False)
         key_cols = (["stimulus_id", "time", "model", "feature"]
@@ -915,14 +952,4 @@ def build_composed(
             "rows": int(len(frame)),
             "models": sorted(p["model"] for p in stem_plans),
         }
-
-    unmatched = sorted(set(ids) - matched_sids)
-    if unmatched:
-        shown = ", ".join(unmatched[:10])
-        more = "" if len(unmatched) <= 10 else f" (+{len(unmatched) - 10} more)"
-        raise InputError(
-            f"{len(unmatched)} presented stimulus id(s) have no rows in any "
-            f"given store: {shown}{more}. Every presentation must compose — "
-            "add the store that covers them, or fix the events/registry."
-        )
     return summary

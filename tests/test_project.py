@@ -218,3 +218,17 @@ def test_overlap_owned_by_latest_start_and_counted(tmp_path, gridded):
     # chunk 1 owns [1,3): bins 1.0..2.5
     assert cell(out, "clipA", 1, "vis", "f0") == pytest.approx(1.75)
     assert meta["n_overlapped_bins"] > 0
+
+
+def test_bins_inside_a_long_interval_survive_a_nested_short_one():
+    from psytwill.project import _assign_bins
+
+    iv = pd.DataFrame({"stimulus_id": ["m", "m"], "chunk_idx": [0, 1],
+                       "onset": [0.0, 2.0], "offset": [10.0, 3.0]})
+    bins = pd.DataFrame({"stimulus_id": ["m"] * 20, "t": [i * 0.5 for i in range(20)]})
+    out, n_overlap = _assign_bins(bins, iv)
+    owner = dict(zip(out["t"], out["chunk_idx"]))
+    assert sorted(owner) == list(bins["t"])  # every bin lies inside [0, 10)
+    assert owner[2.0] == owner[2.5] == 1  # the latest-starting containing interval
+    assert owner[3.0] == owner[9.5] == 0  # the nested one has ended
+    assert n_overlap == 2

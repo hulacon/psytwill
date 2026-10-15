@@ -34,7 +34,10 @@ def read_scores(path: str | Path) -> pd.DataFrame:
         raise InputError(f"Input file not found: {path}")
     sep = "\t" if path.suffix.lower() == ".tsv" else ","
     try:
-        df = pd.read_csv(path, sep=sep)
+        # stimulus_id is a key, not a number: "001" must not become 1 (or
+        # 1.0 when the column has a gap), or the same stimulus keys
+        # differently depending on which CSV carried it.
+        df = pd.read_csv(path, sep=sep, dtype={"stimulus_id": str})
     except Exception as exc:
         raise InputError(f"Could not read {path}: {exc}") from exc
     if df.empty:

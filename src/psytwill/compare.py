@@ -86,10 +86,10 @@ def _align(X, Y, groups=None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None
             f"{B.shape[0]}. Project both onto a common grain before comparing "
             "(pooling for chunk grain, interval matching for irregular text)."
         )
+    if groups is not None and np.asarray(groups).shape[0] != A.shape[0]:
+        raise SpaceError("'groups' must have one entry per row of X/Y.")
     keep = ~(np.isnan(A).any(axis=1) | np.isnan(B).any(axis=1))
     g = None if groups is None else np.asarray(groups)[keep]
-    if g is not None and g.shape[0] != keep.sum():
-        raise SpaceError("'groups' must have one entry per row of X/Y.")
     return A[keep], B[keep], g, int((~keep).sum())
 
 

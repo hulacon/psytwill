@@ -62,7 +62,11 @@ def next_window(
     alphas: Sequence[float] = DEFAULT_ALPHAS,
     n_boot: int = 2000,
     seed: int = 0,
+    window: float | None = None,
 ) -> tuple[pd.DataFrame, dict]:
+    """``window`` (seconds) places rows on the grid by time, so a film with
+    dropped (NaN) bins never pairs windows further apart than ``horizon``
+    bins; without it, consecutive rows are taken as consecutive bins."""
     if horizon < 1:
         raise BenchError("horizon must be at least 1 bin")
     gap = horizon if gap is None else gap
@@ -71,8 +75,16 @@ def next_window(
                          "candidates, which persistence then always picks")
     films = _films(emb)
     names = sorted(films)
-    # source/target pairs per film
-    pairs = {f: (films[f][1][:-horizon], films[f][1][horizon:]) for f in names if len(films[f][0]) > horizon}
+    # grid bin of every row; source/target pairs are bins exactly `horizon` apart
+    bins = {f: (np.floor(films[f][0] / window + 1e-6).astype(int) if window else np.arange(len(films[f][0])))
+            for f in names}
+    src_tgt = {}
+    for f in names:
+        at = {b: i for i, b in enumerate(bins[f])}
+        src = np.array([i for i, b in enumerate(bins[f]) if b + horizon in at], dtype=int)
+        if len(src):
+            src_tgt[f] = (src, np.array([at[bins[f][i] + horizon] for i in src], dtype=int))
+    pairs = {f: (films[f][1][s], films[f][1][t]) for f, (s, t) in src_tgt.items()}
     if len(pairs) < 2:
         raise BenchError(f"{len(pairs)} film(s) are longer than the horizon; need at least 2")
     preds: dict[str, dict[str, np.ndarray]] = {p: {} for p in predictors}
@@ -97,15 +109,14 @@ def next_window(
     rows = []
     for f in pairs:
         times, X = films[f]
-        n_src = len(X) - horizon
-        tgt = np.arange(n_src) + horizon
-        allowed = np.abs(np.arange(len(X))[None, :] - tgt[:, None]) > gap
+        src, tgt = src_tgt[f]
+        allowed = np.abs(bins[f][None, :] - bins[f][tgt][:, None]) > gap
         for p in predictors:
             S = similarity(preds[p][f], X, metric)
             r = identify(S, tgt, allowed)
             r.insert(0, "predictor", p)
             r.insert(0, "target_time", times[tgt])
-            r.insert(0, "time", times[:n_src])
+            r.insert(0, "time", times[src])
             r.insert(0, "stimulus_id", f)
             if p in alpha_of:
                 r["alpha"] = alpha_of[p][f]

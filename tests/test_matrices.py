@@ -144,3 +144,28 @@ class TestSeries:
         recs = diagonal_records(r)
         assert [rec["value"] for rec in recs] == [pytest.approx(1.0)] * 2
         assert recs[1]["label_a"] == "a1" and recs[1]["label_b"] == "b1"
+
+
+def test_cross_profile_columns_pair_by_name_not_position():
+    from psytwill.spaces import match_spaces
+
+    a = pd.DataFrame({"chunk_label": ["x", "y"], "emotion_joy": [0.9, 0.1],
+                      "emotion_anger": [0.1, 0.9], "emotion_fear": [0.0, 0.0]})
+    b = a[["chunk_label", "emotion_anger", "emotion_joy", "emotion_fear"]].copy()
+    (pa, pb), = match_spaces(detect_spaces(a.columns), detect_spaces(b.columns))
+    frame = compute_matrix(a, pa, df_b=b, space_b=pb).frame
+    # identical rows, only the CSV column order differs
+    assert frame.loc["x", "x"] == pytest.approx(1.0)
+    assert frame.loc["y", "y"] == pytest.approx(1.0)
+
+
+def test_cross_profile_with_different_columns_is_refused():
+    from psytwill.spaces import match_spaces
+
+    a = pd.DataFrame({"chunk_label": ["x", "y"], "emotion_joy": [0.9, 0.1],
+                      "emotion_anger": [0.1, 0.9]})
+    b = pd.DataFrame({"chunk_label": ["x", "y"], "emotion_joy": [0.9, 0.1],
+                      "emotion_grief": [0.1, 0.9]})
+    (pa, pb), = match_spaces(detect_spaces(a.columns), detect_spaces(b.columns))
+    with pytest.raises(SpaceError, match="different columns"):
+        compute_matrix(a, pa, df_b=b, space_b=pb)

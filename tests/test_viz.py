@@ -336,3 +336,12 @@ def test_build_bundle_ships_family_trajectories(family_dir, films_three_chunks, 
     body = json.loads(re.search(
         r"= (\{.*\});", (out / "data" / "film-a.js").read_text(), re.S).group(1))
     assert [e["model"] for e in body["proj"]] == ["clip"]
+
+
+def test_registry_empty_cells_are_none_so_the_payload_is_strict_json(tmp_path):
+    reg = tmp_path / "movies.tsv"
+    pd.DataFrame({"stimulus_id": ["f1"], "movie_name": ["Film One"], "style": [None],
+                  "duration_s": [2.0]}).to_csv(reg, sep="\t", index=False)
+    row = M.load_registry(reg)["f1"]
+    assert row["style"] is None
+    json.dumps(row, allow_nan=False)

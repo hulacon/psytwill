@@ -261,9 +261,20 @@ def read_events(
     """
     frames = []
     unresolved: list[str] = []
+    generic: dict[str, Path] = {}
     for p in paths:
         p = Path(p)
         ents = parse_entities(p)
+        if ents["subject"] is None:
+            # A generic file's clock is its stem; two files with one stem
+            # (run1/events.tsv, run2/events.tsv) would merge into one scan.
+            seen = generic.setdefault(str(ents["task"]), p)
+            if seen != p:
+                raise InputError(
+                    f"{seen} and {p} are non-BIDS events files with the same "
+                    f"name stem {ents['task']!r}, so they would share one clock; "
+                    "rename them apart (or use BIDS names)."
+                )
         ev = pd.read_csv(
             p, sep="\t", na_values=["n/a"],
             dtype={"word": str, "voice": str, "movie_name": str,
@@ -420,7 +431,7 @@ def load_item_features(
     if p.suffix == ".parquet":
         long = pd.read_parquet(p)
     else:
-        long = pd.read_csv(p)
+        long = pd.read_csv(p, dtype={"stimulus_id": str, "voice": str})
     need = {"stimulus_id", "model", "feature", "value"}
     if not need <= set(long.columns):
         raise InputError(
@@ -443,9 +454,11 @@ def load_item_features(
         raise InputError(f"{p.name} has no item-level (untimed) feature rows to attach")
     if "voice" not in untimed.columns:
         untimed = untimed.assign(voice=None)
+    # Replicates (several captions of one image, the words of a chunk) pool
+    # by mean, as store.load_spaces pools them — never first-row-wins.
     wide = untimed.pivot_table(
         index=["stimulus_id", "voice"], columns="feature", values="value",
-        aggfunc="first", dropna=False,
+        aggfunc="mean", dropna=False,
     ).reset_index()
     wide.columns.name = None
     model_cols = {

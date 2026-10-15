@@ -363,3 +363,13 @@ class TestProvenanceColumns:
         spaces = load_spaces(write_table(tmp_path / "kept.parquet", rows), report=rep)
         assert "llstat_n_edges" in spaces["llstat"].features
         assert rep.dropped_provenance == {}
+
+
+def test_null_modality_loads_as_none_not_the_string_nan(tmp_path):
+    p = tmp_path / "legacy.parquet"
+    pd.DataFrame({"stimulus_id": ["a", "b", "a", "b"], "model": "m",
+                  "feature": ["m_000", "m_000", "m_001", "m_001"],
+                  "value": [1.0, 2.0, 3.0, 4.0], "value_str": pd.Series([None] * 4, dtype="string"),
+                  "modality": [None] * 4, "extractor": [None] * 4}).to_parquet(p, index=False)
+    sp = load_spaces(p)["m"]
+    assert sp.modality is None and sp.extractor is None

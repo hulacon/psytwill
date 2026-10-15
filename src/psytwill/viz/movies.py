@@ -580,6 +580,8 @@ def load_registry(registry: Path) -> dict[str, dict]:
     if "stimulus_id" not in df.columns:
         raise InputError(f"{path} has no stimulus_id column — not a "
                          "stimulus-registry table")
+    # empty cells are None, not NaN: the payload is strict JSON
+    df = df.astype(object).where(df.notna(), None)
     return {r["stimulus_id"]: r.to_dict() for _, r in df.iterrows()}
 
 

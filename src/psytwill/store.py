@@ -155,6 +155,14 @@ def _read(
         ) from exc
 
 
+def _first_or_none(df: pd.DataFrame, column: str) -> str | None:
+    """The column's first value as a string; None when absent or null (not "nan")."""
+    if column not in df:
+        return None
+    v = df[column].iloc[0]
+    return None if pd.isna(v) else str(v)
+
+
 def distinct_values(path: str | Path, column: str) -> set[str]:
     """Distinct non-null values of one column, streamed batch by batch.
 
@@ -325,8 +333,8 @@ def load_spaces(
             labels=labels,
             X=wide.to_numpy(dtype=float),
             features=[str(c) for c in wide.columns],
-            modality=str(df["modality"].iloc[0]) if "modality" in df else None,
-            extractor=str(df["extractor"].iloc[0]) if "extractor" in df else None,
+            modality=_first_or_none(df, "modality"),
+            extractor=_first_or_none(df, "extractor"),
             n_replicates=n_rep,
         )
         rep.loaded.append(name)

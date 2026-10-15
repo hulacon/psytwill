@@ -670,9 +670,12 @@ def _table_usable(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def aggregate_groups(args: argparse.Namespace) -> tuple[dict[tuple[str, str, str], list[Path]], list[tuple[Path, str]]]:
+def aggregate_groups(args: argparse.Namespace) -> tuple[dict[tuple[str, str, str], list[Path]], list[tuple[Path, str]],
+                                                         dict[tuple[str, str, str], dict[str, set[Path]]]]:
+    """Groups, skipped tables, and per group the unit dirs each model has a usable table in."""
     groups: dict[tuple[str, str, str], list[Path]] = {}
     skipped: list[tuple[Path, str]] = []
+    units_of: dict[tuple[str, str, str], dict[str, set[Path]]] = {}
     for src, unit, model in _filtered(args):
         if not is_done(stem_for(src, unit, model)):
             continue
@@ -682,7 +685,8 @@ def aggregate_groups(args: argparse.Namespace) -> tuple[dict[tuple[str, str, str
                 skipped.append((path, why))
                 continue
             groups.setdefault((src.corpus, src.source, table), []).append(path)
-    return {k: sorted(v) for k, v in sorted(groups.items())}, skipped
+            units_of.setdefault((src.corpus, src.source, table), {}).setdefault(model, set()).add(path.parent)
+    return {k: sorted(v) for k, v in sorted(groups.items())}, skipped, units_of
 
 
 def agg_output(key: tuple[str, str, str]) -> Path:
@@ -696,7 +700,7 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
         sys.exit("ERROR: `aggregate --model/--skip-model` would write a partial group (a group holds every model of its table); narrow with --corpus/--source instead")
     if args.unit or args.unit_index is not None:
         sys.exit("ERROR: `aggregate` is per corpus/source, not per unit")
-    groups, skipped = aggregate_groups(args)
+    groups, skipped, units_of = aggregate_groups(args)
     if not groups:
         print("no aggregatable tables matched the filters")
         return 0
@@ -708,15 +712,17 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
         print(f"skipped {sum(names.values()):>6} table(s): {why}")
         for name, n in sorted(names.items()):
             print(f"    {n:>5}  {name}")
-    # a group holds every unit of its (corpus, source); incomplete ones are
-    # reported and left unbuilt unless --allow-partial
+    # a group holds every unit of its (corpus, source) for every model of its
+    # table; incomplete ones are reported and left unbuilt unless --allow-partial
     complete: dict[tuple[str, str, str], list[Path]] = {}
     for key, paths in groups.items():
         corpus, source, table = key
         src = next(s_ for s_ in build_sources() if s_.corpus == corpus and s_.source == source)
-        n_units, n_seen = len(src.units()), len({p.parent for p in paths})
-        if n_seen < n_units and not args.allow_partial:
-            print(f"  INCOMPLETE {corpus}/{source}/{table}: {n_seen}/{n_units} units done — skipped")
+        n_units = len(src.units())
+        short = {m: len(u) for m, u in sorted(units_of[key].items()) if len(u) < n_units}
+        if short and not args.allow_partial:
+            done = ", ".join(f"{m} {n}/{n_units}" for m, n in short.items())
+            print(f"  INCOMPLETE {corpus}/{source}/{table}: units done per model {done} — skipped")
             continue
         complete[key] = paths
     groups = complete

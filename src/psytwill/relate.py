@@ -123,7 +123,8 @@ def read_scores(path: str | Path) -> ScoreTable:
         )
     frame = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
     block = meta["block"]
-    columns = sorted(c for c in frame.columns if c.startswith(f"{block}_") and c[len(block) + 1:].isdigit())
+    columns = sorted((c for c in frame.columns if c.startswith(f"{block}_") and c[len(block) + 1:].isdigit()),
+                     key=lambda c: int(c[len(block) + 1:]))
     if len(columns) != int(meta["k"]):
         raise InputError(f"{p}: {len(columns)} `{block}_###` columns but the sidecar says k = {meta['k']}")
     key = meta["key"].split(",")
@@ -135,6 +136,10 @@ def _pooled(t: ScoreTable, join: Sequence[str], pool: str) -> tuple[pd.DataFrame
     missing = [j for j in join if j not in t.frame.columns]
     if missing:
         raise SpaceError(f"{t.path.name} has no join column(s) {missing}; its key is {t.key}")
+    n_null = int(t.frame[list(join)].isna().any(axis=1).sum())
+    if n_null:
+        raise SpaceError(f"{t.path.name}: {n_null} row(s) have a null join key {list(join)}; "
+                         "they would drop out of the pairing uncounted")
     sizes = t.frame.groupby(list(join), sort=False).size()
     per_key = int(sizes.max())
     if per_key > 1 and pool == "none":

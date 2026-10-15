@@ -102,6 +102,18 @@ def compute_matrix(
             "be compared."
         )
 
+    if cross and space_a.kind == "profile" and space_b.kind == "profile":
+        # Profile columns are detected in file order; pair them by name.
+        if set(space_a.columns) != set(space_b.columns):
+            only_a = sorted(set(space_a.columns) - set(space_b.columns))
+            only_b = sorted(set(space_b.columns) - set(space_a.columns))
+            raise SpaceError(
+                f"Profile '{space_a.name}' has different columns in the two "
+                f"inputs (only in A: {only_a[:5]}; only in B: {only_b[:5]}); "
+                "they cannot be paired dimension by dimension."
+            )
+        space_b = space_a
+
     Xa = _extract(df_a, space_a)
     Xb = _extract(df_b, space_b) if cross else None
 

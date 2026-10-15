@@ -192,11 +192,7 @@ def _run_timelines(args: argparse.Namespace) -> None:
 def _run_compose(args: argparse.Namespace) -> None:
     from psytwill.compose import build_composed
 
-    modality_map = None
-    if args.modality_map:
-        modality_map = dict(
-            item.split("=", 1) for item in args.modality_map.split(",") if item
-        )
+    modality_map = _parse_modality_map(args.modality_map) or None
     summary = build_composed(
         args.events,
         args.stores,

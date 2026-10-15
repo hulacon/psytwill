@@ -109,11 +109,24 @@ def _assign_bins(
         offsets = iv["offset"].to_numpy()
         t = grp["t"].to_numpy()
         pos = np.searchsorted(onsets, t, side="right") - 1
-        ok = (pos >= 0) & (t < offsets[np.clip(pos, 0, None)])
-        # overlap accounting: a bin whose owner's predecessor also contains it
-        prev = pos - 1
-        overlapped = ok & (prev >= 0) & (t < offsets[np.clip(prev, 0, None)])
+        # Every interval at or before ``pos`` starts at or before t, so one
+        # contains t iff its offset is past t; the running max of offsets
+        # says whether any does, and the owner is the latest such one — not
+        # necessarily the latest-starting (a short interval nested in a long
+        # one may already have ended).
+        reach = np.maximum.accumulate(offsets)
+        ok = (pos >= 0) & (t < reach[np.clip(pos, 0, None)])
+        owner = pos.copy()
+        for i in np.flatnonzero(ok & (t >= offsets[np.clip(pos, 0, None)])):
+            j = owner[i]
+            while offsets[j] <= t[i]:
+                j -= 1
+            owner[i] = j
+        # overlap accounting: a bin some earlier interval also contains
+        prev = owner - 1
+        overlapped = ok & (prev >= 0) & (t < reach[np.clip(prev, 0, None)])
         n_overlap += int(overlapped.sum())
+        pos = owner
         sel = grp.loc[ok].copy()
         sel["chunk_idx"] = iv["chunk_idx"].to_numpy()[pos[ok]]
         out.append(sel)

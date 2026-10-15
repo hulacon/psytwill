@@ -530,3 +530,14 @@ def test_window_sec_is_carried_into_the_table_sidecar(tmp_path):
     img = json.loads((tmp_path / "img_features.meta.json").read_text())
     assert all("window_sec" not in v for v in img["inputs"][0]["models"].values())
     assert group_window_sec(tmp_path / "img_features.csv") == {}
+
+
+def test_numeric_looking_stimulus_ids_keep_their_spelling(tmp_path):
+    a, b = tmp_path / "a.csv", tmp_path / "b.csv"
+    a.write_text("stimulus_id,minilm_000,minilm_001\n001,0.1,0.2\n002,0.3,0.4\n")
+    b.write_text("stimulus_id,clip_000,clip_001\n001,0.1,0.2\n,0.3,0.4\n")
+    out = tmp_path / "f.csv"
+    build_features([a, b], out)  # legacy inputs: warns about missing sidecars
+    t = pd.read_csv(out, dtype={"stimulus_id": str})
+    ids = t.dropna(subset=["stimulus_id"]).groupby("model")["stimulus_id"].unique()
+    assert set(ids["minilm"]) == {"001", "002"} and set(ids["clip"]) == {"001"}

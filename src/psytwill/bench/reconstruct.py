@@ -32,12 +32,23 @@ from .core import fit_map, folds
 MIN_FIT_ROWS = 100
 
 
+def _part(p: str) -> str:
+    """One non-leading key part in canonical spelling: "3.0" -> "3"."""
+    try:
+        f = float(p)
+    except ValueError:
+        return p
+    return str(int(f)) if f.is_integer() and p != "nan" else p
+
+
 def _label(values) -> str:
     out = []
-    for v in values:
+    for i, v in enumerate(values):
         if isinstance(v, float) and v.is_integer():
             v = int(v)
-        out.append(str(v))
+        # string-typed key columns (``space project`` writes split labels)
+        # get the same respelling as the member side, or "f|1.0" never meets "f|1"
+        out.append(_part(v) if i and isinstance(v, str) else str(v))
     return "|".join(out)
 
 
@@ -61,14 +72,9 @@ def _relabel(sm: SpaceMatrix) -> SpaceMatrix:
     labels = []
     for lab in sm.labels:
         head, *rest = lab.split("|")
-        parts = [head]
-        for p in rest:
-            try:
-                f = float(p)
-                parts.append(str(int(f)) if f.is_integer() and p not in ("nan",) else p)
-            except ValueError:
-                parts.append(p)
-        labels.append("|".join(parts))
+        labels.append("|".join([head, *(_part(p) for p in rest)]))
+    if len(set(labels)) != len(labels):
+        raise BenchError(f"{sm.name}: distinct labels collapse to one spelling (e.g. '3' and '3.0')")
     return SpaceMatrix(name=sm.name, labels=labels, X=sm.X, features=sm.features, modality=sm.modality,
                        extractor=sm.extractor, n_replicates=sm.n_replicates)
 

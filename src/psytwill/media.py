@@ -200,9 +200,14 @@ def _mux_audio(run_dir: Path, audio: list[dict], run_end: float) -> None:
 
     mix = np.zeros((int(run_end * AUDIO_SR) + AUDIO_SR, 2), dtype=np.float32)
     with tempfile.TemporaryDirectory() as td:
+        # decoded once per source path: keyed by the full path, not the stem,
+        # so male/dog.wav and female/dog.wav stay two files
+        decoded: dict[Path, Path] = {}
         for r in audio:
-            wav = Path(td) / (r["file"].stem + ".wav")
-            if not wav.exists():
+            src = Path(r["file"]).resolve()
+            wav = decoded.get(src)
+            if wav is None:
+                wav = decoded[src] = Path(td) / f"{len(decoded):06d}.wav"
                 subprocess.run([ffmpeg, "-y", "-v", "error", "-i", str(r["file"]),
                                 "-ar", str(AUDIO_SR), "-ac", "2", str(wav)],
                                check=True)
