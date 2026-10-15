@@ -394,3 +394,10 @@ def test_reliability_checks_the_group_length(rng):
 
     with pytest.raises(SpaceError, match="entries for 10 rows"):
         split_half_reliability(rng.randn(10, 3), np.arange(4))
+
+
+def test_groups_of_the_wrong_length_raise_space_error():
+    rng = np.random.default_rng(0)
+    X, Y = rng.standard_normal((30, 3)), rng.standard_normal((30, 2))
+    with pytest.raises(SpaceError, match="groups"):
+        ridge_predictivity(X, Y, groups=np.arange(29) % 5)

@@ -38,6 +38,7 @@ the load report instead of the covariance matrix.
 
 from __future__ import annotations
 
+import heapq
 import json
 from pathlib import Path
 from typing import Iterable, Literal
@@ -109,11 +110,32 @@ def _assign_bins(
         offsets = iv["offset"].to_numpy()
         t = grp["t"].to_numpy()
         pos = np.searchsorted(onsets, t, side="right") - 1
-        ok = (pos >= 0) & (t < offsets[np.clip(pos, 0, None)])
-        # overlap accounting: a bin whose owner's predecessor also contains it
-        prev = pos - 1
-        overlapped = ok & (prev >= 0) & (t < offsets[np.clip(prev, 0, None)])
+        # Every interval at or before ``pos`` starts at or before t, so one
+        # contains t iff its offset is past t; the running max of offsets
+        # says whether any does, and the owner is the latest such one — not
+        # necessarily the latest-starting (a short interval nested in a long
+        # one may already have ended).
+        reach = np.maximum.accumulate(offsets)
+        ok = (pos >= 0) & (t < reach[np.clip(pos, 0, None)])
+        owner = pos.copy()
+        # Bins whose latest-starting interval has ended: sweep them in time
+        # order with a max-heap of started intervals, dropping ended ones
+        # lazily (an interval ended at t stays ended later) — O(n log n).
+        walk = np.flatnonzero(ok & (t >= offsets[np.clip(pos, 0, None)]))
+        heap: list[int] = []
+        k = 0
+        for i in walk[np.argsort(t[walk], kind="stable")]:
+            while k <= pos[i]:
+                heapq.heappush(heap, -k)
+                k += 1
+            while offsets[-heap[0]] <= t[i]:
+                heapq.heappop(heap)
+            owner[i] = -heap[0]
+        # overlap accounting: a bin some earlier interval also contains
+        prev = owner - 1
+        overlapped = ok & (prev >= 0) & (t < reach[np.clip(prev, 0, None)])
         n_overlap += int(overlapped.sum())
+        pos = owner
         sel = grp.loc[ok].copy()
         sel["chunk_idx"] = iv["chunk_idx"].to_numpy()[pos[ok]]
         out.append(sel)

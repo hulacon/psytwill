@@ -312,3 +312,21 @@ def test_cli_registers_from_label(tmp_path):
     assert {r: v["n"] for r, v in m["per_register"].items()} == {"librispeech": half, "musopen": N_ITEMS - half}
     w = np.load(out / "PQ_v0.2.npz")
     assert w["reg::musopen::cov"].shape == (2 * m["k"], 2 * m["k"])
+
+
+def test_read_scores_orders_columns_numerically_past_999(tmp_path):
+    X = np.zeros((2, 1001))
+    t = read_scores(_write_block(tmp_path, "P", X, {"stimulus_id": ["a", "b"]}))
+    assert t.columns == [f"P_{j:03d}" for j in range(1001)]  # P_100 is not followed by P_1000
+
+
+def test_null_join_keys_are_refused_not_dropped(tmp_path):
+    from psytwill.relate import pair_tables
+
+    rng = np.random.default_rng(0)
+    a = read_scores(_write_block(tmp_path, "P", rng.normal(size=(3, 2)),
+                                 {"stimulus_id": ["s1", "s2", "s3"], "chunk_idx": [0, 0, 0]}))
+    b = read_scores(_write_block(tmp_path, "Q", rng.normal(size=(3, 2)),
+                                 {"stimulus_id": ["s1", "s2", "s3"], "chunk_idx": [0.0, 0.0, np.nan]}))
+    with pytest.raises(SpaceError, match="null join key"):
+        pair_tables(a, b, ["stimulus_id", "chunk_idx"])

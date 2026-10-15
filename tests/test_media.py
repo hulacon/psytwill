@@ -72,3 +72,39 @@ def test_render_frames_with_pillow(tmp_path):
     assert out["image_items"] == 1 and out["unmapped"] == 0
     frames = sorted((tmp_path / "run" / "frames").glob("frame_*.jpg"))
     assert len(frames) == out["frames"] == 5  # 0.0..2.0 inclusive
+
+
+def test_mux_audio_decodes_same_named_files_separately(tmp_path, monkeypatch):
+    """male/dog.wav and female/dog.wav are two sources, not one cached decode."""
+    import subprocess
+    import sys
+    import types
+    from pathlib import Path
+
+    import numpy as np
+
+    from psytwill import media
+
+    level = {}
+    decoded_from = []
+
+    def fake_run(cmd, check):
+        if "-ar" in cmd:  # a source decode: remember which file fed which wav
+            src, wav = cmd[cmd.index("-i") + 1], cmd[-1]
+            decoded_from.append(src)
+            level[wav] = 1.0 if "male" in src and "female" not in src else 0.0
+            Path(wav).touch()
+        return subprocess.CompletedProcess(cmd, 0)
+
+    def fake_read(path, dtype, always_2d):
+        return np.full((10, 2), level[str(path)], dtype=np.float32), media.AUDIO_SR
+
+    monkeypatch.setitem(sys.modules, "soundfile",
+                        types.SimpleNamespace(read=fake_read, write=lambda *a, **k: None))
+    monkeypatch.setattr(media.shutil, "which", lambda _: "ffmpeg")
+    monkeypatch.setattr(media.subprocess, "run", fake_run)
+    files = {v: tmp_path / v / "dog.wav" for v in ("male", "female")}
+    audio = [{"sid": "dog", "voice": v, "onset": float(i), "dur": 0.3, "file": files[v], "kind": "audio"}
+             for i, v in enumerate(("male", "female"))]
+    media._mux_audio(tmp_path / "run", audio, run_end=2.0)
+    assert sorted(decoded_from) == sorted(str(f) for f in files.values())

@@ -143,3 +143,13 @@ def test_spaces_subcommand(chunks_csv, capsys):
     out = capsys.readouterr().out
     assert "minilm" in out and "emotion" in out
     assert "16d" in out and "3d" in out
+
+
+def test_compose_rejects_a_malformed_modality_map(tmp_path, capsys):
+    ev = tmp_path / "x_events.tsv"
+    ev.write_text("onset\tduration\tstimulus_id\n0\t1\tA\n")
+    store = tmp_path / "s.parquet"
+    store.write_bytes(b"")
+    assert main(["compose", str(ev), "--stores", str(store), "-o", str(tmp_path / "o"),
+                 "--modality-map", "clip"]) == 1
+    assert "Bad --modality-map entry" in capsys.readouterr().err

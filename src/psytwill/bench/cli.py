@@ -121,8 +121,14 @@ def _run_oddoneout(args) -> None:
     from .core import refuse_overlap, write_run
     from .oddoneout import oddoneout
 
-    emb, n_nan = _load(args.features, args.model, args.key)
+    drop = _ids(args.drop_ids)
+    emb, n_nan = _load(args.features, args.model, args.key, drop=drop)
     tri = _read_table(args.triplets)
+    if drop:
+        tri = tri[~(tri["item1"].astype(str).isin(drop) | tri["item2"].astype(str).isin(drop)
+                    | tri["item3"].astype(str).isin(drop))]
+        if tri.empty:
+            raise BenchError(f"--drop-ids {args.drop_ids} leaves no triplets")
     if args.split:
         col, _, val = args.split.partition("=")
         tri = tri[tri[col].astype(str) == val]
@@ -156,7 +162,8 @@ def _run_nextwindow(args) -> None:
     emb, n_nan = _load(args.features, args.model, "stimulus_id,time", window=args.window, drop=drop)
     guard = refuse_overlap({lab.split("|")[0] for lab in emb.labels}, args.fit_ids, what="film")
     items, summary = next_window(emb, horizon=args.horizon, gap=args.gap, predictors=args.predictors.split(","),
-                                 metric=args.metric, n_splits=args.n_splits, n_boot=args.n_boot, seed=args.seed)
+                                 metric=args.metric, n_splits=args.n_splits, n_boot=args.n_boot, seed=args.seed,
+                                 window=args.window)
     summary["leak_guard"] = guard
     summary["window_sec"] = args.window
     params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": n_nan}
@@ -176,9 +183,14 @@ def _run_congruence(args) -> None:
     from .congruence import congruence
     from .core import refuse_overlap, write_run
 
+    drop = _ids(args.drop_ids)
     pairs = _read_table(args.pairs)
-    img, n1 = _load(args.image_features, args.image_model, "stimulus_id")
-    wrd, n2 = _load(args.word_features, args.word_model, "stimulus_id")
+    if drop:
+        pairs = pairs[~(pairs["image_id"].astype(str).isin(drop) | pairs["word_id"].astype(str).isin(drop))]
+        if pairs.empty:
+            raise BenchError(f"--drop-ids {args.drop_ids} leaves no pairs")
+    img, n1 = _load(args.image_features, args.image_model, "stimulus_id", drop=drop)
+    wrd, n2 = _load(args.word_features, args.word_model, "stimulus_id", drop=drop)
     mi = mt = None
     if args.mode == "mapped":
         if not (args.map_image_features and args.map_text_features):

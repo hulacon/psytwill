@@ -500,3 +500,94 @@ def test_cli_select_names_cross_modal_members_by_pair(tmp_path):
     assert side["summary"]["both_directions"]["pct_beaten"]["mean"] == pytest.approx(
         good["both_directions"]["pct_beaten"]["mean"])
     assert side["params"]["query_model"] == "B2" and side["params"]["arm"] == "B2"
+
+
+def test_cli_oddoneout_applies_drop_ids(tmp_path):
+    pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(6)
+    ids = [f"c{i}" for i in range(12)]
+    centers = rng.normal(size=(2, 6)) * 5
+    emb = _sm("e", ids, np.vstack([centers[i % 2] + rng.normal(size=6) for i in range(12)]))
+    fp = tmp_path / "things_features.parquet"
+    _long(emb, "viz2psy").drop(columns="chunk_idx").to_parquet(fp, index=False)
+    tri = pd.DataFrame([{"item1": f"c{a}", "item2": f"c{a + 2}", "item3": f"c{b}", "odd": f"c{b}"}
+                        for a in range(0, 8, 2) for b in (1, 3, 5)])
+    tp = tmp_path / "tri.csv"
+    tri.to_csv(tp, index=False)
+    drop = tmp_path / "drop.txt"
+    drop.write_text("c5\n")
+    out = tmp_path / "out"
+    assert main(["bench", "oddoneout", "--features", str(fp), "--model", "e", "--triplets", str(tp), "--drop-ids",
+                 str(drop), "-o", str(out), "--tag", "t", "--n-boot", "50"]) == 0
+    items = pd.read_csv(out / "oddoneout__t.items.csv")
+    assert len(items) == len(tri) - 4
+    assert not items[["item1", "item2", "item3"]].isin(["c5"]).any().any()
+
+
+def test_cli_congruence_applies_drop_ids(tmp_path):
+    pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(4)
+    image, caps, word, pairs = _pairs(rng)
+    paths = {}
+    for sm in (image, caps, word):
+        paths[sm.name] = tmp_path / f"{sm.name}.parquet"
+        _long(sm, "x").drop(columns="chunk_idx").to_parquet(paths[sm.name], index=False)
+    pp = tmp_path / "pairs.csv"
+    pairs.to_csv(pp, index=False)
+    gone = pairs["image_id"].iloc[0]
+    drop = tmp_path / "drop.txt"
+    drop.write_text(f"{gone}\n")
+    out = tmp_path / "out"
+    assert main(["bench", "congruence", "--image-features", str(paths["img"]), "--image-model", "img",
+                 "--word-features", str(paths["w"]), "--word-model", "w", "--pairs", str(pp),
+                 "--outcomes", "rating", "--map-image-features", str(paths["img"]),
+                 "--map-text-features", str(paths["cap"]), "--map-text-model", "cap", "--map-text-key",
+                 "stimulus_id", "--drop-ids", str(drop), "-o", str(out), "--tag", "t", "--n-boot", "20"]) == 0
+    items = pd.read_csv(out / "congruence__t.items.csv")
+    assert len(items) == int((pairs["image_id"] != gone).sum())
+    assert gone not in set(items["image_id"])
+
+
+def test_reconstruct_matches_string_time_keys_from_space_project(tmp_path):
+    pytest.importorskip("pyarrow")
+    from psytwill.bench.core import load_model
+    from psytwill.bench.reconstruct import fit_reconstruction, scores_matrix
+
+    rng = np.random.default_rng(1)
+    rows = [(f"film{k}", b * 0.5, "m", f"m_{j:03d}", float(rng.normal()))
+            for k in range(6) for b in range(40) for j in range(3)]
+    df = pd.DataFrame(rows, columns=["stimulus_id", "time", "model", "feature", "value"])
+    df["value_str"] = pd.Series([None] * len(df), dtype="string")
+    df.to_parquet(tmp_path / "member.parquet")
+    member = load_model([tmp_path / "member.parquet"], "m", key=("stimulus_id", "time"))
+    # key columns as `space project` writes them: the label's string parts ("film0", "1.0")
+    parts = [lab.split("|") for lab in member.labels]
+    sc = pd.DataFrame(rng.normal(size=(member.n, 4)), columns=[f"V_{j:03d}" for j in range(4)])
+    sc.insert(0, "stimulus_id", [p[0] for p in parts])
+    sc.insert(1, "time", [p[1] for p in parts])
+    sc.to_parquet(tmp_path / "V_scores.parquet")
+    scores = scores_matrix(tmp_path / "V_scores.parquet", ["stimulus_id", "time"])
+    _, fit = fit_reconstruction(scores, member, cv_rows=1000)
+    assert fit["n_fit_rows"] == member.n  # whole-second bins included
+
+
+def test_reconstruct_refuses_labels_that_collapse():
+    from psytwill.bench.reconstruct import _relabel
+
+    with pytest.raises(BenchError, match="collapse"):
+        _relabel(_sm("m", ["s|3", "s|3.0"], np.eye(2)))
+
+
+def test_next_window_pairs_by_time_across_dropped_bins():
+    from psytwill.bench.core import drop_nan_rows
+
+    rng = np.random.default_rng(0)
+    labels, X = [], []
+    for f in "abc":
+        for b in range(12):
+            labels.append(f"{f}|{b * 0.5}")
+            X.append(np.full(4, np.nan) if f == "a" and b in (3, 4, 5) else rng.normal(size=4))
+    sm, _ = drop_nan_rows(_sm("m", labels, np.array(X)))
+    items, _ = next_window(sm, horizon=1, predictors=["persistence"], n_boot=10, window=0.5)
+    lag = items["target_time"] - items["time"]
+    assert np.allclose(lag, 0.5)  # 1.0 s -> 3.0 s across the gap is not one bin ahead

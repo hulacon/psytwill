@@ -218,3 +218,33 @@ def test_overlap_owned_by_latest_start_and_counted(tmp_path, gridded):
     # chunk 1 owns [1,3): bins 1.0..2.5
     assert cell(out, "clipA", 1, "vis", "f0") == pytest.approx(1.75)
     assert meta["n_overlapped_bins"] > 0
+
+
+def test_bins_inside_a_long_interval_survive_a_nested_short_one():
+    from psytwill.project import _assign_bins
+
+    iv = pd.DataFrame({"stimulus_id": ["m", "m"], "chunk_idx": [0, 1],
+                       "onset": [0.0, 2.0], "offset": [10.0, 3.0]})
+    bins = pd.DataFrame({"stimulus_id": ["m"] * 20, "t": [i * 0.5 for i in range(20)]})
+    out, n_overlap = _assign_bins(bins, iv)
+    owner = dict(zip(out["t"], out["chunk_idx"]))
+    assert sorted(owner) == list(bins["t"])  # every bin lies inside [0, 10)
+    assert owner[2.0] == owner[2.5] == 1  # the latest-starting containing interval
+    assert owner[3.0] == owner[9.5] == 0  # the nested one has ended
+    assert n_overlap == 2
+
+
+def test_bins_between_many_nested_intervals_go_to_the_containing_one():
+    from psytwill.project import _assign_bins
+
+    # one long interval holding several short ones, plus a later disjoint one
+    iv = pd.DataFrame({"stimulus_id": "m", "chunk_idx": [0, 1, 2, 3, 4],
+                       "onset": [0.0, 1.0, 3.0, 5.0, 12.0],
+                       "offset": [10.0, 2.0, 4.0, 6.0, 13.0]})
+    bins = pd.DataFrame({"stimulus_id": "m", "t": np.arange(0.0, 14.0, 0.5)})
+    out, _ = _assign_bins(bins, iv)
+    owner = dict(zip(out["t"], out["chunk_idx"]))
+    expect = {t: (1 if 1 <= t < 2 else 2 if 3 <= t < 4 else 3 if 5 <= t < 6 else 0)
+              for t in np.arange(0.0, 10.0, 0.5)}
+    expect.update({12.0: 4, 12.5: 4})
+    assert owner == expect  # 10.0-11.5 and 13.0+ lie in no interval

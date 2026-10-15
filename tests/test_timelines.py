@@ -413,3 +413,26 @@ def test_cli_timelines(events, registry_dir, features_table, tmp_path, capsys):
     assert rc == 0
     assert out.exists() and out.with_suffix(".meta.json").exists()
     assert "presentations" in capsys.readouterr().out
+
+
+def test_generic_events_files_sharing_a_stem_are_refused(tmp_path):
+    for d in ("s1", "s2"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "events.tsv").write_text("onset\tduration\tstimulus_id\n0\t1\tA\n")
+    with pytest.raises(InputError, match="same name stem"):
+        read_events([tmp_path / "s1" / "events.tsv", tmp_path / "s2" / "events.tsv"])
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".parquet"])
+def test_item_features_pool_replicates_by_mean(tmp_path, suffix):
+    from psytwill.timelines import load_item_features
+
+    rows = [dict(stimulus_id="001", voice=None, time=np.nan, onset=np.nan, offset=np.nan,
+                 chunk_idx=ch, model="minilm", feature="minilm_000", value=v)
+            for ch, v in enumerate([1.0, 2.0, 30.0])]
+    p = tmp_path / f"feat{suffix}"
+    long = pd.DataFrame(rows)
+    long.to_csv(p, index=False) if suffix == ".csv" else long.to_parquet(p, index=False)
+    wide, _ = load_item_features(p)
+    assert list(wide["stimulus_id"]) == ["001"]  # a key, not the number 1
+    assert wide["minilm_000"].tolist() == [11.0]

@@ -629,3 +629,67 @@ def test_family_name_is_checked(img_events, visual_store, tmp_path):
     with pytest.raises(InputError, match="--family"):
         build_composed([img_events], [visual_store], tmp_path / "x",
                        window=W, family="Bad-Name")
+
+
+# --------------------------------------------------------------------------
+# regressions
+# --------------------------------------------------------------------------
+
+def _events(path, rows):
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
+    return path
+
+
+def test_a_refused_run_leaves_nothing_that_reads_as_up_to_date(visual_store, tmp_path):
+    ev = _events(tmp_path / "sub-01_ses-06_task-T_run-01_events.tsv", [
+        {"onset": 0.0, "duration": 1.0, "stimulus_id": "imgA"},
+        {"onset": 2.0, "duration": 1.0, "stimulus_id": "imgZ"},  # in no store
+    ])
+    out = tmp_path / "out"
+    for _ in range(2):  # the identical re-run must refuse again, not skip
+        with pytest.raises(InputError, match="imgZ"):
+            build_composed([ev], [visual_store], out, window=W)
+    assert not list(out.rglob("*.parquet"))
+
+
+def test_chunk_idx_names_one_item_across_text_stores(tmp_path):
+    def text(path, model, ids):
+        return _store(path, [{"stimulus_id": s, "chunk_idx": 0, "model": model,
+                              "feature": f"{model}_000", "value": 1.0,
+                              "modality": "text", "extractor": "word2psy"} for s in ids])
+
+    full = text(tmp_path / "full.parquet", "minilm", ["A", "B", "C"])
+    part = text(tmp_path / "part.parquet", "gpt2", ["B", "C"])  # lacks A
+    ev = _events(tmp_path / "sub-01_ses-07_task-T_run-01_events.tsv", [
+        {"onset": 2.0 * i, "duration": 1.0, "stimulus_id": s} for i, s in enumerate("ABC")])
+    build_composed([ev], [full, part], tmp_path / "out", window=W)
+    t = pd.read_parquet(tmp_path / "out" / "features" / "movies_transcript_words_features.parquet")
+    per_chunk = t.groupby("chunk_idx")["source_stimulus_id"].unique()
+    assert all(len(v) == 1 for v in per_chunk)  # one item per chunk_idx, whichever store
+    assert {int(k): v[0] for k, v in per_chunk.items()} == {0: "A", 1: "B", 2: "C"}
+
+
+def test_grid_fill_is_per_model(tmp_path):
+    rows = [{"stimulus_id": s, "model": m, "feature": f"{m}_000", "value": 1.0,
+             "modality": "visual", "extractor": "viz2psy"}
+            for m, ids in (("clip", ["A", "B"]), ("gated", ["B"])) for s in ids]
+    store = _store(tmp_path / "vis.parquet", rows)
+    ev = _events(tmp_path / "sub-01_ses-08_task-T_run-01_events.tsv", [
+        {"onset": 0.0, "duration": 1.0, "stimulus_id": "A"},
+        {"onset": 2.0, "duration": 1.0, "stimulus_id": "B"}])
+    build_composed([ev], [store], tmp_path / "out", window=W)
+    t = pd.read_parquet(tmp_path / "out" / "features" / "movies_frames_features.parquet")
+    n = t.groupby("model")["time"].nunique()
+    assert n["gated"] == n["clip"]  # A's bins are NaN rows for gated, not missing
+    gated_a = t[(t["model"] == "gated") & (t["time"] < 1.0)]
+    assert len(gated_a) and gated_a["value"].isna().all()
+
+
+def test_an_unreadable_store_sidecar_is_an_error(tmp_path):
+    from psytwill.compose import store_checkpoints
+
+    p = tmp_path / "s.parquet"
+    p.write_bytes(b"")
+    (tmp_path / "s.meta.json").write_text('{"inputs": [')
+    with pytest.raises(InputError, match="sidecar"):
+        store_checkpoints(p)
