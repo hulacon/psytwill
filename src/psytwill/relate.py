@@ -20,6 +20,11 @@ Conventions (psytwill-space, DECIDED 2026-10-01):
 - **Inputs are pinned.** Each score table's sidecar names the block manifest
   it was projected through; the relation records that manifest's sha256, and
   ``check`` / ``project`` refuse a table projected through any other.
+- **So is the view.** A side records the block view its scores were read in
+  (``space project --view``: ``covariance`` or ``whitened``), and a table in
+  the other view is refused: the map would accept it and return wrong
+  coordinates. A sidecar or manifest written before views were recorded is
+  the covariance view, the only one there was.
 - **Pairing is declared, never inferred.** Rows join on named key columns.
   A side with several rows per join key must declare how they pool.
 - **Subspace stability is reported, not gated** (v0.1): each fold's top-k
@@ -61,6 +66,7 @@ from psytwill.decompose import (
     fit_cca,
 )
 from psytwill.exceptions import InputError, SpaceError
+from psytwill.space import BLOCK_VIEWS
 
 #: 1.1: `fixed_k` (k given from outside, or null) and `prefix_k` (the measured
 #: prefix count, which equals k unless k was fixed).
@@ -68,7 +74,13 @@ from psytwill.exceptions import InputError, SpaceError
 #: ({register: {n, r, full_rank}}, null without registers); the weights carry
 #: `reg::<register>::mean` (2k,) and `reg::<register>::cov` (2k, 2k), the
 #: joint moments of the top-k variates [a, b] on that register's fit rows.
-RELATE_SCHEMA_VERSION = "1.2"
+#: 1.3: each side records `view`, the block view its scores were read in.
+#: A side without it (schema <= 1.2) was fitted on the covariance view.
+RELATE_SCHEMA_VERSION = "1.3"
+#: The view of a score table or relation side that does not record one: views
+#: arrived with `space project --view` (psytwill 0.44.0), and before it every
+#: table was the covariance view.
+LEGACY_VIEW = "covariance"
 #: How `relate fit --registers-from-label` keys a row's register.
 REGISTER_FROM_LABEL = "corpus from the first join column's ext-<corpus>-* id ('internal' otherwise)"
 DEFAULT_R_MIN = math.sqrt(0.5)
@@ -99,6 +111,7 @@ class ScoreTable:
     columns: list[str]
     manifest: Path
     manifest_sha256: str
+    view: str = LEGACY_VIEW
 
 
 def _sidecar(path: Path) -> Path:
@@ -128,8 +141,11 @@ def read_scores(path: str | Path) -> ScoreTable:
     if len(columns) != int(meta["k"]):
         raise InputError(f"{p}: {len(columns)} `{block}_###` columns but the sidecar says k = {meta['k']}")
     key = meta["key"].split(",")
+    view = meta.get("view", LEGACY_VIEW)
+    if view not in BLOCK_VIEWS:
+        raise InputError(f"{side.name} names view {view!r}, which is not a block view {BLOCK_VIEWS}")
     return ScoreTable(path=p, frame=frame, block=block, key=key, columns=columns,
-                      manifest=manifest, manifest_sha256=sha256_file(manifest))
+                      manifest=manifest, manifest_sha256=sha256_file(manifest), view=view)
 
 
 def _pooled(t: ScoreTable, join: Sequence[str], pool: str) -> tuple[pd.DataFrame, int]:
@@ -382,7 +398,7 @@ def relate_tables(a: ScoreTable, b: ScoreTable, *, name: str, join: Sequence[str
     fit = fit_relation(X, Y, name=name, groups=groups, **fit_kw)
     fit.manifest["sides"] = {
         side: {"block": t.block, "manifest": str(t.manifest), "manifest_sha256": t.manifest_sha256,
-               "block_k": len(t.columns), "scores": str(t.path), "key": t.key, "pool": pool}
+               "block_k": len(t.columns), "view": t.view, "scores": str(t.path), "key": t.key, "pool": pool}
         for side, t, pool in (("a", a, pool_a), ("b", b, pool_b))
     }
     fit.manifest["join"] = list(join)
@@ -453,8 +469,15 @@ def load_relation(manifest_path: str | Path) -> RelationFit:
     return RelationFit(name=meta["name"], k=int(meta["k"]), map=cm, manifest=meta, registers=regs)
 
 
+def side_view(manifest: dict, side: str) -> str:
+    """The block view side ``side`` was fitted on; covariance for a manifest
+    written before sides recorded it (schema <= 1.2, see :data:`LEGACY_VIEW`)."""
+    return manifest["sides"][side].get("view", LEGACY_VIEW)
+
+
 def require_side(fit: RelationFit, table: ScoreTable, side: str) -> None:
-    """Refuse a score table projected through any block manifest but the one fitted on."""
+    """Refuse a score table projected through any block manifest but the one fitted on,
+    or read in any view but the one fitted on."""
     want = fit.manifest["sides"][side]
     if table.manifest_sha256 != want["manifest_sha256"]:
         raise SpaceError(
@@ -462,4 +485,12 @@ def require_side(fit: RelationFit, table: ScoreTable, side: str) -> None:
             f"side {side!r} of relation {fit.name} was fitted on {want['manifest']} "
             f"(block {want['block']}, sha256 {want['manifest_sha256'][:12]}…). Re-project the table "
             "through that block, or refit the relation on this one."
+        )
+    view = side_view(fit.manifest, side)
+    if table.view != view:
+        raise SpaceError(
+            f"{table.path.name} holds block {table.block} scores in the {table.view} view, but side {side!r} "
+            f"of relation {fit.name} was fitted on the {view} view; the map would return wrong coordinates. "
+            f"Re-project the table with `psytwill space project --view {view}`, or refit the relation on "
+            f"{table.view} scores."
         )
