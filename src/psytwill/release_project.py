@@ -59,9 +59,10 @@ import pandas as pd
 
 from psytwill import __version__
 from psytwill.exceptions import InputError, SpaceError
-from psytwill.relate import sha256_file
+from psytwill.relate import sha256_file, side_view
 from psytwill.release import Release
 from psytwill.sidecar import _TABLE_SUFFIXES
+from psytwill.space import block_view
 
 FAMILY_SCHEMA_VERSION = "1.1"  # Contract B §4.1
 BLOCK_MODALITY = {"V": "visual", "A": "audio", "L": "text"}
@@ -336,8 +337,11 @@ def project_grain(release: Release, grain: Grain, spaces: dict, id_map: dict[str
             if rel.manifest["sides"][side]["manifest_sha256"] != meta["manifest_sha256"]:
                 raise SpaceError(f"relation {rname} side {side} was not fitted on the release's block "
                                  f"{grain.block}; the release is inconsistent")
+            # `full` is the covariance view; a side fitted on another view gets that view
+            # of the same scores, or the map would return wrong coordinates
+            S = block_view(full[ok], fit.map.block_eigenvalues, side_view(rel.manifest, side))
             P = np.full((len(full), rel.k), np.nan)
-            P[ok] = rel.project(full[ok], side)
+            P[ok] = rel.project(S, side)
             res.columns[model_name(rname, pre)] = P
             res.leak[model_name(rname, pre)] = {"side": side, **relation_leak_guard(rel.manifest, src_ids)}
     return res

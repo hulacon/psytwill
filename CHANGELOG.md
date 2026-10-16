@@ -3,6 +3,39 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.48.0 — 2026-10-16
+
+Minor bump: relation manifests gain a field (schema 1.2 → 1.3), and a mix
+that was silent is now refused or corrected.
+
+### Changed outputs
+
+- **Relation sides record their score view.** `space relate fit` writes
+  `sides.<a|b>.view` (`covariance` or `whitened`, from the score table's
+  sidecar), and `relate_schema_version` is 1.3. `space relate project` writes
+  the input's `view` into its sidecar.
+- **`space release project` feeds each relation side the view it was fitted
+  on.** The release places blocks in the covariance view; a relation side
+  fitted on whitened scores was handed those covariance scores and returned
+  wrong coordinates without an error. It now gets the block's whitened scores,
+  matching `space relate project` on a `--view whitened` table. A relation
+  fitted on covariance scores is unaffected.
+
+### Now refused (previously silent)
+
+- **A score table in the other view.** `space relate project` and
+  `space relate check` refuse a table whose view differs from the side's,
+  and the message names the `--view` to re-project with.
+- **A sidecar naming an unknown view** is refused at read.
+
+### Back-compat
+
+- A score-table sidecar without `view` was written before `space project
+  --view` existed (0.44.0) and is read as `covariance`, the only view there
+  was. A relation manifest without `sides.*.view` (schema ≤ 1.2) is read the
+  same way. Such relations keep working on covariance tables and now refuse
+  whitened ones.
+
 ## 0.47.0 — 2026-10-15
 
 Minor bump: several fixes below change values that existing commands write.

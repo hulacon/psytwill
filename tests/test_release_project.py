@@ -256,3 +256,37 @@ def test_baseline_release_writes_its_own_model_prefix(space, tmp_path, capsys):
     capsys.readouterr()
     assert main(["space", "release", "write", "--name", "x", "--version", "0.1.0", "--model-prefix", "B-0",
                  "--blocks", str(sp / "V_t.json"), "-o", str(rels)]) == 1
+
+
+def test_a_whitened_relation_is_fed_whitened_block_scores(space, tmp_path):
+    """The release projects blocks in the covariance view; a relation side fitted
+    on the whitened view gets the block's whitened scores, as `relate project`
+    on a `--view whitened` table would."""
+    s, sp = space, space["sp"]
+    ex = s["tmp"] / "held.txt"
+    for blk, f, key in (("V", s["vp"], "stimulus_id"), ("L", s["lp"], "stimulus_id,chunk_idx")):
+        for tag, extra in (("fitrows", ["--exclude-ids", str(ex)]), ("all", [])):
+            assert main(["space", "project", "--features", str(f), "--key", key, *extra, "--view", "whitened",
+                         "--space", str(sp / f"{blk}_t.json"), "-o", str(tmp_path / f"{blk}_{tag}_w.parquet")]) == 0
+    assert main(["space", "relate", "fit", "--a", str(tmp_path / "V_fitrows_w.parquet"),
+                 "--b", str(tmp_path / "L_fitrows_w.parquet"), "--name", "VL", "--pool-b", "mean", "--n-perm", "0",
+                 "-o", str(tmp_path / "rel"), "--stem", "VL_w"]) == 0
+    rel = tmp_path / "rel" / "VL_w.json"
+    assert main(["space", "relate", "project", "--relation", str(rel), "--side", "a",
+                 "--scores", str(tmp_path / "V_all_w.parquet"), "-o", str(tmp_path / "VL_V_all_w.parquet")]) == 0
+    rels = tmp_path / "releases"
+    assert main(["space", "release", "write", "--name", "sw", "--version", "0.1.0",
+                 "--blocks", str(sp / "V_t.json"), str(sp / "L_t.json"), "--relations", str(rel),
+                 "--data-root", str(s["tmp"]), "-o", str(rels)]) == 0
+    out = tmp_path / "store" / "toy" / "psytwill_space"
+    argv = _argv(s, out)
+    argv[argv.index("--release") + 1] = str(rels / "sw_0.1.0.json")
+    assert main(argv) == 0
+    img = pd.read_csv(out.parent / "psytwill_space.csv")
+    ref = pd.read_parquet(tmp_path / "VL_V_all_w.parquet")
+    ref["stimulus_id"] = ref["stimulus_id"].astype(str)
+    to_src = {f"img{i + 1:04d}": f"ext-t-{i:04d}" for i in range(N_HELD)}
+    got = img.assign(stimulus_id=img["stimulus_id"].map(to_src))[["stimulus_id"]].merge(ref, on="stimulus_id")
+    cols = sorted(c for c in ref.columns if c.startswith("VL_"))
+    ours = img[[c for c in img.columns if c.startswith("pspace_vl_")]].to_numpy()
+    np.testing.assert_allclose(ours, got[cols].to_numpy(), rtol=1e-5, atol=1e-5)

@@ -3,7 +3,8 @@
 What these pin: the shared prefix is recovered and nothing is invented (k = 0
 is refused, not saved); the frozen map reproduces itself on its own rows;
 pooling is declared, never inferred; and a score table projected through a
-different block cannot be read through the relation. Plus a regression on
+different block, or read in a different view (whitened vs covariance), cannot
+be read through the relation. Plus a regression on
 `cv_cca`, whose fold loop now runs through the shared `fit_cca`.
 """
 
@@ -36,17 +37,24 @@ def _latents(seed=0, n=N_ITEMS, k=K_SHARED, d_a=D_A, d_b=D_B, noise=0.15):
     return A, B, rng
 
 
-def _write_block(tmp_path, block, X, key_cols: dict, tag="v1"):
-    """A score table + sidecar + the (stand-in) block manifest it names."""
+def _write_block(tmp_path, block, X, key_cols: dict, tag="v1", view=None):
+    """A score table + sidecar + the (stand-in) block manifest it names.
+
+    ``view`` is written to the sidecar as `space project` writes it; None
+    writes a sidecar without the field, as before `--view` existed.
+    """
     manifest = tmp_path / f"{block}_{tag}.json"
     manifest.write_text(json.dumps({"block": block, "tag": tag}))
     df = pd.DataFrame(X, columns=[f"{block}_{j:03d}" for j in range(X.shape[1])])
     for j, (name, vals) in enumerate(key_cols.items()):
         df.insert(j, name, vals)
-    path = tmp_path / f"{block}_{tag}_scores.parquet"
+    stem = f"{block}_{tag}_scores" + (f"_{view}" if view else "")
+    path = tmp_path / f"{stem}.parquet"
     df.to_parquet(path, index=False)
-    (tmp_path / f"{block}_{tag}_scores.meta.json").write_text(json.dumps(
-        {"space": str(manifest), "block": block, "k": X.shape[1], "key": ",".join(key_cols), "rows": len(df)}))
+    meta = {"space": str(manifest), "block": block, "k": X.shape[1], "key": ",".join(key_cols), "rows": len(df)}
+    if view:
+        meta["view"] = view
+    (tmp_path / f"{stem}.meta.json").write_text(json.dumps(meta))
     return path
 
 
@@ -308,7 +316,7 @@ def test_cli_registers_from_label(tmp_path):
     assert main(["space", "relate", "fit", "--a", str(a), "--b", str(b), "--name", "PQ", "--n-perm", "20",
                  "--registers-from-label", "-o", str(out), "--stem", "PQ_v0.2"]) == 0
     m = json.loads((out / "PQ_v0.2.json").read_text())
-    assert m["relate_schema_version"] == "1.2" and m["register_key"].startswith("corpus")
+    assert m["relate_schema_version"] == "1.3" and m["register_key"].startswith("corpus")
     assert {r: v["n"] for r, v in m["per_register"].items()} == {"librispeech": half, "musopen": N_ITEMS - half}
     w = np.load(out / "PQ_v0.2.npz")
     assert w["reg::musopen::cov"].shape == (2 * m["k"], 2 * m["k"])
@@ -330,3 +338,104 @@ def test_null_join_keys_are_refused_not_dropped(tmp_path):
                                  {"stimulus_id": ["s1", "s2", "s3"], "chunk_idx": [0.0, 0.0, np.nan]}))
     with pytest.raises(SpaceError, match="null join key"):
         pair_tables(a, b, ["stimulus_id", "chunk_idx"])
+
+
+# --- the score view each side was fitted on ----------------------------------
+
+
+def _view_tables(tmp_path):
+    """Side a in both views (the whitened one rescaled per column, as `block_view`
+    does), side b in covariance; one block manifest per side."""
+    A, B, _ = _latents()
+    ids = [f"ext-test-{i:04d}" for i in range(N_ITEMS)]
+    lam = np.linspace(4.0, 0.5, D_A)
+    a_cov = _write_block(tmp_path, "P", A * np.sqrt(lam), {"stimulus_id": ids}, view="covariance")
+    a_wht = _write_block(tmp_path, "P", A, {"stimulus_id": ids}, view="whitened")
+    a_old = _write_block(tmp_path, "P", A * np.sqrt(lam), {"stimulus_id": ids})  # pre-`--view` sidecar
+    b = _write_block(tmp_path, "Q", B, {"stimulus_id": ids}, view="covariance")
+    return a_cov, a_wht, a_old, b
+
+
+def _fit_cli(tmp_path, a, b, stem):
+    out = tmp_path / "rel"
+    assert main(["space", "relate", "fit", "--a", str(a), "--b", str(b), "--name", "PQ", "--n-perm", "0",
+                 "-o", str(out), "--stem", stem]) == 0
+    return out / f"{stem}.json"
+
+
+def _project_cli(rel, scores, out):
+    return main(["space", "relate", "project", "--relation", str(rel), "--side", "a", "--scores", str(scores),
+                 "-o", str(out)])
+
+
+def test_each_side_records_the_view_it_was_fitted_on(tmp_path):
+    a_cov, a_wht, a_old, b = _view_tables(tmp_path)
+    m = json.loads(_fit_cli(tmp_path, a_wht, b, "PQ_w").read_text())
+    assert m["sides"]["a"]["view"] == "whitened" and m["sides"]["b"]["view"] == "covariance"
+    # a sidecar from before `--view` existed is the covariance view, the only one there was
+    m = json.loads(_fit_cli(tmp_path, a_old, b, "PQ_o").read_text())
+    assert m["sides"]["a"]["view"] == "covariance"
+
+
+def test_scores_in_the_other_view_are_refused(tmp_path, capsys):
+    a_cov, a_wht, a_old, b = _view_tables(tmp_path)
+    rel = _fit_cli(tmp_path, a_wht, b, "PQ_w")
+    capsys.readouterr()
+    assert _project_cli(rel, a_cov, tmp_path / "x.parquet") == 1
+    err = capsys.readouterr().err
+    assert "whitened" in err and "--view whitened" in err
+    assert not (tmp_path / "x.parquet").exists()
+    # so is a pre-`--view` table, which is covariance
+    assert _project_cli(rel, a_old, tmp_path / "y.parquet") == 1
+    # and `relate check` refuses the same mix
+    assert main(["space", "relate", "check", "--relation", str(rel), "--a", str(a_cov), "--b", str(b),
+                 "--n-perm", "0"]) == 1
+
+
+def test_scores_in_the_fitted_view_project_and_say_so(tmp_path):
+    a_cov, a_wht, a_old, b = _view_tables(tmp_path)
+    rel = _fit_cli(tmp_path, a_wht, b, "PQ_w")
+    out = tmp_path / "P_in_PQ.parquet"
+    assert _project_cli(rel, a_wht, out) == 0
+    assert json.loads((tmp_path / "P_in_PQ.meta.json").read_text())["view"] == "whitened"
+    rel_c = _fit_cli(tmp_path, a_cov, b, "PQ_c")
+    assert _project_cli(rel_c, a_old, tmp_path / "old.parquet") == 0  # covariance either way
+
+
+def _legacy(rel):
+    """The same relation as a schema-1.2 manifest: no `view` on its sides."""
+    m = json.loads(rel.read_text())
+    m["relate_schema_version"] = "1.2"
+    for side in m["sides"].values():
+        del side["view"]
+    rel.write_text(json.dumps(m))
+    return rel
+
+
+def test_a_manifest_without_views_is_read_as_covariance(tmp_path, capsys):
+    a_cov, a_wht, a_old, b = _view_tables(tmp_path)
+    rel = _legacy(_fit_cli(tmp_path, a_cov, b, "PQ_c"))
+    assert _project_cli(rel, a_cov, tmp_path / "c.parquet") == 0
+    assert _project_cli(rel, a_old, tmp_path / "o.parquet") == 0
+    capsys.readouterr()
+    assert _project_cli(rel, a_wht, tmp_path / "w.parquet") == 1
+    assert "--view covariance" in capsys.readouterr().err
+
+
+def test_require_side_compares_views(tmp_path):
+    from psytwill.relate import require_side, side_view
+
+    a_cov, a_wht, a_old, b = _view_tables(tmp_path)
+    fit = relate_tables(read_scores(a_wht), read_scores(b), name="PQ", join=["stimulus_id"], n_perm=0)
+    assert side_view(fit.manifest, "a") == "whitened"
+    require_side(fit, read_scores(a_wht), "a")
+    with pytest.raises(SpaceError, match="view"):
+        require_side(fit, read_scores(a_cov), "a")
+
+
+def test_a_sidecar_naming_an_unknown_view_is_refused(tmp_path):
+    from psytwill.exceptions import InputError
+
+    path = _write_block(tmp_path, "P", np.zeros((2, 2)), {"stimulus_id": ["a", "b"]}, view="correlation")
+    with pytest.raises(InputError, match="view"):
+        read_scores(path)

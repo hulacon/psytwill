@@ -1103,7 +1103,8 @@ def _run_relate_project(args: argparse.Namespace) -> None:
 
     meta = {"relation": str(args.relation), "relation_sha256": sha256_file(args.relation), "name": fit.name,
             "side": args.side, "block": t.block, "k": fit.k, "r": fit.manifest["r_insample"],
-            "scores": str(t.path), "key": ",".join(t.key), "rows": int(len(df)), "n_dropped_nan": int((~ok).sum())}
+            "scores": str(t.path), "view": t.view, "key": ",".join(t.key), "rows": int(len(df)),
+            "n_dropped_nan": int((~ok).sum())}
     (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
     print(f"psytwill space relate project [{fit.name} side {args.side} ({t.block}), k={fit.k}] -> {out}  ({len(df)} rows)")
 
