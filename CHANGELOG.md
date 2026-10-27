@@ -3,6 +3,15 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## Unreleased
+
+- **`scripts/setup_env.sh --prefix` no longer rewrites the shared records.**
+  A build at a non-shared prefix used to overwrite psytwill's committed lock
+  manifests (`conda/`) and every family repo's `.conda-prefix`, repointing
+  them at the personal build. It now leaves both alone unless `--record` is
+  given. A build at the shared prefix writes them as before. Script only; the
+  package is unchanged.
+
 ## 0.48.0 — 2026-10-16
 
 Minor bump: relation manifests gain a field (schema 1.2 → 1.3), and a mix
