@@ -25,6 +25,15 @@
 #
 #   ./scripts/setup_env.sh                # build at the shared prefix
 #   ./scripts/setup_env.sh --prefix PATH  # elsewhere (personal build)
+#   ./scripts/setup_env.sh --prefix PATH --record
+#                                         # elsewhere, AND rewrite the shared
+#                                         # records (see below)
+#
+# The shared records are psytwill's committed lock manifests (conda/) and the
+# `.conda-prefix` marker in every family repo under $CODE. A build at the
+# shared prefix writes them. A --prefix build leaves them alone unless
+# --record is given: a personal build would otherwise overwrite the family's
+# version standard and repoint every repo at itself.
 #
 # Cold pip cache downloads ~10 GB of wheels; run somewhere with network
 # (a login node is fine — the work is network-bound, not CPU-bound).
@@ -38,6 +47,7 @@ CODE=/gpfs/projects/hulacon/shared/mmmdata/code
 ENVS=/projects/hulacon/shared/envs
 SHARED_PREFIX=$ENVS/stimfeat
 PREFIX=$SHARED_PREFIX
+RECORD=0
 CACHE=$ENVS/cache
 CONDA_MODULE=miniconda3/20260319
 REPOS=(viz2psy aud2psy word2psy psytwill)
@@ -60,10 +70,13 @@ COMPANIONS=(eyelinkio pybids nibabel pydicom)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix)  PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
-    -h|--help) sed -n '2,35p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --record)  RECORD=1; shift ;;
+    -h|--help) sed -n '2,41p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+# The shared prefix always records; any other prefix only when asked.
+[[ "$PREFIX" == "$SHARED_PREFIX" ]] && RECORD=1
 
 # conda: a bare `conda` on $PATH here is FSL's — load the module explicitly.
 source /etc/profile.d/z00_lmod.sh 2>/dev/null || source /etc/profile.d/modules.sh 2>/dev/null || true
@@ -88,6 +101,11 @@ export NLTK_DATA="$CACHE/nltk_data"
 export YOLO_CONFIG_DIR="$CACHE/ultralytics"
 
 echo "prefix : $PREFIX"
+if [[ "$RECORD" == 1 ]]; then
+  echo "records: lock manifests in $OWNER/conda + .conda-prefix in ${REPOS[*]}"
+else
+  echo "records: left alone (non-shared prefix; pass --record to write them)"
+fi
 echo "conda  : python=3.12 pip ffmpeg (conda-forge, --override-channels)"
 echo "pip    : ${REPOS[*]} (editable, [dev]) + deepgaze-pytorch @ pinned git"
 echo "torch  : $TORCH_INDEX"
@@ -161,7 +179,9 @@ print(f'smoke: gensim {gensim.__version__} loads against numpy {numpy.__version_
 PYCHECK
 
 # Lock manifests: conda side (explicit URLs) + pip side (everything else).
-# Together with pyproject.toml files these reproduce the env.
+# Together with pyproject.toml files these reproduce the env. Shared records:
+# only the shared prefix, or --record, writes them.
+if [[ "$RECORD" == 1 ]]; then
 mkdir -p "$OWNER/conda"
 CONDA_LOCK="$OWNER/conda/lock-linux-64.txt"
 PIP_LOCK="$OWNER/conda/pip-lock-linux-64.txt"
@@ -184,6 +204,10 @@ echo "==> writing $PIP_LOCK"
   "$PY" -m pip list --format=freeze
 } > "$PIP_LOCK"
 echo "    $(grep -cv '^#' "$PIP_LOCK") pip packages pinned"
+else
+  echo
+  echo "==> lock manifests NOT written (non-shared prefix; --record writes them)"
+fi
 
 # activate.d hooks: user-site guard + shared caches for every
 # `conda activate` user, not just this script.
@@ -220,13 +244,18 @@ done
 HOOK
 
 # Record the prefix in each family repo (gitignored, like duckbrain's).
-for r in "${REPOS[@]}"; do
-  echo "$PREFIX" > "$CODE/$r/.conda-prefix"
-  grep -qx '.conda-prefix' "$CODE/$r/.gitignore" 2>/dev/null \
-    || echo '.conda-prefix' >> "$CODE/$r/.gitignore"
-done
-echo
-echo "recorded prefix in ${REPOS[*]/#/.conda-prefix @ }"
+if [[ "$RECORD" == 1 ]]; then
+  for r in "${REPOS[@]}"; do
+    echo "$PREFIX" > "$CODE/$r/.conda-prefix"
+    grep -qx '.conda-prefix' "$CODE/$r/.gitignore" 2>/dev/null \
+      || echo '.conda-prefix' >> "$CODE/$r/.gitignore"
+  done
+  echo
+  echo "recorded prefix in ${REPOS[*]/#/.conda-prefix @ }"
+else
+  echo
+  echo "==> .conda-prefix markers NOT written (non-shared prefix; --record writes them)"
+fi
 
 # Group permissions: umask 0002 + inherited setgid cover the common case;
 # sweep for anything pip installed with restrictive modes anyway.
