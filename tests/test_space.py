@@ -675,6 +675,27 @@ class TestMasking:
         S_proj, labels = fit.project(sp)
         assert np.isfinite(S_proj).all() and len(labels) == S_proj.shape[0]
 
+    def test_a_smaller_projection_k_places_rows_the_fit_k_cannot(self, members):
+        sp, _ = members
+        sp = {"b": sp["b"], "c": sp["c"]}
+        Xb = sp["b"].X.copy()
+        only_c = np.arange(0, N, 4)
+        Xb[only_c] = np.nan  # c alone on these rows
+        sp["b"] = SpaceMatrix(name="b", labels=sp["b"].labels, X=Xb, features=sp["b"].features)
+        nulls = {"b": {f: _undefined() for f in sp["b"].features}, "c": {}}
+        rank_c = fit_block_map(sp, ["b", "c"], np.arange(N)).whiteners["c"].rank
+        fit = fit_block(sp, ["b", "c"], block="T", nulls=nulls, fixed_k=rank_c + 1, score=False, **_fit_kwargs())
+        S_fit, lab_fit = fit.project(sp)
+        assert len(lab_fit) == N - len(only_c)  # c alone cannot place rank_c + 1 directions
+        S, labels = fit.project(sp, k=rank_c)
+        assert S.shape == (N, rank_c) and np.isfinite(S).all() and labels == sp["c"].labels
+        # where b is present, the first rank_c columns of the fit-k projection, unchanged
+        both = [labels.index(lab) for lab in lab_fit]
+        np.testing.assert_allclose(S[both], S_fit[:, :rank_c], atol=1e-10)
+        for bad in (0, fit.k + 1):
+            with pytest.raises(SpaceError, match="can only drop components"):
+                fit.project(sp, k=bad)
+
     def test_nothing_is_filled_anywhere(self, gated_member, tmp_path):
         sp, nulls, off = gated_member
         fit = fit_block(sp, list(sp), block="T", nulls=nulls, **_fit_kwargs())

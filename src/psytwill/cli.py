@@ -925,10 +925,10 @@ def _verdict(passed: bool | None) -> str:
     return "UNSCOREABLE" if passed is None else "pass" if passed else "FAIL"
 
 
-def _project_frame(fit, spaces: dict, key: str, view: str):
+def _project_frame(fit, spaces: dict, key: str, view: str, k: int | None = None):
     import pandas as pd
 
-    S, labels = fit.project(spaces, view=view)
+    S, labels = fit.project(spaces, view=view, k=k)
     df = pd.DataFrame(S, columns=[f"{fit.block}_{j:03d}" for j in range(S.shape[1])])
     parts = [lab.split("|") for lab in labels]
     for j, kname in enumerate(key.split(",")):
@@ -943,6 +943,9 @@ def _run_space_project(args: argparse.Namespace) -> None:
     from psytwill.store import distinct_values
 
     fit = load_fit(args.space)
+    k = fit.k if args.k is None else args.k
+    if not 1 <= k <= fit.k:
+        raise SpaceError(f"--k {k} is outside {args.space}'s 1..{fit.k}; a projection can only drop components")
     chunked = {}
     if args.chunk_size:
         # Every step after the load is row-wise (frozen whiteners, inner row
@@ -958,25 +961,27 @@ def _run_space_project(args: argparse.Namespace) -> None:
             spaces, _, _, _ = _space_load(ns, members=fit.members, partial_features=feats, verbose=False)
             if min(sp.n for sp in spaces.values()) == 0:
                 continue  # a member with no rows here: the inner alignment places none of them
-            frames.append(_project_frame(fit, spaces, args.key, args.view))
+            frames.append(_project_frame(fit, spaces, args.key, args.view, k))
             del spaces
             print(f"  chunk {i + 1}/{len(chunks)}: {len(frames[-1])} rows", flush=True)
-        cols = args.key.split(",") + [f"{fit.block}_{j:03d}" for j in range(fit.k)]
+        cols = args.key.split(",") + [f"{fit.block}_{j:03d}" for j in range(k)]
         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=cols)
         chunked = {"chunk_size": args.chunk_size, "chunks": len(chunks)}
     else:
         spaces, _, _, _ = _space_load(args, members=fit.members)
-        df = _project_frame(fit, spaces, args.key, args.view)
+        df = _project_frame(fit, spaces, args.key, args.view, k)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix == ".parquet":
         df.to_parquet(out, index=False)
     else:
         df.to_csv(out, index=False)
-    meta = {"space": str(args.space), "block": fit.block, "k": fit.k, "inputs": [str(p) for p in args.features],
+    # `k` is the columns written (relate.read_scores checks it); `fit_k` names the fit's own when it differs
+    meta = {"space": str(args.space), "block": fit.block, "k": k, **({"fit_k": fit.k} if k != fit.k else {}),
+            "inputs": [str(p) for p in args.features],
             "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view, **chunked}
     (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
-    print(f"psytwill space project [{fit.block}, k={fit.k}] -> {out}  ({len(df)} rows)")
+    print(f"psytwill space project [{fit.block}, k={k}{f' of {fit.k}' if k != fit.k else ''}] -> {out}  ({len(df)} rows)")
 
 
 def _run_space_check(args: argparse.Namespace) -> None:
@@ -1681,6 +1686,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="project this many stimulus_ids at a time and concatenate (same rows and "
                          "scores, bounded memory; a whole-table load of ~500 M long-form rows "
                          "passes 96 G)")
+    pr.add_argument("--k", type=int,
+                    help="project through the first K block components (1..the fit's k; default the fit's k). "
+                         "A row with a masked member is placed when its present members span K directions, "
+                         "so a smaller K places rows the fit's k cannot")
     pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
     pr.set_defaults(func=_run_space_project)
 

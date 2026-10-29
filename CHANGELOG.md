@@ -5,6 +5,16 @@ commit per version.
 
 ## Unreleased
 
+- **`space project --k K` projects through the first K block components.**
+  K runs from 1 to the fit's k, and the default is the fit's k, so existing
+  calls are unchanged. A row with every member present gets the first K
+  columns of the full projection. A row with a masked member is placed when
+  its present members span K directions, so a smaller K places rows the
+  fit's k leaves out. For example, a fixed-k audio block truncated close to
+  its concatenation rank otherwise places only the rows where every gated
+  member is present. The sidecar's `k` is the number of columns written,
+  which is what `relate` checks. `fit_k` records the fit's own k when the
+  two differ. `BlockFit.project` takes the same `k`.
 - **`scripts/setup_env.sh --prefix` no longer rewrites the shared records.**
   A build at a non-shared prefix used to overwrite psytwill's committed lock
   manifests (`conda/`) and every family repo's `.conda-prefix`, repointing

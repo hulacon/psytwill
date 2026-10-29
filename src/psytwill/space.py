@@ -1010,12 +1010,18 @@ class BlockFit:
     curve: list[dict]  # one row per (k, member, fold)
     manifest: dict = field(default_factory=dict)
 
-    def project(self, spaces: dict[str, SpaceMatrix],
-                view: str = "covariance") -> tuple[np.ndarray, list[str]]:
+    def project(self, spaces: dict[str, SpaceMatrix], view: str = "covariance",
+                k: int | None = None) -> tuple[np.ndarray, list[str]]:
         """Block scores for every aligned row the block can place.
 
         ``view`` (see :func:`block_view`): "covariance" keeps each component's
         variance (the stored scores); "whitened" divides it out.
+
+        ``k`` (default: the fit's k) projects through the first ``k`` block
+        components. A row with every member present gets the first ``k``
+        columns of the full projection. A row with a masked member is placed
+        whenever its present members span ``k`` directions, so a smaller ``k``
+        places rows the fit's own k leaves out.
 
         A row holding NaN in a member's `undefinable` column has no position
         in the space (it was dropped from the fit), and a row whose present
@@ -1026,7 +1032,10 @@ class BlockFit:
         picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
         aligned, labels = align_spaces(picked)
         aligned, labels, _ = _drop_undefinable(self, aligned, labels)
-        S = block_view(self.map.scores(aligned, k=self.k), self.map.block_eigenvalues, view)
+        k = self.k if k is None else int(k)
+        if not 1 <= k <= self.k:
+            raise SpaceError(f"k {k} is outside this block's 1..{self.k}; a projection can only drop components")
+        S = block_view(self.map.scores(aligned, k=k), self.map.block_eigenvalues, view)
         placed = np.isfinite(S).all(axis=1)
         if placed.all():
             return S, labels
