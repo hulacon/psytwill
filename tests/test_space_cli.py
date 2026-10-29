@@ -436,6 +436,31 @@ def test_chunked_project_equals_whole_on_split_members(faces_table, tmp_path):
                                   check_exact=False, rtol=0, atol=1e-10)
 
 
+def test_project_k_writes_the_leading_components_and_records_both_ks(two_corpora, tmp_path, capsys):
+    from psytwill.relate import read_scores
+
+    out = tmp_path / "space"
+    assert main(["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "-o", str(out), "--stem", "T_k", *FIT_ARGS]) == 0
+    k_fit = json.loads((out / "T_k.json").read_text())["k"]
+    assert k_fit > 1
+    common = ["space", "project", "--space", str(out / "T_k.json"), "--features", *map(str, two_corpora),
+              "--key", "stimulus_id,time", "--window", "0.5"]
+    assert main([*common, "-o", str(tmp_path / "full.parquet")]) == 0
+    assert main([*common, "--k", "1", "-o", str(tmp_path / "k1.parquet")]) == 0
+    full, k1 = pd.read_parquet(tmp_path / "full.parquet"), pd.read_parquet(tmp_path / "k1.parquet")
+    assert list(k1.columns) == ["stimulus_id", "time", "T_000"]
+    pd.testing.assert_frame_equal(k1, full[["stimulus_id", "time", "T_000"]], check_exact=False, rtol=0, atol=1e-10)
+    meta = json.loads((tmp_path / "k1.meta.json").read_text())
+    assert meta["k"] == 1 and meta["fit_k"] == k_fit
+    assert "fit_k" not in json.loads((tmp_path / "full.meta.json").read_text())
+    assert read_scores(tmp_path / "k1.parquet").columns == ["T_000"]  # the sidecar k is the columns written
+    capsys.readouterr()
+    assert main([*common, "--k", str(k_fit + 1), "-o", str(tmp_path / "bad.parquet")]) == 1
+    assert "can only drop components" in capsys.readouterr().err
+    assert not (tmp_path / "bad.parquet").exists()
+
+
 # --- leave-one-member-out (outside targets) ---------------------------------
 
 
