@@ -138,16 +138,21 @@ def _parse_modality_map(arg: str | None) -> dict[str, str] | None:
 
 
 def _run_features(args: argparse.Namespace) -> None:
-    from psytwill.features import build_features, refresh_group_nulls
+    from psytwill.features import build_features, refresh_group_labels, refresh_group_nulls
 
-    if args.refresh_nulls:
+    if args.refresh_nulls or args.refresh_labels:
         for table in args.inputs:
-            got = refresh_group_nulls(table)
-            n_decl = sum(v is not None for v in got.values())
-            print(f"psytwill features --refresh-nulls {table}: {n_decl}/{len(got)} models declare nulls")
+            if args.refresh_nulls:
+                got = refresh_group_nulls(table)
+                n_decl = sum(v is not None for v in got.values())
+                print(f"psytwill features --refresh-nulls {table}: {n_decl}/{len(got)} models declare nulls")
+            if args.refresh_labels:
+                got = refresh_group_labels(table)
+                n_decl = sum(v is not None for v in got.values())
+                print(f"psytwill features --refresh-labels {table}: {n_decl}/{len(got)} models declare labels")
         return
     if not args.output:
-        raise SystemExit("psytwill features: -o/--output is required (unless --refresh-nulls)")
+        raise SystemExit("psytwill features: -o/--output is required (unless --refresh-nulls/--refresh-labels)")
     summary = build_features(
         args.inputs,
         output=args.output,
@@ -585,7 +590,8 @@ def _exclude_rows(path: str | None, key: tuple[str, ...]) -> set[tuple]:
 
 
 def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
-                partial_features: dict[str, list[str]] | None = None, verbose: bool = True):
+                partial_features: dict[str, list[str]] | None = None, verbose: bool = True,
+                want_labels: bool = False):
     """Load member spaces one model at a time (a 300 M-row group table does
     not fit in pandas whole), dropping --exclude-ids rows. Returns
     (spaces, members, n_excluded, report).
@@ -607,13 +613,17 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
     """
     import numpy as np
 
-    from psytwill.features import group_nulls
+    from psytwill.features import group_checkpoints, group_labels, group_nulls
+    from psytwill.labels import LabelSource, stack_labels
     from psytwill.store import LoadReport, SpaceMatrix, distinct_values, load_spaces
 
     key = tuple(args.key.split(","))
     rep = LoadReport()
     where: dict[str, list[str]] = {}
     table_nulls = {str(path): group_nulls(path) for path in args.features}
+    # labels and checkpoints matter only to a fit (projection uses the fit's columns)
+    table_labels = {str(path): group_labels(path) for path in args.features} if want_labels else {}
+    table_ckpts = {str(path): group_checkpoints(path) for path in args.features} if want_labels else {}
     for path in args.features:
         for m in sorted(distinct_values(path, "model")):
             where.setdefault(m, []).append(str(path))
@@ -699,6 +709,19 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
         if cols is not None and nulls is not None:
             nulls = {c: v for c, v in nulls.items() if c in cols}
         rep.nulls[m] = nulls
+        # Contract B 1.2 labels, stacked across tables by the rule the
+        # features aggregation uses (structural disagreement refused)
+        held = None
+        for p in (where[model] if want_labels else []):
+            got, origin = table_labels[p]
+            held = stack_labels(model, held, LabelSource(got.get(model), p,
+                                                         (origin.get(model) or {}).get("created_at"),
+                                                         frozenset(sm.features)),
+                                what="fit", fix="`psytwill features --refresh-labels` every table")
+        rep.labels[m] = held.labels if held is not None else None
+        rep.label_sources[m] = list(where[model])
+        rep.checkpoints[m] = next((table_ckpts[p][model] for p in where[model]
+                                   if model in table_ckpts.get(p, {})), None)
         src = f" from {len(parts)} tables" if len(parts) > 1 else ""
         of = f" (split from {model})" if cols is not None else ""
         if verbose:
@@ -770,9 +793,15 @@ def _apply_like(args: argparse.Namespace) -> dict:
         raise SpaceError("--k-schedule needs the criterion to choose k; drop --no-criterion")
     if args.fixed_k is None and not args.k_schedule:
         args.fixed_k = int(m["k"])
+    # the label selection is part of what the source fit was (an arm is rebuilt
+    # from its manifest); a --select given here replaces it
+    source_sel = (m.get("selection") or {}).get("expression")
+    selection_from = "caller" if args.select else "manifest" if source_sel else None
+    if not args.select and source_sel:
+        args.select = [source_sel]
     return {"manifest": str(path.resolve()), "manifest_sha256": hashlib.sha256(raw).hexdigest(),
             "block": m["block"], "k": m["k"], "member_scaling": m.get("member_scaling", "pr"),
-            "left_out": out, "added_per_corpus": added_per_corpus}
+            "left_out": out, "added_per_corpus": added_per_corpus, "selection_from": selection_from}
 
 
 def _split(arg: str | None) -> list[str]:
@@ -794,10 +823,11 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         raise SpaceError("--targets needs the block's --members listed (or --like), so a target "
                          "can never be read as a member")
     if targets:
-        spaces, loaded, n_excl, rep = _space_load(args, members=_split(args.members) + targets)
+        spaces, loaded, n_excl, rep = _space_load(args, members=_split(args.members) + targets,
+                                                  want_labels=True)
         members = [m for m in loaded if m not in targets]
     else:
-        spaces, members, n_excl, rep = _space_load(args)
+        spaces, members, n_excl, rep = _space_load(args, want_labels=True)
     from psytwill.features import group_window_sec
     from psytwill.space import resolve_member_windows
 
@@ -855,7 +885,24 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     on_row=on_row,
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
                     member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
-                    targets=targets)
+                    targets=targets, column_labels=rep.labels, checkpoints=rep.checkpoints,
+                    select=args.select, label_sources=rep.label_sources)
+    sel = fit.manifest["selection"]
+    if sel:
+        print(f"  selection {sel['expression']!r}"
+              + (f": dropped member(s) with no matching column: {', '.join(sel['dropped_members'])}"
+                 if sel["dropped_members"] else ""))
+    members = list(fit.members)
+    windows = {m: w for m, w in windows.items() if m in members}
+    for m in members:
+        pm = fit.manifest["per_member"][m]
+        if pm["bookkeeping_columns"]:
+            print(f"  {m}: bookkeeping column(s) left out: {', '.join(pm['bookkeeping_columns'])}")
+        if pm["deselected_columns"]:
+            print(f"  {m}: {len(pm['deselected_columns'])} column(s) not selected; "
+                  f"{len(pm['labels'] or {})} kept")
+        for col, others in pm["circular_with"].items():
+            print(f"  {m}: {col} is derived_from the checkpoint of {', '.join(others)} (circular_with)")
     for m in members:
         pm = fit.manifest["per_member"][m]
         if pm["masked_columns"]:
@@ -1114,6 +1161,23 @@ def _run_relate_project(args: argparse.Namespace) -> None:
     print(f"psytwill space relate project [{fit.name} side {args.side} ({t.block}), k={fit.k}] -> {out}  ({len(df)} rows)")
 
 
+def _run_space_labels(args: argparse.Namespace) -> None:
+    import json
+
+    from psytwill.labels import write_labels
+
+    if args.release:
+        from psytwill.release import load_release
+
+        rel = load_release(args.release)
+        paths = [e["manifest"] for e in rel.meta["blocks"].values()]
+    else:
+        paths = list(args.space)
+    manifests = [json.loads(Path(p).read_text()) for p in paths]
+    csv_path, json_path = write_labels(manifests, args.output)
+    print(f"psytwill space labels [{len(manifests)} block(s)] -> {csv_path}\n  {json_path}")
+
+
 def _run_release_write(args: argparse.Namespace) -> None:
     from psytwill.release import build_release, parse_absent, write_release
 
@@ -1121,6 +1185,8 @@ def _run_release_write(args: argparse.Namespace) -> None:
                         absent=[parse_absent(a) for a in (args.absent or [])], note=args.note,
                         model_prefix=args.model_prefix, data_root=args.data_root)
     path = write_release(rel, args.output)
+    if rel.get("labels"):
+        print(f"  labels {path.parent / rel['labels']['table']}\n  columns {path.parent / rel['labels']['columns']}")
     b = ", ".join(f"{n} k={e['k']}" for n, e in rel["blocks"].items())
     r = ", ".join(f"{n} ({e['a']}<->{e['b']}) k={e['k']}" for n, e in rel["relations"].items()) or "none"
     a = ", ".join("<->".join(x["pair"]) for x in rel["absent"]) or "none"
@@ -1260,6 +1326,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         help="Output table (.parquet preferred, or .csv); "
         "<stem>.meta.json is written alongside",
+    )
+    f.add_argument(
+        "--refresh-labels",
+        action="store_true",
+        help="patch the given features tables' sidecars with their inputs' (refreshed) Contract B 1.2 "
+        "`labels` (`model_labels`); JSON only, no re-aggregation. Combines with --refresh-nulls",
     )
     f.add_argument(
         "--refresh-nulls",
@@ -1672,6 +1744,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "may differ (--k-schedule walks the variant to its own k); --leave-out and "
                         "--targets add outside targets, and --per-corpus adds per-corpus scoring to a "
                         "pooled source at its fixed k")
+    f.add_argument("--select", action="append", metavar="EXPR",
+                   help="keep only member columns whose Contract B 1.2 labels match, e.g. "
+                        "'interpretability=nameable;derivation!=probe,zero-shot'. Clauses (';'-separated, "
+                        "or repeat --select) are ANDed; KEY=a,b keeps a value in the set, KEY!=a,b drops "
+                        "it; keys interpretability | derivation. Column-level: each member is whitened "
+                        "on its selected columns alone, and only their `nulls` act. A member with no "
+                        "matching column is dropped; an unlabelled member is refused. Recorded as "
+                        "`selection` in the manifest (copied by --like unless given). Bookkeeping "
+                        "columns are always left out, with or without --select")
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
     f.set_defaults(func=_run_space_fit)
@@ -1692,6 +1773,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "so a smaller K places rows the fit's k cannot")
     pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
     pr.set_defaults(func=_run_space_project)
+
+    lb = spsub.add_parser("labels", help="per-column Contract B 1.2 labels of fitted blocks or a release: "
+                                         "a stimulus-free CSV plus a BIDS-style column dictionary")
+    lbsrc = lb.add_mutually_exclusive_group(required=True)
+    lbsrc.add_argument("--space", nargs="+", help="block .json manifest(s)")
+    lbsrc.add_argument("--release", help="release .json (every block it pins; loaded tamper-evident)")
+    lb.add_argument("-o", "--output", required=True,
+                    help="labels table (.csv); the column dictionary is written beside it as <stem>.columns.json")
+    lb.set_defaults(func=_run_space_labels)
 
     ck = spsub.add_parser("check", help="the subsumption criterion on any table, no refit")
     _space_common(ck)

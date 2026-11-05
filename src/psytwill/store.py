@@ -101,6 +101,12 @@ class LoadReport:
     """Space -> its Contract B 1.1 `nulls` map from the table sidecar(s); None = 1.0."""
     excluded_rows: dict[str, int] = field(default_factory=dict)
     """Space -> rows dropped by an --exclude-rows file (absent = no file given)."""
+    labels: dict[str, dict | None] = field(default_factory=dict)
+    """Space -> its model's Contract B 1.2 `labels` block from the table sidecar(s); None = unlabelled."""
+    checkpoints: dict[str, str | None] = field(default_factory=dict)
+    """Space -> its model's checkpoint as the table sidecar(s) record it."""
+    label_sources: dict[str, list[str]] = field(default_factory=dict)
+    """Space -> the table(s) its labels were read from (named when a refresh is needed)."""
 
 
 def _read(

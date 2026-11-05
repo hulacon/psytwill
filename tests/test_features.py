@@ -472,7 +472,7 @@ def test_nulls_are_carried_into_the_table_sidecar(tmp_path):
     _declare(a, "clip", {})
     build_features([a], tmp_path / "features.csv")
     meta = json.loads((tmp_path / "features.meta.json").read_text())
-    assert meta["schema_version"] == FEATURES_SCHEMA_VERSION == "1.1"
+    assert meta["schema_version"] == FEATURES_SCHEMA_VERSION == "1.2"
     assert meta["inputs"][0]["models"]["resmem"]["nulls"] == {"resmem_memorability": UNDEF}
     got = group_nulls(tmp_path / "features.csv")
     assert got["resmem"] == {"resmem_memorability": UNDEF}

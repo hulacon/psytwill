@@ -42,7 +42,11 @@ from psytwill.relate import RelationFit, load_relation, sha256_file
 #: pinned fit names, all under `data_root`, checked by :func:`load_release`);
 #: each block entry carries `member_windows` ({member: window_sec}, or null
 #: for a block fitted before space schema 1.14).
-RELEASE_SCHEMA_VERSION = "1.2"
+#: 1.3: `labels` -- null, or {table, columns}: the file names (beside the
+#: release) of the per-column Contract B 1.2 labels table of every pinned block
+#: and its BIDS-style column dictionary, written by :func:`write_release` when
+#: any block recorded labels (space schema >= 1.16).
+RELEASE_SCHEMA_VERSION = "1.3"
 #: Block / relation manifest fields that name an exclusion file.
 EXCLUSION_FIELDS = ("exclude_ids_file", "exclude_rows_file")
 
@@ -170,11 +174,26 @@ def build_release(*, name: str, version: str, blocks: Sequence[str | Path], rela
 
 
 def write_release(release: dict, out_dir: str | Path, *, stem: str | None = None) -> Path:
+    """Write the release manifest and, beside it, the labels of its blocks.
+
+    When any pinned block recorded Contract B 1.2 labels, ``<stem>_labels.csv``
+    (one stimulus-free row per block member column) and
+    ``<stem>_labels.columns.json`` (a BIDS-style dictionary, one entry per
+    feature column) are written too, and named under ``labels``.
+    """
+    from psytwill.labels import has_labels, write_labels
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{stem or release['name'] + '_' + release['version']}.json"
+    stem = stem or release["name"] + "_" + release["version"]
+    path = out / f"{stem}.json"
     if path.exists():
         raise SpaceError(f"{path} exists; a release is immutable. Give it a new --version.")
+    manifests = [json.loads(Path(e["manifest"]).read_text()) for e in release.get("blocks", {}).values()]
+    release["labels"] = None
+    if any(has_labels(m) for m in manifests):
+        table, columns = write_labels(manifests, out / f"{stem}_labels.csv")
+        release["labels"] = {"table": table.name, "columns": columns.name}
     path.write_text(json.dumps(release, indent=2))
     return path
 

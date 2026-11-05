@@ -34,13 +34,20 @@ import pandas as pd
 from psytwill import __version__
 from psytwill.exceptions import EmptyInputError, InputError, SpaceError
 from psytwill.matrices import resolve_labels
-from psytwill.sidecar import load_sidecar, model_checkpoint, model_nulls, model_window_sec
+from psytwill.labels import LabelSource, labels_digest, read_model_labels, resolve, stack_labels
+from psytwill.sidecar import find_sidecar, load_sidecar, model_checkpoint, model_nulls, model_window_sec
 from psytwill.spaces import INDEX_COLUMNS, detect_embedding_spaces
 
 # 1.1 (psytwill 0.20.0): each input's model entries carry the producer's
 # Contract B 1.1 `nulls` map, and the sidecar consolidates them as
 # `model_nulls` (additive; 1.0 readers ignore both).
-FEATURES_SCHEMA_VERSION = "1.1"
+# 1.2 (psytwill 0.49.0): Contract B 1.2 `labels`. Each input's model entries
+# carry `labels_sha256` (a digest of the producer's block, or null when the
+# input is unlabelled; the block itself is stored once, not per input), and
+# the sidecar consolidates `model_labels` ({model: raw block | null}) plus
+# `model_labels_from` ({model: {path, created_at}} of the sidecar whose
+# block was kept). Additive; older readers ignore all three.
+FEATURES_SCHEMA_VERSION = "1.2"
 
 # Reserved columns that survive as keys in the long table; the remaining
 # INDEX_COLUMNS are row-identity implementation details and are dropped
@@ -161,6 +168,7 @@ def _melt_input(
 
     extractor = meta.get("extractor") if meta else None
     modality = modality_map.get(extractor) if extractor else None
+    label_sources = _label_sources(path, meta, models)
 
     keys = pd.DataFrame({"stimulus_id": ids})
     for col in CARRIED_KEYS:
@@ -207,16 +215,52 @@ def _melt_input(
         "schema_version": meta.get("schema_version") if meta else None,
         "modality": modality,
         "n_feature_columns": len(feature_cols),
+        "sidecar_created_at": meta.get("created_at") if meta else None,
         "models": {
             name: {"checkpoint": model_checkpoint(meta, name), "nulls": model_nulls(meta, name),
+                   "labels_sha256": labels_digest(label_sources[name].labels),
                    # only when declared: an absent key is what every older table holds
                    **({"window_sec": w} if (w := model_window_sec(meta, name)) is not None else {})}
             for name in sorted(set(models.values()))
         },
+        # popped by the caller before the sidecar is written: the raw labels
+        # and the columns they were resolved against, for the stacking check
+        "_labels": label_sources,
     }
     if unattributed:
         entry["unattributed_columns"] = unattributed
     return long, entry
+
+
+def _label_sources(path: str | Path, meta: dict[str, Any] | None,
+                   models: dict[str, str]) -> dict[str, LabelSource]:
+    """Per model of one input: its validated Contract B 1.2 labels (None when
+    unlabelled), resolved against the input's own columns of that model so a
+    column the block leaves incomplete is refused here, at the producer."""
+    side = str(find_sidecar(path) or path)
+    by_model: dict[str, list[str]] = {}
+    for col, model in models.items():
+        by_model.setdefault(model, []).append(col)
+    out = {}
+    for name, cols in by_model.items():
+        labels = read_model_labels(meta, name, where=side)
+        resolve(labels, cols, model=name, where=side)
+        out[name] = LabelSource(labels, side, meta.get("created_at") if meta else None, frozenset(cols))
+    return out
+
+
+def _stack_labels(held: dict[str, LabelSource], entry: dict[str, Any]) -> None:
+    """Fold one input's labels into ``held`` (model -> kept source), refusing a
+    structural disagreement (see :func:`psytwill.labels.stack_labels`)."""
+    for name, src in entry.get("_labels", {}).items():
+        held[name] = stack_labels(name, held.get(name), src)
+
+
+def _consolidated_labels(held: dict[str, LabelSource]) -> tuple[dict, dict]:
+    labels = {m: held[m].labels for m in sorted(held)}
+    origin = {m: {"path": held[m].path, "created_at": held[m].created_at} for m in sorted(held)
+              if held[m].labels is not None}
+    return labels, origin
 
 
 def _assert_checkpoints(entries: list[dict[str, Any]]) -> None:
@@ -300,6 +344,103 @@ def group_window_sec(table: str | Path) -> dict[str, set[float]]:
     return out
 
 
+def group_labels(table: str | Path) -> tuple[dict[str, dict | None], dict[str, dict]]:
+    """``({model: raw labels block | None}, {model: {path, created_at}})`` from a
+    features table's sidecar.
+
+    A table built before features schema 1.2 (or with no sidecar) is
+    unlabelled: every model reads as ``None``. Never warns, so readers that
+    only need labels for a selection can call it freely.
+    """
+    meta_path = Path(table).with_suffix(".meta.json")
+    if not meta_path.exists():
+        return {}, {}
+    meta = json.loads(meta_path.read_text())
+    if "model_labels" in meta:
+        return dict(meta["model_labels"]), dict(meta.get("model_labels_from") or {})
+    return {m: None for m in meta.get("models", [])}, {}
+
+
+def group_checkpoints(table: str | Path) -> dict[str, str]:
+    """``{model: checkpoint}`` recorded by a features table's inputs (models
+    without one are absent)."""
+    meta_path = Path(table).with_suffix(".meta.json")
+    if not meta_path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for entry in json.loads(meta_path.read_text()).get("inputs", []):
+        for model, info in (entry.get("models") or {}).items():
+            if isinstance(info, dict) and info.get("checkpoint"):
+                out.setdefault(model, info["checkpoint"])
+    return out
+
+
+def _schema_max(current: str | None, floor: str) -> str:
+    """The later of a table's schema version and the version a refresh brings."""
+    def key(v):
+        try:
+            return tuple(int(x) for x in str(v).split(".")[:2])
+        except ValueError:
+            return (0, 0)
+    return floor if current is None or key(floor) > key(current) else str(current)
+
+
+def _write_meta(meta_path: Path, meta: dict) -> None:
+    tmp = meta_path.with_name(meta_path.name + ".tmp")
+    tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(tmp, meta_path)
+
+
+def refresh_group_labels(table: str | Path) -> dict[str, dict | None]:
+    """Re-read every input's (refreshed) extractor sidecar into a table's
+    ``model_labels``; JSON only, like :func:`refresh_group_nulls`.
+
+    Each input's columns are read from its header (not its rows), so the
+    stacking check runs exactly as at aggregation. Refuses, writing nothing,
+    if an input's sidecar is gone, a block is malformed, or two inputs of one
+    model disagree on a structural label.
+    """
+    meta_path = Path(table).with_suffix(".meta.json")
+    meta = json.loads(meta_path.read_text())
+    entries = meta.get("inputs", [])
+    held: dict[str, LabelSource] = {}
+    for entry in entries:
+        side = load_sidecar(entry["path"])
+        if side is None and entry.get("extractor"):
+            raise InputError(f"{table}: input {entry['path']} had a sidecar when aggregated but "
+                             "none is found now; cannot refresh its `labels`.")
+        cols = _header_columns(entry["path"])
+        models, _ = _resolve_models([c for c in cols if c not in INDEX_COLUMNS], side)
+        sources = _label_sources(entry["path"], side, models)
+        for name, info in entry["models"].items():
+            src = sources.get(name)
+            info["labels_sha256"] = labels_digest(src.labels if src else None)
+        entry["sidecar_created_at"] = side.get("created_at") if side else None
+        _stack_labels(held, {"_labels": {n: s for n, s in sources.items() if n in entry["models"]}})
+    labels, origin = _consolidated_labels(held)
+    before = (meta.get("schema_version"), meta.get("model_labels"), meta.get("model_labels_from"))
+    meta["model_labels"], meta["model_labels_from"] = labels, origin
+    meta["schema_version"] = _schema_max(meta.get("schema_version"), "1.2")
+    if before != (meta["schema_version"], labels, origin):
+        meta.setdefault("refreshed", []).append({
+            "by": f"psytwill {__version__}",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "fields": ["schema_version", "inputs.*.models.*.labels_sha256", "model_labels",
+                       "model_labels_from"],
+            "from_schema_version": before[0],
+        })
+        _write_meta(meta_path, meta)
+    return labels
+
+
+def _header_columns(path: str | Path) -> list[str]:
+    path = Path(path)
+    if not path.exists():
+        raise InputError(f"Input file not found: {path} (needed to refresh its labels)")
+    sep = "\t" if path.suffix.lower() == ".tsv" else ","
+    return [str(c) for c in pd.read_csv(path, sep=sep, nrows=0).columns]
+
+
 def refresh_group_nulls(table: str | Path) -> dict[str, Any]:
     """Re-read every input's (refreshed) extractor sidecar into a table's sidecar.
 
@@ -322,7 +463,7 @@ def refresh_group_nulls(table: str | Path) -> dict[str, Any]:
     consolidated = _assert_nulls(entries)
     before = (meta.get("schema_version"), meta.get("model_nulls"))
     meta["model_nulls"] = consolidated
-    meta["schema_version"] = FEATURES_SCHEMA_VERSION
+    meta["schema_version"] = _schema_max(meta.get("schema_version"), "1.1")
     if before != (meta["schema_version"], consolidated):
         meta.setdefault("refreshed", []).append({
             "by": f"psytwill {__version__}",
@@ -509,6 +650,7 @@ def build_features(
     partial = output.with_name(output.name + ".partial")
 
     entries: list[dict[str, Any]] = []
+    held_labels: dict[str, LabelSource] = {}
     skipped_empty: list[str] = []
     per_input_hashes: list[np.ndarray] = []
     stimulus_ids: set[str] = set()
@@ -533,6 +675,8 @@ def build_features(
                     stacklevel=2,
                 )
                 continue
+            _stack_labels(held_labels, entry)
+            entry.pop("_labels", None)
             entries.append(entry)
             # Incremental, so a checkpoint clash is refused at the input that
             # introduces it rather than after every input has been melted.
@@ -603,6 +747,7 @@ def build_features(
         "models": sorted(models_seen),
         "model_nulls": _assert_nulls(entries),
     }
+    meta["model_labels"], meta["model_labels_from"] = _consolidated_labels(held_labels)
     meta_path = output.with_suffix(".meta.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)

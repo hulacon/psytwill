@@ -98,6 +98,15 @@ that spec is authoritative. Working summary:
   — §4.1's CSV-only rule binds extractors, not this aggregate surface;
   `.csv` works without pyarrow); the table carries its own
   `FEATURES_SCHEMA_VERSION` ("1.0") in `<stem>.meta.json`.
+- **`labels.py`** (0.49.0) — Contract B 1.2 per-column `labels`: strict
+  reader (vocabularies, `derived_from` rule, pattern-aware inventory check),
+  key-wise resolution of `default` + `columns`, the stacking rule
+  (structural keys `interpretability`/`derivation`/`derived_from` must agree,
+  descriptive keys warn and the newer sidecar wins), the `--select` grammar,
+  the `circular_with` flag, and the per-column CSV + BIDS-style column
+  dictionary export. `features` carries `model_labels` (features schema 1.2);
+  `space.apply_labels` drops bookkeeping columns and applies `--select`
+  before the null policy (space schema 1.16).
 - **`cli.py`** — `psytwill matrices <csv> [<csv2>] -o out/`,
   `psytwill spaces <csv>`, and `psytwill features <csv>... -o table.parquet`;
   heavy imports deferred into the command functions
