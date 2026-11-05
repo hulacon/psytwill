@@ -351,3 +351,36 @@ def test_old_manifests_still_load_and_export_refuses_cleanly(labelled_table, tmp
     assert main(["space", "release", "write", "--name", "old", "--version", "0.1.0", "--blocks", str(path),
                  "-o", str(rel_dir)]) == 0
     assert json.loads((rel_dir / "old_0.1.0.json").read_text())["labels"] is None
+
+
+def test_inventory_matcher_covers_word2psy_chunk_inventories():
+    """word2psy declares chunk columns outside ``features``: the
+    ``chunk_aggregates`` list and ``chunk_pooling``'s count column and pooled
+    pattern. Labels keyed on those columns must validate."""
+    from psytwill.labels import inventory_matcher, validate_labels
+
+    pooled = {
+        "features": {"pattern": "emb_{NNN}", "range": [0, 2], "count": 3, "level": "word"},
+        "chunk_pooling": {"stat": "mean", "count_column": "emb_n_pooled",
+                          "features": {"pattern": "emb_{NNN}", "range": [0, 2], "count": 3,
+                                       "level": "chunk"}},
+    }
+    m = inventory_matcher(pooled)
+    assert m("emb_000") and m("emb_n_pooled") and not m("emb_count")
+    validate_labels(
+        {"default": {"interpretability": "opaque", "derivation": "embedding"},
+         "columns": {"emb_n_pooled": {"derivation": "bookkeeping"}}},
+        model="emb", where="t", is_column=m)
+
+    aggregated = {
+        "features": {"columns": ["wf_length"], "count": 1, "level": "word"},
+        "chunk_aggregates": {"stats": ["mean", "sd"], "columns": ["wf_length_mean", "wf_length_sd"]},
+    }
+    m = inventory_matcher(aggregated)
+    assert m("wf_length") and m("wf_length_mean") and m("wf_length_sd") and not m("wf_length_max")
+
+
+def test_inventory_matcher_none_without_inventory():
+    from psytwill.labels import inventory_matcher
+
+    assert inventory_matcher({"checkpoint": "x"}) is None

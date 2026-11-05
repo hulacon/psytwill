@@ -3,6 +3,17 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.49.1 — 2026-11-05
+
+### Fixed
+- `labels.inventory_matcher` now accepts every inventory a model entry
+  declares, not only the top level / `features`: word2psy's
+  `chunk_aggregates` columns and `chunk_pooling`'s pooled pattern and
+  `count_column`. 0.49.0 refused valid producer labels keyed on those
+  columns (`<model>_n_pooled`, `{feature}_{stat}`), so
+  `features --refresh-labels` failed on every table holding a pooled or
+  aggregated word2psy model.
+
 ## 0.49.0 — 2026-11-05
 
 Minor bump: Contract B schema_version 1.2 per-column `labels` on the consumer
