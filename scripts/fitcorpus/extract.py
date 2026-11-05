@@ -66,8 +66,11 @@ V_MODELS = [m.model for m in BATTERY.values() if m.extractor == "viz2psy" and m.
 A_MODELS = [m.model for m in BATTERY.values() if m.extractor == "aud2psy"]
 L_MODELS = [m.model for m in BATTERY.values() if m.extractor == "word2psy"]
 
-# aud2psy models that consume another cell's table (no second inference pass)
-_AUDIO_DEPS = {"conversation": "diarize", "speech_rate": "transcribe"}
+# aud2psy models that consume another cell's table (no second inference pass).
+# egemaps / speech_emotion read diarize's turns for their speech gate
+# (aud2psy >= 0.20.0, where diarize is the default gate).
+_AUDIO_DEPS = {"conversation": "diarize", "egemaps": "diarize",
+               "speech_emotion": "diarize", "speech_rate": "transcribe"}
 
 
 def _ordered_audio() -> list[str]:
@@ -316,7 +319,7 @@ def build_sources() -> list[Source]:
         S.append(Source(
             corpus, "audio", "aud2psy", "", _ordered_audio(),
             f"soundtracks of the same {corpus} segments, {GRID_HOP} s hop; "
-            "diarize/transcribe run before conversation/speech_rate",
+            "diarize/transcribe run before the models that read their tables",
             lambda c=corpus: _cneuromod_units(c),
         ))
         S.append(Source(
@@ -328,7 +331,7 @@ def build_sources() -> list[Source]:
     for corpus, what in {**STAGED_CURATED, **STAGED_WHISPER, **STAGED_MUSIC}.items():
         S.append(Source(
             corpus, "audio", "aud2psy", "", _ordered_audio(),
-            f"{what}; {GRID_HOP} s hop; diarize/transcribe run before conversation/speech_rate",
+            f"{what}; {GRID_HOP} s hop; diarize/transcribe run before the models that read their tables",
             lambda c=corpus: _staged_units(c),
         ))
     for corpus in STAGED_CURATED:
@@ -348,7 +351,7 @@ def build_sources() -> list[Source]:
     for corpus, what in STAGED_CLIPS.items():
         S.append(Source(
             corpus, "audio", "aud2psy", "", _ordered_audio(),
-            f"{what}; {GRID_HOP} s hop; diarize/transcribe run before conversation/speech_rate",
+            f"{what}; {GRID_HOP} s hop; diarize/transcribe run before the models that read their tables",
             lambda c=corpus: _staged_units(c),
         ))
         for ctype in CAPTION_TYPES[corpus]:
@@ -402,7 +405,7 @@ def command_for(src: Source, unit: Unit, model: str) -> list[str]:
     if src.package == "aud2psy":
         cmd = [PY, "-m", "aud2psy.cli", model, *unit.inputs,
                "-o", str(stem), "--hop", str(GRID_HOP), *unit.extra]
-        if model == "conversation":
+        if _AUDIO_DEPS.get(model) == "diarize":
             cmd += ["--speakers", str(unit.out_dir / f"{src.prefix}diarize_speakers.csv")]
         if model == "speech_rate":
             cmd += ["--words", str(unit.out_dir / f"{src.prefix}transcribe_transcript_words.csv")]
