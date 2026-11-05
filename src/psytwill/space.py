@@ -56,6 +56,7 @@ from psytwill.compare import (
     ridge_predictivity,
 )
 from psytwill.exceptions import SpaceError
+from psytwill.labels import BOOKKEEPING, admits, circular_with, parse_select, resolve, select_text
 from psytwill.store import SpaceMatrix, align_spaces
 
 DEFAULT_K_SCHEDULE: tuple[int, ...] = (8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256)
@@ -187,7 +188,14 @@ def split_members(models: Sequence[str]) -> list[str]:
 # screen; DECIDED 2026-10-12, psytwill-space 0.2.0 step 1); curve rows carry
 # `role` ("member" | "target"). A fit with no targets differs from 1.14 only
 # by the two empty keys and the `role` column.
-SPACE_SCHEMA_VERSION = "1.15"
+# 1.16: Contract B 1.2 labels. `selection` (null, or the `--select` expression,
+# its clauses and the members it left with no column); per member `labelled`,
+# `checkpoint`, `labels` ({column: resolved labels} for the columns that
+# entered the fit, null when unlabelled), `bookkeeping_columns` (never swept
+# in), `deselected_columns` and `circular_with` ({column: [members whose
+# checkpoint the column is derived_from]}); per target `labelled` and
+# `bookkeeping_columns`. Older manifests load unchanged (no labels).
+SPACE_SCHEMA_VERSION = "1.16"
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
@@ -786,6 +794,103 @@ def select_features(space: SpaceMatrix, features: Sequence[str]) -> SpaceMatrix:
 
 
 # --------------------------------------------------------------------------
+# Contract B 1.2 labels: bookkeeping exclusion and column selection
+# --------------------------------------------------------------------------
+
+# BOOKKEEPING (Contract B 1.2): a column whose derivation is `bookkeeping`
+# describes the extraction (counts pooled, detector confidence), not the
+# stimulus, and never enters a block -- as a member or as a target. The fit
+# drops it by name before anything else and records it per member; projection
+# and check select the fit's recorded columns by name, so a frozen fit is
+# never affected by labels a table gains later. The loader's name-based drop
+# of unprefixed reserved columns and `_n_pooled` stays where it was: it needs
+# no labels.
+#
+# SELECTION (`select`, DECIDED 2026-11-05: label selection lives inside
+# psytwill, so an arm is rebuilt from its manifest alone). Column-level: a
+# member contributes only its matching columns, and the member is then that
+# subset for every later step --
+#   - its whitener is fitted on the selected columns alone, so its
+#     participation ratio, whitened rank and block weight are the subset's,
+#     not a slice of the whole member's whitening;
+#   - only the selected columns' `nulls` entries act: an unselected column's
+#     NaN neither refuses the fit nor masks the member, an unselected
+#     `undefinable` column drops no rows, and "absent unless complete" is
+#     judged over the selected columns (so a member can be present on more
+#     rows than without the selection);
+#   - the max_nan_frac and minimum-support drops run on the selected columns.
+# A member left with no column is dropped from the block and recorded. The
+# selection applies to members only; outside targets are scored whole (minus
+# bookkeeping), since they are what coverage is measured against. Without a
+# selection, and with no labelled bookkeeping column, a fit is bit-identical
+# to one made before labels existed.
+
+
+@dataclass
+class LabelPass:
+    spaces: dict
+    members: list
+    resolved: dict = field(default_factory=dict)
+    bookkeeping: dict = field(default_factory=dict)
+    deselected: dict = field(default_factory=dict)
+    dropped_members: list = field(default_factory=list)
+    clauses: list = field(default_factory=list)
+
+
+def apply_labels(spaces: dict[str, SpaceMatrix], members: Sequence[str], targets: Sequence[str] = (), *,
+                 column_labels: dict[str, dict | None] | None = None,
+                 select: str | Sequence[str] | None = None,
+                 label_sources: dict[str, Sequence[str]] | None = None) -> LabelPass:
+    """Drop bookkeeping columns and apply ``select``; see the comment above.
+
+    ``column_labels`` maps each member/target to its model's raw Contract B
+    1.2 ``labels`` block (None = unlabelled). Any selection refuses an
+    unlabelled member, naming the tables to refresh (``label_sources``).
+    """
+    column_labels = column_labels or {}
+    clauses = parse_select(select)
+    if clauses:
+        unl = [m for m in members if column_labels.get(m) is None]
+        if unl:
+            src = "; ".join(f"{m}: {', '.join(map(str, (label_sources or {}).get(m, []))) or 'its table'}"
+                            for m in unl)
+            raise SpaceError(
+                f"--select {select_text(clauses)!r} needs labels, and member(s) {unl} have none (Contract B "
+                f"1.0/1.1 input). Tables to refresh -- {src}. Fix: `<extractor> sidecar refresh` the "
+                "producer sidecars, then `psytwill features --refresh-labels` those tables.")
+    out = LabelPass(spaces=dict(spaces), members=list(members), clauses=clauses)
+    for m in list(members) + list(targets):
+        sp = spaces[m]
+        res = resolve(column_labels.get(m), sp.features, model=m, where=f"member {m!r}")
+        out.resolved[m] = res
+        if res is None:
+            continue
+        book = [f for f in sp.features if res[f]["derivation"] == BOOKKEEPING]
+        keep = [f for f in sp.features if f not in book]
+        des = []
+        if clauses and m in members:
+            des = [f for f in keep if not admits(clauses, res[f])]
+            keep = [f for f in keep if f not in des]
+        if book:
+            out.bookkeeping[m] = book
+        if des:
+            out.deselected[m] = des
+        if not keep:
+            if m in targets or not clauses:
+                raise SpaceError(f"'{m}' has no column that is not bookkeeping; it is not a feature space")
+            out.dropped_members.append(m)
+            out.resolved[m] = {}
+            continue
+        if len(keep) != len(sp.features):
+            out.spaces[m] = select_features(sp, keep)
+        out.resolved[m] = {f: res[f] for f in keep}
+    out.members = [m for m in members if m not in out.dropped_members]
+    if not out.members:
+        raise SpaceError(f"--select {select_text(clauses)!r} leaves no member any column")
+    return out
+
+
+# --------------------------------------------------------------------------
 # criterion
 # --------------------------------------------------------------------------
 
@@ -1184,6 +1289,10 @@ def fit_block(
     fixed_k: int | None = None,
     score: bool = True,
     targets: Sequence[str] = (),
+    column_labels: dict[str, dict | None] | None = None,
+    checkpoints: dict[str, str | None] | None = None,
+    select: str | Sequence[str] | None = None,
+    label_sources: dict[str, Sequence[str]] | None = None,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
@@ -1245,6 +1354,11 @@ def fit_block(
     None that neither passes nor blocks k (DECIDED 2026-09-29, Ben), as long
     as some corpus scores it; a non-deferred member no corpus can score
     blocks k. The pooled folds are scored as before.
+
+    ``column_labels`` (member -> raw Contract B 1.2 ``labels`` block, None =
+    unlabelled) drops bookkeeping columns and enables ``select`` (see
+    :func:`apply_labels`); ``checkpoints`` (member -> checkpoint) feeds the
+    ``circular_with`` flag. All three are recorded in the manifest.
     """
     if member_scaling not in MEMBER_SCALINGS:
         raise SpaceError(f"unknown member scaling {member_scaling!r}; use one of {MEMBER_SCALINGS}")
@@ -1274,6 +1388,13 @@ def fit_block(
         raise SpaceError(f"targets not in the loaded spaces: {missing}; have {sorted(spaces)}")
     if targets and not score:
         raise SpaceError("targets are scored by the criterion; drop them or score it")
+    # 0. Contract B 1.2 labels: bookkeeping out, then the column selection
+    lp = apply_labels(spaces, members, targets, column_labels=column_labels, select=select,
+                      label_sources=label_sources)
+    spaces, members = lp.spaces, lp.members
+    defer = [m for m in defer if m in members]
+    if defer and len(defer) == len(members):
+        raise SpaceError("the selection leaves only deferred members, so nothing can choose k")
     every = members + targets
     aligned, labels = align_spaces({m: spaces[m] for m in every})
     nulls = nulls or {}
@@ -1542,6 +1663,9 @@ def fit_block(
     pr_sum = float(sum(pr.values()))
     lam = np.asarray(final.block_eigenvalues, dtype=float)
     block_pr = float(lam.sum() ** 2 / (lam ** 2).sum()) if lam.size and lam.sum() > 0 else 0.0
+    circular = circular_with({m: lp.resolved.get(m) for m in members},
+                             {m: (checkpoints or {}).get(m) for m in members},
+                             {m: member_source(m)[0] for m in members})
     per_member = {}
     for m in members:
         at_k = [r for r in curve if r["member"] == m and r["k"] == chosen]
@@ -1571,6 +1695,12 @@ def fit_block(
             "undefinable_rows_dropped": undefinable_dropped.get(m, 0),
             "declared_never_null": declared_never_null.get(m, []),
             "suspected_gated_missing": suspected_gated.get(m, []),
+            "labelled": lp.resolved.get(m) is not None,
+            "checkpoint": (checkpoints or {}).get(m),
+            "labels": lp.resolved.get(m),
+            "bookkeeping_columns": lp.bookkeeping.get(m, []),
+            "deselected_columns": lp.deselected.get(m, []),
+            "circular_with": circular.get(m, {}),
             "nan_fraction_kept": float(np.isnan(aligned[m].X).mean()),
             "n_rows_per_fold": [r["n_rows"] for r in rows],
             "r2_per_fold": [r["r2"] for r in rows],
@@ -1598,6 +1728,8 @@ def fit_block(
             "dim": aligned[t].dim,
             "dropped_columns": dropped_columns.get(t, []),
             "low_support_columns": low_support.get(t, []),
+            "labelled": lp.resolved.get(t) is not None,
+            "bookkeeping_columns": lp.bookkeeping.get(t, []),
             "rows_present": int(present[t].sum()),
             "n_rows_per_fold": [r["n_rows"] for r in rows],
             "r2_per_fold": [r["r2"] for r in rows],
@@ -1690,6 +1822,13 @@ def fit_block(
         "per_member": per_member,
         "outside_targets": targets,
         "per_target": per_target,
+        "labels_source": "contract-b-1.2 labels",
+        "selection": None if not lp.clauses else {
+            "expression": select_text(lp.clauses),
+            "clauses": [{"key": c.key, "op": c.op, "values": list(c.values)} for c in lp.clauses],
+            "scope": "members",
+            "dropped_members": lp.dropped_members,
+        },
     }
     return BlockFit(block=block, members=members, k=chosen, map=final, labels=labels,
                     curve=curve, manifest=manifest)

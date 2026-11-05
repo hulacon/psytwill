@@ -120,7 +120,7 @@ def _new_block(tmp_path, block, key, windows, **extra):
 def test_member_windows_are_recorded_and_checked(tmp_path):
     ok = _new_block(tmp_path, "A", "stimulus_id,time", {"clap": (10.0, "battery"), "pitch": (None, "battery")})
     rel = build_release(name="sp", version="0.2.0", blocks=[ok])
-    assert rel["release_schema_version"] == "1.2"
+    assert rel["release_schema_version"] == "1.3"
     assert rel["blocks"]["A"]["member_windows"] == {"clap": 10.0, "pitch": None}
     bad = _new_block(tmp_path, "B", "stimulus_id,time", {"x": (None, "undeclared")})
     with pytest.raises(SpaceError, match="x: no window declared"):

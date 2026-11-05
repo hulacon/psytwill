@@ -121,3 +121,121 @@ def test_stimulus_id_is_reserved_and_preferred_label(tmp_path):
     assert "stimulus_id" not in swept and "filename" not in swept
     result = build_quilt(csv, output_dir=tmp_path / "out")
     assert result["meta"]["inputs"][0]["label_column"] == "stimulus_id"
+
+
+# --- schema_version 1.2: per-column `labels` ------------------------------
+#
+# A viz2psy-shaped 1.2 fixture: an embedding model (pattern inventory), a
+# probe model on that embedding's checkpoint (so its columns are circular
+# with it in one block), a formula model, and one bookkeeping column.
+
+AESTHETICS_CKPT = "aesthetic-head/v2"
+N_LABELLED = 60
+
+
+def labelled_models(clip_checkpoint=CLIP_CKPT):
+    """The 1.2 sidecar `models` map of :func:`labelled_fixture` (a fresh copy)."""
+    return {
+        "clip": {
+            "checkpoint": clip_checkpoint,
+            "features": {"pattern": "clip_{NNN}", "range": [0, 5], "count": 6},
+            "nulls": {},
+            "labels": {"default": {"interpretability": "opaque", "derivation": "embedding",
+                                   "Description": "CLIP image embedding dimension"}},
+        },
+        "aesthetics": {
+            "checkpoint": AESTHETICS_CKPT,
+            "features": {"columns": ["aesthetics_score", "aesthetics_artistic", "aesthetics_quality",
+                                     "aesthetics_n_crops"]},
+            "nulls": {},
+            "labels": {
+                "default": {"interpretability": "nameable", "derivation": "probe",
+                            "derived_from": clip_checkpoint, "Description": "predicted aesthetic rating"},
+                "columns": {
+                    "aesthetics_score": {
+                        "LongName": "Aesthetic score", "Units": "rating (1-10)",
+                        "source_validation": [{"citation": "https://example.org/aesthetics",
+                                               "eval_dataset": "a public ratings set",
+                                               "metric": "spearman", "value": 0.7}]},
+                    "aesthetics_quality": {"derivation": "zero-shot",
+                                           "Description": "similarity to a quality prompt"},
+                    "aesthetics_n_crops": {"derivation": "bookkeeping", "derived_from": None,
+                                           "interpretability": "opaque",
+                                           "Description": "number of crops pooled"},
+                },
+            },
+        },
+        "llstat": {
+            "checkpoint": None,
+            "features": {"columns": ["llstat_luminance_mean", "llstat_contrast", "llstat_colorfulness",
+                                     "llstat_hist_00", "llstat_hist_01"]},
+            "nulls": {},
+            "labels": {
+                "default": {"interpretability": "nameable", "derivation": "formula"},
+                "columns": {
+                    "llstat_luminance_mean": {"LongName": "Mean luminance", "Units": "arbitrary",
+                                              "TermURL": "https://example.org/term/luminance"},
+                    "llstat_hist_00": {"interpretability": "opaque"},
+                    "llstat_hist_01": {"interpretability": "opaque"},
+                },
+            },
+        },
+    }
+
+
+def labelled_fixture(tmp_path, *, name="img_scores.csv", models=None, schema="1.2",
+                     created_at="2026-01-01T00:00:00+00:00", seed=0, ids=None):
+    """viz2psy-shaped 1.2 scores CSV + sidecar with per-column labels.
+
+    Columns share a 2-d latent, so any subset of members makes a fittable
+    block; ``aesthetics_n_crops`` is a bookkeeping count.
+    """
+    rng = np.random.default_rng(seed)
+    n = N_LABELLED
+    z = rng.normal(size=(n, 2))
+    cols = {"stimulus_id": ids or [f"img{i:03d}" for i in range(n)]}
+    blocks = {"clip": [f"clip_{i:03d}" for i in range(6)],
+              "aesthetics": ["aesthetics_score", "aesthetics_artistic", "aesthetics_quality"],
+              "llstat": ["llstat_luminance_mean", "llstat_contrast", "llstat_colorfulness",
+                         "llstat_hist_00", "llstat_hist_01"]}
+    for names in blocks.values():
+        W = rng.normal(size=(2, len(names)))
+        X = z @ W + 0.3 * rng.normal(size=(n, len(names)))
+        cols.update({c: X[:, j] for j, c in enumerate(names)})
+    cols["aesthetics_n_crops"] = rng.integers(1, 30, size=n).astype(float)
+    df = pd.DataFrame(cols)
+    models = labelled_models() if models is None else models
+    if schema in ("1.0", "1.1"):
+        for entry in models.values():
+            entry.pop("labels", None)
+            if schema == "1.0":
+                entry.pop("nulls", None)
+    sidecar = {"schema_version": schema, "extractor": "viz2psy", "extractor_version": "0.12.0",
+               "created_at": created_at, "models": models}
+    return _write(tmp_path / name, df, sidecar)
+
+
+def test_labels_reader_accepts_1_2_and_resolves(tmp_path):
+    from psytwill.labels import read_model_labels, resolve
+
+    meta = load_sidecar(labelled_fixture(tmp_path))
+    assert meta["schema_version"] == "1.2"
+    clip = read_model_labels(meta, "clip")
+    got = resolve(clip, [f"clip_{i:03d}" for i in range(6)], model="clip")
+    assert {e["derivation"] for e in got.values()} == {"embedding"}
+    aes = resolve(read_model_labels(meta, "aesthetics"),
+                  ["aesthetics_score", "aesthetics_quality", "aesthetics_n_crops"], model="aesthetics")
+    # key-wise merge: the override replaces only the keys it names
+    assert aes["aesthetics_score"]["derived_from"] == CLIP_CKPT
+    assert aes["aesthetics_score"]["Description"] == "predicted aesthetic rating"
+    assert aes["aesthetics_quality"]["derivation"] == "zero-shot"
+    # a null override removes the default's key (a bookkeeping column has no parent)
+    assert "derived_from" not in aes["aesthetics_n_crops"]
+
+
+def test_1_1_sidecar_reads_as_unlabelled(tmp_path):
+    from psytwill.labels import read_model_labels
+
+    meta = load_sidecar(labelled_fixture(tmp_path, schema="1.1"))
+    assert read_model_labels(meta, "clip") is None
+    assert read_model_labels(None, "clip") is None
