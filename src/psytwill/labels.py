@@ -91,25 +91,40 @@ def _placeholder_regex(pattern: str) -> re.Pattern:
 
 def inventory_matcher(entry: Mapping[str, Any] | None) -> Callable[[str], bool] | None:
     """A predicate for "is this a column of the model", from the sidecar entry's
-    feature inventory, or ``None`` when the entry lists none.
+    feature inventories, or ``None`` when the entry lists none.
 
-    The inventory may sit at the entry's top level or under ``features`` (the
-    viz2psy form): an explicit ``columns`` list, or an embedding ``pattern``
-    (pattern-aware, so a 1024-d model need not list its columns).
+    A column belongs to the model if ANY inventory the entry declares names it:
+    the entry's top level or ``features`` (the viz2psy form), word2psy's
+    ``chunk_aggregates`` (the ``{feature}_{stat}`` chunk columns) and
+    ``chunk_pooling`` (its pooled ``features`` and its ``count_column``). Each
+    is an explicit ``columns`` list or an embedding ``pattern`` (pattern-aware,
+    so a 1024-d model need not list its columns).
     """
     if not isinstance(entry, Mapping):
         return None
-    for inv in (entry.get("features"), entry):
+    names: set[str] = set()
+    patterns: list[re.Pattern] = []
+
+    def take(inv: Any) -> None:
         if not isinstance(inv, Mapping):
-            continue
+            return
         cols = inv.get("columns")
-        if isinstance(cols, list) and cols:
-            names = {str(c) for c in cols}
-            return names.__contains__
+        if isinstance(cols, list):
+            names.update(str(c) for c in cols)
         if isinstance(inv.get("pattern"), str):
-            rx = _placeholder_regex(inv["pattern"])
-            return lambda c, rx=rx: rx.match(c) is not None
-    return None
+            patterns.append(_placeholder_regex(inv["pattern"]))
+
+    take(entry)
+    take(entry.get("features"))
+    take(entry.get("chunk_aggregates"))
+    pooling = entry.get("chunk_pooling")
+    if isinstance(pooling, Mapping):
+        take(pooling.get("features"))
+        if isinstance(pooling.get("count_column"), str):
+            names.add(pooling["count_column"])
+    if not names and not patterns:
+        return None
+    return lambda c: c in names or any(rx.match(c) is not None for rx in patterns)
 
 
 def _check_value(key: str, value: Any, *, where: str) -> None:
