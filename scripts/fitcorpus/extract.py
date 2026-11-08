@@ -32,9 +32,18 @@ Short-file corpora (speech, music, words) are first packed into units by
 reads, and `<unit>_segments.csv` beside it maps unit time back to files.
 
 Roots (flags win over env; there are no defaults -- a site names them):
-    --durable-root / $PSYTWILL_FITCORPUS_DURABLE   feature store
-    --scratch-root / $PSYTWILL_FITCORPUS_SCRATCH   staged raw media
-    --nsd-hdf5     / $PSYTWILL_NSD_HDF5            the 73k NSD image brick
+    --durable-root  / $PSYTWILL_FITCORPUS_DURABLE  feature store
+    --scratch-root  / $PSYTWILL_FITCORPUS_SCRATCH  staged, derived media (packed audio units, PNG frames)
+    --media-root    / $PSYTWILL_FITCORPUS_MEDIA    raw source video (CNeuroMod), read in place
+    --framing-table / $PSYTWILL_FRAMING_TABLE      reviewed viz2psy framing table; required by
+                                                   every viz2psy cell that reads a video file
+    --nsd-hdf5      / $PSYTWILL_NSD_HDF5           the 73k NSD image brick
+
+Video paths are passed exactly as found under --media-root (symlinks not
+resolved), because the framing table is keyed on that spelling; viz2psy
+refuses a video the table does not hold. A video cell is done only if its
+sidecar was framed with the current table (sha256), so a resumed run
+re-extracts cells framed under an older table, or none.
 
 Env: needs viz2psy, aud2psy, word2psy importable (the stimfeat env on
 Talapas). The interpreter running this script runs the extractors.
@@ -115,6 +124,22 @@ class Roots:
     def __init__(self, args: argparse.Namespace) -> None:
         self.durable = self._resolve(args.durable_root, "PSYTWILL_FITCORPUS_DURABLE", "--durable-root")
         self.scratch = self._resolve(args.scratch_root, "PSYTWILL_FITCORPUS_SCRATCH", "--scratch-root", required=False)
+        self.media = self._resolve(args.media_root, "PSYTWILL_FITCORPUS_MEDIA", "--media-root", required=False)
+        self.framing_table = self._resolve(args.framing_table, "PSYTWILL_FRAMING_TABLE", "--framing-table",
+                                           required=False)
+        self._framing_sha: str | None = None
+
+    def framing_sha256(self) -> str:
+        """The framing table's sha256, from its parameter record (viz2psy writes it)."""
+        if self.framing_table is None:
+            sys.exit("ERROR: a viz2psy cell reads a video file, and no --framing-table is given "
+                     "($PSYTWILL_FRAMING_TABLE unset); every video is extracted through the reviewed table")
+        if self._framing_sha is None:
+            rec = self.framing_table.with_name(self.framing_table.name + ".json")
+            if not rec.is_file():
+                sys.exit(f"ERROR: framing table {self.framing_table} has no parameter record {rec}")
+            self._framing_sha = json.loads(rec.read_text())["sha256"]
+        return self._framing_sha
         self.nsd_hdf5 = self._resolve(args.nsd_hdf5, "PSYTWILL_NSD_HDF5", "--nsd-hdf5", required=False)
 
     @staticmethod
@@ -165,10 +190,11 @@ def _nsd_caption_units() -> list[Unit]:
 
 
 def _cneuromod_media(corpus: str) -> list[Path]:
-    """Staged (annex content present) .mkv segments of one CNeuroMod corpus."""
-    if ROOTS.scratch is None:
+    """Present (annex content available) .mkv segments of one CNeuroMod corpus,
+    under the media root, spelled as found there (the framing table's keys)."""
+    if ROOTS.media is None:
         return []
-    root = ROOTS.scratch / "cneuromod" / "algonauts_2025.competitors" / "stimuli" / "movies" / corpus
+    root = ROOTS.media / "cneuromod" / "algonauts_2025.competitors" / "stimuli" / "movies" / corpus
     if not root.exists():
         return []
     files = []
@@ -382,8 +408,18 @@ def sidecar_for(stem: Path) -> Path:
     return stem.with_suffix(".meta.json")
 
 
-def is_done(stem: Path) -> bool:
-    """Sidecar present AND clean against the clamped battery."""
+VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v"}
+
+
+def is_video_cell(src: Source, unit: Unit) -> bool:
+    """A viz2psy cell whose input is a video file (not staged PNG frames)."""
+    return (src.package == "viz2psy" and len(unit.inputs) == 1
+            and Path(unit.inputs[0]).suffix.lower() in VIDEO_SUFFIXES)
+
+
+def is_done(stem: Path, src: Source | None = None, unit: Unit | None = None) -> bool:
+    """Sidecar present AND clean against the clamped battery AND, for a video
+    cell, framed with the current framing table."""
     meta = sidecar_for(stem)
     if not meta.exists():
         return False
@@ -391,7 +427,12 @@ def is_done(stem: Path) -> bool:
         sidecar = json.loads(meta.read_text())
     except (OSError, ValueError):
         return False
-    return not check_sidecar(sidecar, source=str(meta))
+    if check_sidecar(sidecar, source=str(meta)):
+        return False
+    if src is not None and unit is not None and is_video_cell(src, unit):
+        framing = (sidecar.get("input") or {}).get("framing") or {}
+        return framing.get("framing_table_sha256") == ROOTS.framing_sha256()
+    return True
 
 
 def command_for(src: Source, unit: Unit, model: str) -> list[str]:
@@ -401,6 +442,9 @@ def command_for(src: Source, unit: Unit, model: str) -> list[str]:
                "-o", str(stem), "--batch-size", "64", "--no-viz", "--quiet"]
         if src.source == "frames":
             cmd += ["--frame-interval", str(GRID_HOP), "--no-save-frames"]
+        if is_video_cell(src, unit):
+            ROOTS.framing_sha256()  # refuses without a table
+            cmd += ["--framing-table", str(ROOTS.framing_table)]
         return cmd + unit.extra
     if src.package == "aud2psy":
         cmd = [PY, "-m", "aud2psy.cli", model, *unit.inputs,
@@ -458,7 +502,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         models = [m for m in src.models if (not args.model or m == args.model)
                   and m not in (args.skip_model or ())]
         n = len(units) * len(models)
-        done = sum(is_done(stem_for(src, u, m)) for u in units for m in models)
+        done = sum(is_done(stem_for(src, u, m), src, u) for u in units for m in models)
         rows.append((src.key, src.package, len(units), len(models), n, done, src.what, src.depends))
     print(f"fit-corpus manifest   durable: {ROOTS.durable}")
     print(f"{'corpus/source':22} {'pkg':9} {'units':>5} {'models':>6} {'cells':>7} {'done':>7} {'todo':>6}")
@@ -549,7 +593,7 @@ def _ensure_transcript_input(corpus: str, unit: Unit, force: bool = False) -> bo
 
 def cmd_run(args: argparse.Namespace) -> int:
     cells = _filtered(args)
-    todo = [(s, u, m) for s, u, m in cells if args.redo or not is_done(stem_for(s, u, m))]
+    todo = [(s, u, m) for s, u, m in cells if args.redo or not is_done(stem_for(s, u, m), s, u)]
     print(f"{len(cells)} cells matched: {len(todo)} to run, {len(cells) - len(todo)} already done")
     n_ok = n_fail = 0
     failures: list[str] = []
@@ -680,7 +724,7 @@ def aggregate_groups(args: argparse.Namespace) -> tuple[dict[tuple[str, str, str
     skipped: list[tuple[Path, str]] = []
     units_of: dict[tuple[str, str, str], dict[str, set[Path]]] = {}
     for src, unit, model in _filtered(args):
-        if not is_done(stem_for(src, unit, model)):
+        if not is_done(stem_for(src, unit, model), src, unit):
             continue
         for table, path in family_tables(src, unit, model).items():
             usable, why = _table_usable(path)
@@ -771,6 +815,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--durable-root")
     ap.add_argument("--scratch-root")
+    ap.add_argument("--media-root")
+    ap.add_argument("--framing-table")
     ap.add_argument("--nsd-hdf5")
     sub = ap.add_subparsers(dest="verb", required=True)
 

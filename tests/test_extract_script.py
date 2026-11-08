@@ -26,9 +26,75 @@ def test_aggregate_refuses_a_group_one_of_whose_models_is_missing_units(tmp_path
     monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=durable, scratch=None, nsd_hdf5=None),
                         raising=False)  # set in main()
     monkeypatch.setattr(extract, "build_sources", lambda: [src])
-    monkeypatch.setattr(extract, "is_done", lambda stem: (stem.parent.name, stem.stem) in done)
+    monkeypatch.setattr(extract, "is_done", lambda stem, *_: (stem.parent.name, stem.stem) in done)
     monkeypatch.setattr(extract._dir_stems, "cache", {}, raising=False)
     args = argparse.Namespace(model=None, skip_model=None, unit=None, unit_index=None, corpus=None, source=None,
                               allow_partial=False, dry_run=True, redo=False, fail_fast=False)
     assert extract.cmd_aggregate(args) == 1
     assert "INCOMPLETE c/image/main" in capsys.readouterr().out
+
+
+def _roots(tmp_path, table=None):
+    args = argparse.Namespace(durable_root=str(tmp_path / "durable"), scratch_root=None, nsd_hdf5=None,
+                              media_root=str(tmp_path / "media"),
+                              framing_table=str(table) if table else None)
+    return extract.Roots(args)
+
+
+def _table(tmp_path, sha="f" * 64):
+    t = tmp_path / "framing_table.csv"
+    t.write_text("path\n")
+    (tmp_path / "framing_table.csv.json").write_text(f'{{"sha256": "{sha}"}}')
+    return t
+
+
+def _video_cell(tmp_path):
+    unit = extract.Unit(id="bourne01", out_dir=tmp_path / "durable" / "movie10" / "features" / "bourne01",
+                        inputs=[str(tmp_path / "media" / "cneuromod" / "bourne01.mkv")])
+    src = extract.Source("movie10", "frames", "viz2psy", "", ["clip"], "synthetic", lambda: [unit])
+    return src, unit
+
+
+def test_video_cells_pass_the_framing_table(tmp_path, monkeypatch):
+    table = _table(tmp_path)
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, table), raising=False)
+    src, unit = _video_cell(tmp_path)
+    cmd = extract.command_for(src, unit, "clip")
+    assert cmd[cmd.index("--framing-table") + 1] == str(table)
+    # staged PNG frames (AVCaps) are stills: no table
+    png = extract.Unit(id="u0", out_dir=unit.out_dir, inputs=["a.png", "b.png"])
+    assert "--framing-table" not in extract.command_for(src, png, "clip")
+
+
+def test_video_cell_without_table_refuses(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path), raising=False)
+    src, unit = _video_cell(tmp_path)
+    with pytest.raises(SystemExit, match="framing-table"):
+        extract.command_for(src, unit, "clip")
+
+
+def test_video_cell_done_only_under_the_current_table(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, _table(tmp_path, sha="new" * 8)), raising=False)
+    monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
+    src, unit = _video_cell(tmp_path)
+    stem = extract.stem_for(src, unit, "clip")
+    stem.parent.mkdir(parents=True)
+    for sha, want in [("old" * 8, False), ("new" * 8, True), (None, False)]:
+        framing = {"frame_source": "raw decode"} if sha is None else {"framing_table_sha256": sha}
+        extract.sidecar_for(stem).write_text(json.dumps({"input": {"type": "video", "framing": framing}}))
+        assert extract.is_done(stem, src, unit) is want
+    # non-video cells ignore framing
+    assert extract.is_done(stem) is True
+
+
+def test_cneuromod_media_comes_from_the_media_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path), raising=False)
+    d = tmp_path / "media" / "cneuromod" / "algonauts_2025.competitors" / "stimuli" / "movies" / "movie10" / "bourne"
+    d.mkdir(parents=True)
+    (d / "bourne01.mkv").write_bytes(b"x")
+    got = extract._cneuromod_media("movie10")
+    assert got == [d / "bourne01.mkv"]

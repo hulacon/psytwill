@@ -589,6 +589,39 @@ def _exclude_rows(path: str | None, key: tuple[str, ...]) -> set[tuple]:
     return {tuple(_key_value(v) for v in row) for row in df[list(key)].itertuples(index=False)}
 
 
+def _assert_tables_framing(paths: list[str]) -> None:
+    """Refuse member tables whose video inputs were framed under different rules.
+
+    Each features table records the rule its video inputs share
+    (``input_framing``, psytwill >= 0.50.0). Tables without video inputs
+    (stills, audio, text) are ignored, as is a set where no table declares a
+    stage 0 (legacy). Once one table declares one, every other video table
+    must match it, and a table built before 0.50.0 must be rebuilt first.
+    """
+    from psytwill.features import group_framing
+    from psytwill.sidecar import UNDECLARED, describe_framing, framing_rule_key
+
+    got = {p: group_framing(p) for p in paths}
+    declared = {p: r for p, r in got.items()
+                if isinstance(r, dict) and framing_rule_key(r) is not None and r.get("stage0") != UNDECLARED}
+    if not declared:
+        return
+    ref_path, ref = next(iter(declared.items()))
+    for p, r in got.items():
+        if r is None:
+            continue
+        if r == "unknown":
+            raise SpaceError(
+                f"{p} was built before psytwill 0.50.0 recorded input framing, and {ref_path} was "
+                f"extracted with {describe_framing(ref)}; rebuild {p} with `psytwill features` so "
+                "its framing can be compared.")
+        if framing_rule_key(r) is not None and framing_rule_key(r) != framing_rule_key(ref):
+            raise SpaceError(
+                f"framing mismatch across member tables: {ref_path} has {describe_framing(ref)}, "
+                f"{p} has {describe_framing(r)}. Re-extract the video corpora with the same "
+                "`viz2psy --framing-table`, then rebuild the tables.")
+
+
 def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
                 partial_features: dict[str, list[str]] | None = None, verbose: bool = True,
                 want_labels: bool = False):
@@ -635,6 +668,7 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
     missing = [m for m in members if source[m][0] not in where]
     if missing:
         raise SpaceError(f"member(s) {missing} not in the given tables; available {sorted(where)}")
+    _assert_tables_framing(sorted({p for m in members for p in where[source[m][0]]}))
     ids: set[str] = set()
     if args.exclude_ids:
         ids = {line.strip() for line in Path(args.exclude_ids).read_text().splitlines() if line.strip()}
