@@ -35,7 +35,8 @@ from psytwill import __version__
 from psytwill.exceptions import EmptyInputError, InputError, SpaceError
 from psytwill.matrices import resolve_labels
 from psytwill.labels import LabelSource, labels_digest, read_model_labels, resolve, stack_labels
-from psytwill.sidecar import find_sidecar, load_sidecar, model_checkpoint, model_nulls, model_window_sec
+from psytwill.sidecar import (describe_framing, find_sidecar, framing_rule_key, input_framing_rule,
+                              load_sidecar, model_checkpoint, model_nulls, model_window_sec)
 from psytwill.spaces import INDEX_COLUMNS, detect_embedding_spaces
 
 # 1.1 (psytwill 0.20.0): each input's model entries carry the producer's
@@ -47,7 +48,7 @@ from psytwill.spaces import INDEX_COLUMNS, detect_embedding_spaces
 # the sidecar consolidates `model_labels` ({model: raw block | null}) plus
 # `model_labels_from` ({model: {path, created_at}} of the sidecar whose
 # block was kept). Additive; older readers ignore all three.
-FEATURES_SCHEMA_VERSION = "1.2"
+FEATURES_SCHEMA_VERSION = "1.3"  # 1.3: input framing (per-input `framing`, table `input_framing`)
 
 # Reserved columns that survive as keys in the long table; the remaining
 # INDEX_COLUMNS are row-identity implementation details and are dropped
@@ -227,6 +228,8 @@ def _melt_input(
         # and the columns they were resolved against, for the stacking check
         "_labels": label_sources,
     }
+    if (rule := input_framing_rule(meta)) is not None:
+        entry["framing"] = rule
     if unattributed:
         entry["unattributed_columns"] = unattributed
     return long, entry
@@ -280,6 +283,50 @@ def _assert_checkpoints(entries: list[dict[str, Any]]) -> None:
                     "checkpoints or build separate tables."
                 )
             seen.setdefault(model, (checkpoint, entry["path"]))
+
+
+def _assert_framing(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Refuse one table stacking video inputs extracted under different framing
+    rules; return the table's rule (``None`` when it holds no video input).
+
+    A video input written before viz2psy 0.17.0 has no stage 0 and reads as
+    undeclared: a table of only those is legacy and passes, but it cannot be
+    mixed with a declared one (a partial re-extraction). Stills are never
+    compared (no bars, square pixels).
+    """
+    first: tuple[dict[str, Any], str] | None = None
+    for entry in entries:
+        rule = entry.get("framing")
+        if framing_rule_key(rule) is None:
+            continue
+        if first is None:
+            first = (rule, entry["path"])
+        elif framing_rule_key(rule) != framing_rule_key(first[0]):
+            raise SpaceError(
+                f"framing mismatch: {first[1]} was extracted with {describe_framing(first[0])}, "
+                f"{entry['path']} with {describe_framing(rule)}. One features table cannot mix "
+                "video inputs framed differently; re-extract them all with the same "
+                "`viz2psy --framing-table`.")
+    return None if first is None else dict(first[0])
+
+
+def group_framing(table: str | Path) -> dict[str, Any] | None | str:
+    """The framing rule a features table's video inputs share (``input_framing``).
+
+    ``None``: the table holds no video input (or, for a table built before
+    psytwill 0.50.0, no viz2psy input at all). ``"unknown"``: an older table
+    with viz2psy inputs, whose framing was not recorded; rebuild it
+    (aggregation is cheap) to compare it.
+    """
+    meta_path = Path(table).with_suffix(".meta.json")
+    if not meta_path.exists():
+        return "unknown"
+    meta = json.loads(meta_path.read_text())
+    if "input_framing" in meta:
+        return meta["input_framing"]
+    if not any(e.get("extractor") == "viz2psy" for e in meta.get("inputs", [])):
+        return None
+    return "unknown"
 
 
 def _assert_nulls(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -682,6 +729,7 @@ def build_features(
             # introduces it rather than after every input has been melted.
             _assert_checkpoints(entries)
             _assert_nulls(entries)
+            _assert_framing(entries)
 
             table = _coerce(long)
             del long
@@ -746,6 +794,7 @@ def build_features(
         "n_stimuli": len(stimulus_ids),
         "models": sorted(models_seen),
         "model_nulls": _assert_nulls(entries),
+        "input_framing": _assert_framing(entries),
     }
     meta["model_labels"], meta["model_labels_from"] = _consolidated_labels(held_labels)
     meta_path = output.with_suffix(".meta.json")

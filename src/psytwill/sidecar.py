@@ -131,3 +131,51 @@ def model_checkpoint(sidecar: dict[str, Any] | None, space_name: str) -> str | N
         return None
     checkpoint = entry.get("checkpoint")
     return checkpoint if isinstance(checkpoint, str) else None
+
+
+#: The parts of an extractor sidecar's ``input.framing`` that define the
+#: framing *rule* (viz2psy >= 0.17.0, Contract B 1.3). Per-file values (the
+#: crop box, sizes) legitimately differ between inputs; the rule must not.
+FRAMING_RULE_KEYS = ("stage0", "stage0_version", "framing_table_sha256")
+STILL_FRAME_SOURCE = "still image"
+UNDECLARED = "undeclared"
+
+
+def input_framing_rule(sidecar: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The framing rule one input was extracted under, or ``None`` if it has none.
+
+    * a still-image input: ``{"frame_source": "still image", ...}`` (never
+      compared: stills have no bars and square pixels);
+    * a video input written before stage 0 existed (no ``input.framing.stage0``):
+      ``{"stage0": "undeclared"}``, so it cannot be mixed with a declared one;
+    * a video input with stage 0: ``frame_source`` + :data:`FRAMING_RULE_KEYS`;
+    * anything else (no ``input``, a non-visual extractor): ``None``.
+    """
+    inp = (sidecar or {}).get("input")
+    if not isinstance(inp, dict):
+        return None
+    fr = inp.get("framing") if isinstance(inp.get("framing"), dict) else {}
+    if fr.get("frame_source") == STILL_FRAME_SOURCE:
+        return {"frame_source": STILL_FRAME_SOURCE}
+    if inp.get("type") != "video" and "stage0" not in fr:
+        return None
+    if "stage0" not in fr:
+        return {"frame_source": fr.get("frame_source"), "stage0": UNDECLARED}
+    return {"frame_source": fr.get("frame_source"), **{k: fr.get(k) for k in FRAMING_RULE_KEYS}}
+
+
+def framing_rule_key(rule: dict[str, Any] | None) -> tuple | None:
+    """What two video inputs must share; ``None`` for stills and non-visual inputs."""
+    if rule is None or rule.get("frame_source") == STILL_FRAME_SOURCE:
+        return None
+    return tuple(rule.get(k) for k in FRAMING_RULE_KEYS)
+
+
+def describe_framing(rule: dict[str, Any] | None) -> str:
+    if rule is None:
+        return "no framing record"
+    if rule.get("stage0") == UNDECLARED:
+        return "no stage 0 (extracted before viz2psy 0.17.0)"
+    sha = rule.get("framing_table_sha256")
+    return (f"stage 0 {rule.get('stage0')!r} v{rule.get('stage0_version')}"
+            + (f", table sha256 {sha[:12]}..." if sha else ""))

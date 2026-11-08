@@ -15,7 +15,7 @@ import pytest
 
 from psytwill.cli import main
 from psytwill.exceptions import InputError, SpaceError
-from psytwill.features import build_features, group_labels
+from psytwill.features import FEATURES_SCHEMA_VERSION, build_features, group_labels
 from psytwill.labels import parse_select, select_text
 from tests.test_contract import CLIP_CKPT, labelled_fixture, labelled_models
 
@@ -62,7 +62,7 @@ def test_malformed_producer_labels_fail_loudly(tmp_path, mutate, match):
 def test_labels_are_carried_into_the_features_sidecar(tmp_path):
     table = _features(tmp_path, [labelled_fixture(tmp_path)])
     meta = json.loads(table.with_suffix(".meta.json").read_text())
-    assert meta["schema_version"] == "1.2"
+    assert meta["schema_version"] == FEATURES_SCHEMA_VERSION  # a fresh table is at the current schema
     assert meta["model_labels"]["clip"]["default"]["derivation"] == "embedding"
     assert meta["model_labels_from"]["clip"]["created_at"].startswith("2026-01-01")
     digest = meta["inputs"][0]["models"]["clip"]["labels_sha256"]
@@ -158,7 +158,7 @@ def test_refresh_labels_rewrites_only_the_sidecar(tmp_path, capsys):
     labels, _ = group_labels(table)
     assert labels["llstat"]["default"]["derivation"] == "formula"
     out = json.loads(table.with_suffix(".meta.json").read_text())
-    assert out["schema_version"] == "1.2"
+    assert out["schema_version"] == FEATURES_SCHEMA_VERSION  # a refresh never lowers it
     assert out["refreshed"][-1]["fields"][-2:] == ["model_labels", "model_labels_from"]
     assert out["inputs"][0]["models"]["clip"]["labels_sha256"]
     assert table.read_bytes() == before

@@ -3,6 +3,32 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.50.0 — 2026-11-08
+
+Minor bump: Contract B 1.3 input framing on the consumer side (viz2psy
+0.17.0's stage 0: bar crop + square pixels from a reviewed framing table).
+Features table schema 1.2 → 1.3 (additive).
+
+### Added
+- `psytwill features` records each input's framing rule (`inputs[].framing`:
+  `frame_source`, `stage0`, `stage0_version`, `framing_table_sha256`) and the
+  rule the table's video inputs share (`input_framing`; `null` without video
+  inputs). It **refuses to stack video inputs framed under different rules**:
+  a different table, a different stage-0 version, or a video extracted
+  before stage 0 existed mixed with one after it (a partial re-extraction).
+  A table of only pre-0.17.0 video inputs is legacy and still builds. Stills
+  are never compared.
+- The space member loader (`space fit`, `project`, `check`, ...) refuses member
+  tables whose video framing rules differ, and refuses a table built before
+  0.50.0 that holds viz2psy inputs when another table declares a rule
+  (rebuild it with `psytwill features`; aggregation is cheap).
+- `scripts/fitcorpus/extract.py`: `--media-root` / `$PSYTWILL_FITCORPUS_MEDIA`
+  for raw source video (CNeuroMod is read there, spelled as found, matching the
+  framing table's keys; `--scratch-root` keeps staged, derived media), and
+  `--framing-table` / `$PSYTWILL_FRAMING_TABLE`, passed to every viz2psy cell
+  that reads a video file (required for those cells). A video cell counts as
+  done only if its sidecar was framed with the current table's sha256.
+
 ## 0.49.1 — 2026-11-05
 
 ### Fixed
