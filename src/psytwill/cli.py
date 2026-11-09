@@ -140,6 +140,15 @@ def _parse_modality_map(arg: str | None) -> dict[str, str] | None:
 def _run_features(args: argparse.Namespace) -> None:
     from psytwill.features import build_features, refresh_group_labels, refresh_group_nulls
 
+    if args.refresh_segments:
+        from psytwill.windows import record_table_segments
+
+        for table in args.inputs:
+            rec = record_table_segments(table, args.refresh_segments)
+            print(f"psytwill features --refresh-segments {table}: {len(rec['files'])} unit(s) with segments "
+                  f"in {rec['dir']}")
+        if not (args.refresh_nulls or args.refresh_labels):
+            return
     if args.refresh_nulls or args.refresh_labels:
         for table in args.inputs:
             if args.refresh_nulls:
@@ -170,6 +179,11 @@ def _run_features(args: argparse.Namespace) -> None:
             f"{entry['n_feature_columns']} feature cols{note}"
         )
     print(f"  {summary['meta_path']}")
+    if args.segments_dir:
+        from psytwill.windows import record_table_segments
+
+        rec = record_table_segments(summary["output"], args.segments_dir)
+        print(f"  segments: {len(rec['files'])} unit(s) from {rec['dir']}")
 
 
 def _run_timelines(args: argparse.Namespace) -> None:
@@ -870,6 +884,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         for model, vals in group_window_sec(path).items():
             declared.setdefault(model, set()).update(vals)
     windows = resolve_member_windows(members, declared)  # refuses before the fit, not after
+    absent, item_record = _item_masks_for_fit(args, spaces, members, rep)
     groups = None
     corpora = None
     schedule = tuple(int(k) for k in args.k_schedule.split(",")) if args.k_schedule else DEFAULT_K_SCHEDULE
@@ -920,7 +935,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
                     member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
                     targets=targets, column_labels=rep.labels, checkpoints=rep.checkpoints,
-                    select=args.select, label_sources=rep.label_sources)
+                    select=args.select, label_sources=rep.label_sources, absent=absent)
     sel = fit.manifest["selection"]
     if sel:
         print(f"  selection {sel['expression']!r}"
@@ -960,6 +975,11 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         lw = label_windows(pm.get("labels"), w)
         pm.update(lw if lw is not None else w)
     fit.manifest["inputs"] = [str(p) for p in args.features]
+    fit.manifest["item_masks"] = item_record
+    for m in members:
+        if fit.manifest["per_member"][m].get("item_masked_rows"):
+            print(f"  {m}: absent from {fit.manifest['per_member'][m]['item_masked_rows']} row(s) whose "
+                  "window reads two items (item masks)")
     fit.manifest["key"] = args.key
     fit.manifest["window"] = args.window
     fit.manifest["n_excluded_ids"] = n_excl
@@ -1010,10 +1030,77 @@ def _verdict(passed: bool | None) -> str:
     return "UNSCOREABLE" if passed is None else "pass" if passed else "FAIL"
 
 
-def _project_frame(fit, spaces: dict, key: str, view: str, k: int | None = None):
+def _segments_for(args: argparse.Namespace) -> tuple[dict, dict]:
+    """Segments of every input table when rows are on a time grid, and a per-table record."""
+    from psytwill.windows import table_segments
+
+    if not args.window or "time" not in str(args.key).split(","):
+        return {}, {}
+    segs: dict = {}
+    record = {}
+    for path in args.features:
+        got = table_segments(path)
+        record[str(path)] = len(got) if got else None
+        clash = set(got) & set(segs)
+        if clash:
+            raise SpaceError(f"stimulus id(s) {sorted(clash)[:3]} carry segments in two tables")
+        segs.update(got)
+    return segs, record
+
+
+def _item_masks_for_fit(args: argparse.Namespace, spaces: dict, members: list, rep) -> tuple[dict, dict]:
+    """``({member: {column: row labels}}, record)``: rows whose window reads two items."""
+    import numpy as np
+
+    from psytwill.labels import resolve
+    from psytwill.windows import item_masks, numeric_windows
+
+    segs, per_table = _segments_for(args)
+    record = {"hop": args.window, "segments_units_per_table": per_table,
+              "note": "null = the table records no segments: each clip is one item"}
+    if not segs:
+        return {}, record
+    absent = {}
+    for m in members:
+        raw = (rep.labels or {}).get(m)
+        cols = resolve(raw, spaces[m].features, model=m, where=f"member {m!r}") if raw else None
+        masks = item_masks(spaces[m], numeric_windows(cols), segs, args.window)
+        if masks:
+            lab = spaces[m].labels
+            absent[m] = {c: {lab[i] for i in np.flatnonzero(v)} for c, v in masks.items()}
+    return absent, record
+
+
+def _read_members(fit, spaces: dict, segs: dict, hop: float | None, causal: bool) -> tuple[dict, dict, dict]:
+    """Members as a projection reads them: item-masked and, with ``causal``, shifted.
+
+    Returns ``(spaces, {member: absent row labels}, {member: record})``.
+    """
+    import numpy as np
+
+    from psytwill.windows import read_absent
+
+    if not hop or (not segs and not causal):
+        return spaces, {}, {}
+    out, absent, record = dict(spaces), {}, {}
+    for m in fit.members:
+        cols = (fit.manifest.get("per_member", {}).get(m, {}) or {}).get("labels")
+        if not cols:
+            continue
+        sp, mask, rec = read_absent(spaces[m], cols, segs, hop, causal=causal)
+        out[m] = sp
+        if mask.any():
+            absent[m] = {sp.labels[i] for i in np.flatnonzero(mask)}
+        if rec.get("absent_rows") or rec.get("causal_shifts"):
+            record[m] = rec
+    return out, absent, record
+
+
+def _project_frame(fit, spaces: dict, key: str, view: str, k: int | None = None,
+                   absent: dict | None = None):
     import pandas as pd
 
-    S, labels = fit.project(spaces, view=view, k=k)
+    S, labels = fit.project(spaces, view=view, k=k, absent=absent)
     df = pd.DataFrame(S, columns=[f"{fit.block}_{j:03d}" for j in range(S.shape[1])])
     parts = [lab.split("|") for lab in labels]
     for j, kname in enumerate(key.split(",")):
@@ -1031,6 +1118,15 @@ def _run_space_project(args: argparse.Namespace) -> None:
     k = fit.k if args.k is None else args.k
     if not 1 <= k <= fit.k:
         raise SpaceError(f"--k {k} is outside {args.space}'s 1..{fit.k}; a projection can only drop components")
+    if args.causal:
+        if not args.window or "time" not in args.key.split(","):
+            raise SpaceError("--causal shifts windows along time: it needs a time key and --window")
+        pm = fit.manifest.get("per_member", {})
+        if not any("window_sec" in e for m in fit.members for e in ((pm.get(m) or {}).get("labels") or {}).values()):
+            raise SpaceError(f"--causal needs the fit's per-column window labels (Contract B 1.4, space schema "
+                             f">= 1.17); {args.space} records none. Refit on refreshed tables.")
+    segs, seg_tables = _segments_for(args)
+    reads: dict = {}
     chunked = {}
     if args.chunk_size:
         # Every step after the load is row-wise (frozen whiteners, inner row
@@ -1046,7 +1142,14 @@ def _run_space_project(args: argparse.Namespace) -> None:
             spaces, _, _, _ = _space_load(ns, members=fit.members, partial_features=feats, verbose=False)
             if min(sp.n for sp in spaces.values()) == 0:
                 continue  # a member with no rows here: the inner alignment places none of them
-            frames.append(_project_frame(fit, spaces, args.key, args.view, k))
+            spaces, absent, rec = _read_members(fit, spaces, segs, args.window, args.causal)
+            for m, r in rec.items():
+                acc = reads.setdefault(m, {"item_masked_rows": 0, "absent_rows": 0})
+                acc["item_masked_rows"] += r["item_masked_rows"]
+                acc["absent_rows"] += r["absent_rows"]
+                if "causal_shifts" in r:
+                    acc["causal_shifts"] = r["causal_shifts"]
+            frames.append(_project_frame(fit, spaces, args.key, args.view, k, absent))
             del spaces
             print(f"  chunk {i + 1}/{len(chunks)}: {len(frames[-1])} rows", flush=True)
         cols = args.key.split(",") + [f"{fit.block}_{j:03d}" for j in range(k)]
@@ -1054,7 +1157,8 @@ def _run_space_project(args: argparse.Namespace) -> None:
         chunked = {"chunk_size": args.chunk_size, "chunks": len(chunks)}
     else:
         spaces, _, _, _ = _space_load(args, members=fit.members)
-        df = _project_frame(fit, spaces, args.key, args.view, k)
+        spaces, absent, reads = _read_members(fit, spaces, segs, args.window, args.causal)
+        df = _project_frame(fit, spaces, args.key, args.view, k, absent)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix == ".parquet":
@@ -1064,7 +1168,8 @@ def _run_space_project(args: argparse.Namespace) -> None:
     # `k` is the columns written (relate.read_scores checks it); `fit_k` names the fit's own when it differs
     meta = {"space": str(args.space), "block": fit.block, "k": k, **({"fit_k": fit.k} if k != fit.k else {}),
             "inputs": [str(p) for p in args.features],
-            "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view, **chunked}
+            "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view, **chunked,
+            "causal": bool(args.causal), "segments_units_per_table": seg_tables, "window_reads": reads}
     (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
     print(f"psytwill space project [{fit.block}, k={k}{f' of {fit.k}' if k != fit.k else ''}] -> {out}  ({len(df)} rows)")
 
@@ -1365,6 +1470,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output table (.parquet preferred, or .csv); "
         "<stem>.meta.json is written alongside",
     )
+    f.add_argument(
+        "--segments-dir",
+        help="the corpus's staging directory of `<unit>_segments.csv` tables (packed short-file corpora): "
+             "recorded in the table's sidecar with each file's sha256, so fits and projections mask rows "
+             "whose window reads two items")
+    f.add_argument(
+        "--refresh-segments", metavar="DIR",
+        help="record DIR's segments tables into the given features tables' sidecars; JSON only")
     f.add_argument(
         "--refresh-labels",
         action="store_true",
@@ -1809,6 +1922,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="project through the first K block components (1..the fit's k; default the fit's k). "
                          "A row with a masked member is placed when its present members span K directions, "
                          "so a smaller K places rows the fit's k cannot")
+    pr.add_argument("--causal", action="store_true",
+                    help="read every centred windowed column as trailing: shift it later by half its window "
+                         "(Contract B 1.4 labels in the fit manifest), so a row's value reads only audio up to "
+                         "the row's end. The first half-window of each clip has no value: the member is absent "
+                         "there, never filled")
     pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
     pr.set_defaults(func=_run_space_project)
 
