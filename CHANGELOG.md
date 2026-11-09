@@ -3,6 +3,42 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.51.0 — 2026-11-08
+
+Minor bump: Contract B 1.4 window labels on the consumer side (aud2psy
+0.22.0 declares, per column, how much audio each row reads). Space schema
+1.16 → 1.17, release schema 1.3 → 1.4.
+
+### Added
+- `window_sec` and `window_align` are label keys: validated (seconds > 0,
+  `grid` or `event`; a number needs `window_align` `centred`/`trailing`),
+  carried through `features`, and structural, so two inputs of one model
+  whose windows differ (including declared vs undeclared) refuse to stack.
+  They appear in every manifest's per-column labels and in the release labels
+  table.
+- `space fit --select` takes `window_sec` clauses: `window_sec<=0.5` (bounds
+  `<=`, `<`, `>=`, `>`; `grid` counts as 0 s, `event` fails every bound) and
+  `window_sec=event` / `!=grid`. A window clause refuses a member whose
+  columns carry no window labels, naming the refresh to run.
+- Per member (space schema 1.17): `window_sec` is the longest window over
+  the columns in the fit (seconds, `grid` or `event`), with `window_align`,
+  `window_columns` (grid / event / windowed counts),
+  `window_undeclared_columns`, and `window_source: "labels"`. Labels must
+  agree with a model-level declaration (producer `window_sec` or registry
+  pin) where both speak.
+
+### Changed
+- **A battery entry with no window pin is undeclared, not "no window".**
+  Before, `resolve_member_windows` returned `("battery", None)` for it and
+  `release write` accepted that as grid-native, so tonal (3 s), rhythm
+  (3 / 8.92 / 4 s), onsets_tempo (8 s) and psychoacoustic_fluctuation (2 s)
+  would have been certified as unwindowed. The registry now pins `"grid"`
+  explicitly (loudness, pitch, spectral, timbre, egemaps, speech, motion) and
+  tonal at 3.0; models whose columns use different windows are not pinned
+  and need 1.4 labels. `release write` refuses a time-keyed block member that
+  is undeclared, including a 1.14–1.16 manifest's `("battery", null)`.
+- `member_windows` in a release (schema 1.4) may hold `"grid"` / `"event"`.
+
 ## 0.50.0 — 2026-11-08
 
 Minor bump: Contract B 1.3 input framing on the consumer side (viz2psy

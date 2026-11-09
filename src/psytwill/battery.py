@@ -89,7 +89,14 @@ class BatteryModel:
     dim: int | None  # native feature count; None for non-numeric tables
     checkpoint: str | None  # None == analytic, no learned weights
     extra_prefixes: tuple[str, ...] = ()
-    window_sec: float | None = None
+    #: the context window each row reads, when ONE window covers every column:
+    #: seconds (a centred window, as every aud2psy window is), "grid" (each row
+    #: reads only its own grid step) or None = NOT PINNED. None never means "no
+    #: window": a member with no pin and no Contract B 1.4 window labels is
+    #: undeclared, and `release write` refuses it in a time-keyed block. Models
+    #: whose columns use different windows (rhythm, onsets, psychoacoustic,
+    #: conversation, speech_rate) cannot be pinned here; their labels say.
+    window_sec: float | str | None = None
     notes: str = field(default="")
 
     @property
@@ -134,7 +141,7 @@ BATTERY: dict[str, BatteryModel] = {
            notes="presence-gated (NaN without a face); real-photo domain"),
         _m("gist", "viz2psy", "visual", "embedding", 512, None),
         _m("llstat", "viz2psy", "visual", "profile", 17, None),
-        _m("motion", "viz2psy", "visual", "profile", 7, None,
+        _m("motion", "viz2psy", "visual", "profile", 7, None, window_sec="grid",
            notes="video only (frame pairs); absent from image sources"),
         _m("places", "viz2psy", "visual", "profile", 467,
            "wideresnet18_places365", extra_prefixes=("sunattr",),
@@ -160,26 +167,27 @@ BATTERY: dict[str, BatteryModel] = {
            window_sec=2.0,
            notes="store cells extracted at 0.13.1 predate the window_sec "
                  "sidecar key; 2.0 s is the contract value"),
-        _m("egemaps", "aud2psy", "audio", "profile", 25, None,
+        _m("egemaps", "aud2psy", "audio", "profile", 25, None, window_sec="grid",
            notes="speech-gated"),
-        _m("loudness", "aud2psy", "audio", "profile", 2, None),
+        _m("loudness", "aud2psy", "audio", "profile", 2, None, window_sec="grid"),
         _m("music_emotion", "aud2psy", "audio", "profile", 2, _CLAP,
            window_sec=10.0),
         _m("onsets", "aud2psy", "audio", "profile", 3, None),
-        _m("pitch", "aud2psy", "audio", "profile", 2, None),
+        _m("pitch", "aud2psy", "audio", "profile", 2, None, window_sec="grid"),
         _m("psychoacoustic", "aud2psy", "audio", "profile", 4, None),
         _m("rhythm", "aud2psy", "audio", "profile", 3, None),
         _m("sound_events", "aud2psy", "audio", "profile", 16, _CLAP,
            window_sec=10.0),
-        _m("spectral", "aud2psy", "audio", "profile", 5, None),
-        _m("speech", "aud2psy", "audio", "profile", 1, "silero_vad_v6.onnx"),
+        _m("spectral", "aud2psy", "audio", "profile", 5, None, window_sec="grid"),
+        _m("speech", "aud2psy", "audio", "profile", 1, "silero_vad_v6.onnx", window_sec="grid"),
         _m("speech_emotion", "aud2psy", "audio", "profile", 3,
            "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim",
            window_sec=4.0, notes="speech-gated"),
         _m("speech_rate", "aud2psy", "audio", "profile", 3, None,
            notes="speech-gated; derived from transcribe word timings"),
-        _m("timbre", "aud2psy", "audio", "profile", 21, None),
-        _m("tonal", "aud2psy", "audio", "profile", 3, None),
+        _m("timbre", "aud2psy", "audio", "profile", 21, None, window_sec="grid"),
+        _m("tonal", "aud2psy", "audio", "profile", 3, None, window_sec=3.0,
+           notes="3 s chroma window on every column; aud2psy declares it from 0.22.0"),
         _m("transcribe", "aud2psy", "audio", "text", None, "large-v3",
            notes="Whisper transcript (+ words table); the word2psy "
                  "transcript: source"),

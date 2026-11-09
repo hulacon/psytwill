@@ -59,8 +59,15 @@ DERIVATIONS: tuple[str, ...] = (
 #: these and forbidden for the rest
 NEEDS_DERIVED_FROM: frozenset[str] = frozenset({"formula-on-model", "probe", "zero-shot"})
 BOOKKEEPING = "bookkeeping"
+#: Contract B 1.4 window labels: `window_sec` is
+#: seconds of input the column's value reads around its row, "grid" (its own
+#: grid step only) or "event" (the whole extent of an input event); a number
+#: carries `window_align`. Absent = undeclared, never "grid".
+WINDOW_TOKENS: tuple[str, ...] = ("grid", "event")
+WINDOW_ALIGNS: tuple[str, ...] = ("centred", "trailing")
+WINDOW_KEYS: tuple[str, ...] = ("window_sec", "window_align")
 #: keys whose disagreement refuses a stack (what the column IS)
-STRUCTURAL_KEYS: tuple[str, ...] = ("interpretability", "derivation", "derived_from")
+STRUCTURAL_KEYS: tuple[str, ...] = ("interpretability", "derivation", "derived_from") + WINDOW_KEYS
 #: the BIDS tabular-sidecar column keys
 BIDS_KEYS: tuple[str, ...] = ("LongName", "Description", "Units", "Levels", "TermURL")
 #: keys whose disagreement only warns (how the column is DESCRIBED)
@@ -137,8 +144,16 @@ def _check_value(key: str, value: Any, *, where: str) -> None:
     if key == "source_validation":
         if not isinstance(value, list) or not all(isinstance(v, Mapping) for v in value):
             raise InputError(f"{where}: source_validation must be a list of objects")
+    if key == "window_sec" and not (value in WINDOW_TOKENS or _is_seconds(value)):
+        raise InputError(f"{where}: window_sec={value!r}; expected seconds > 0 or one of {WINDOW_TOKENS}")
+    if key == "window_align" and value not in WINDOW_ALIGNS:
+        raise InputError(f"{where}: window_align={value!r}; expected one of {WINDOW_ALIGNS}")
     if key == "Levels" and not isinstance(value, Mapping):
         raise InputError(f"{where}: Levels must be an object (BIDS), got {type(value).__name__}")
+
+
+def _is_seconds(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
 def _merge(default: Mapping[str, Any], override: Mapping[str, Any]) -> dict:
@@ -160,6 +175,16 @@ def check_resolved(entry: Mapping[str, Any], *, where: str) -> None:
     if not needs and "derived_from" in entry:
         raise InputError(f"{where}: `derived_from` is only allowed for derivations "
                          f"{sorted(NEEDS_DERIVED_FROM)}, not {entry['derivation']!r}")
+    if "window_sec" in entry:
+        numeric = _is_seconds(entry["window_sec"])
+        if numeric and "window_align" not in entry:
+            raise InputError(f"{where}: window_sec={entry['window_sec']!r} requires `window_align` "
+                             f"(one of {WINDOW_ALIGNS})")
+        if not numeric and "window_align" in entry:
+            raise InputError(f"{where}: window_align is only allowed with a numeric window_sec, "
+                             f"not {entry['window_sec']!r}")
+    elif "window_align" in entry:
+        raise InputError(f"{where}: window_align without window_sec")
 
 
 def validate_labels(labels: Any, *, model: str, where: str,
@@ -307,7 +332,7 @@ def stack_labels(model: str, held: LabelSource | None, new: LabelSource, *, what
         shown = "; ".join(structural[:4]) + (f"; ... ({len(structural)} in all)" if len(structural) > 4 else "")
         raise SpaceError(
             f"`labels` mismatch for model {model!r} between {held.path} and {new.path}: {shown}. "
-            f"interpretability, derivation and derived_from must agree for every column; {fix}.")
+            f"{', '.join(STRUCTURAL_KEYS)} must agree for every column; {fix}.")
     winner = new if _when(new.created_at) >= _when(held.created_at) else held
     if descriptive:
         loser = held if winner is new else new
@@ -322,28 +347,64 @@ def stack_labels(model: str, held: LabelSource | None, new: LabelSource, *, what
 # selection
 # --------------------------------------------------------------------------
 
-SELECT_KEYS: dict[str, tuple[str, ...]] = {"interpretability": INTERPRETABILITY, "derivation": DERIVATIONS}
+SELECT_KEYS: dict[str, tuple[str, ...]] = {"interpretability": INTERPRETABILITY, "derivation": DERIVATIONS,
+                                           "window_sec": WINDOW_TOKENS}
+#: comparison operators, allowed on ``window_sec`` only
+_BOUNDS = {"<=": "le", "<": "lt", ">=": "ge", ">": "gt"}
+_OP_TEXT = {"in": "=", "not_in": "!=", **{v: k for k, v in _BOUNDS.items()}}
 
 SELECT_GRAMMAR = """\
 EXPR   := CLAUSE (';' CLAUSE)*        clauses are ANDed; --select may also repeat
 CLAUSE := KEY OP VALUE (',' VALUE)*   a value list is a set
-KEY    := interpretability | derivation
+        | window_sec BOUND SECONDS    a numeric bound on the column's window
+KEY    := interpretability | derivation | window_sec
 OP     := '=' (value in the set) | '!=' (value not in the set)
-e.g. interpretability=nameable;derivation!=probe,zero-shot"""
+BOUND  := '<=' | '<' | '>=' | '>'
+window_sec values: seconds, grid, event. Under a BOUND, grid counts as 0 s (no
+context beyond the row) and event fails every bound (its extent is unbounded).
+e.g. interpretability=nameable;derivation!=probe,zero-shot
+     window_sec<=0.5          (timescale-clean: grid columns only, plus any window <= 0.5 s)"""
+
+
+def _window_value(v: str, raw: str) -> float | str:
+    if v in WINDOW_TOKENS:
+        return v
+    try:
+        x = float(v)
+    except ValueError:
+        raise SpaceError(f"--select {raw!r}: {v!r} is not seconds or one of {WINDOW_TOKENS}") from None
+    if x <= 0:
+        raise SpaceError(f"--select {raw!r}: a window is > 0 s (use `grid` for the row's own step)")
+    return x
+
+
+def _same_window(a: Any, b: Any) -> bool:
+    if isinstance(a, str) or isinstance(b, str):
+        return a == b
+    return a is not None and b is not None and abs(float(a) - float(b)) < 1e-9
 
 
 @dataclass(frozen=True)
 class Clause:
     key: str
-    op: str  # "in" | "not_in"
-    values: tuple[str, ...]
+    op: str  # "in" | "not_in" | "le" | "lt" | "ge" | "gt"
+    values: tuple
 
     def admits(self, entry: Mapping[str, Any]) -> bool:
-        hit = entry.get(self.key) in self.values
-        return hit if self.op == "in" else not hit
+        v = entry.get(self.key)
+        if self.op in ("in", "not_in"):
+            hit = any(_same_window(v, x) for x in self.values) if self.key == "window_sec" else v in self.values
+            return hit if self.op == "in" else not hit
+        if v is None or v == "event":
+            return False
+        x = 0.0 if v == "grid" else float(v)
+        bound = float(self.values[0])
+        return {"le": x <= bound + 1e-9, "lt": x < bound - 1e-9,
+                "ge": x >= bound - 1e-9, "gt": x > bound + 1e-9}[self.op]
 
     def text(self) -> str:
-        return f"{self.key}{'=' if self.op == 'in' else '!='}{','.join(self.values)}"
+        vals = ",".join(f"{v:g}" if isinstance(v, float) else str(v) for v in self.values)
+        return f"{self.key}{_OP_TEXT[self.op]}{vals}"
 
 
 def parse_select(spec: str | Sequence[str] | None) -> list[Clause]:
@@ -357,26 +418,46 @@ def parse_select(spec: str | Sequence[str] | None) -> list[Clause]:
             raw = raw.strip()
             if not raw:
                 continue
-            m = re.fullmatch(r"\s*([A-Za-z_]+)\s*(!=|=)\s*(.+?)\s*", raw)
+            m = re.fullmatch(r"\s*([A-Za-z_]+)\s*(!=|<=|>=|=|<|>)\s*(.+?)\s*", raw)
             if not m:
                 raise SpaceError(f"--select clause {raw!r} does not parse.\n{SELECT_GRAMMAR}")
             key, op, rhs = m.group(1), m.group(2), m.group(3)
             if key not in SELECT_KEYS:
                 raise SpaceError(f"--select key {key!r} is not one of {sorted(SELECT_KEYS)}.\n{SELECT_GRAMMAR}")
             values = [v.strip() for v in rhs.split(",") if v.strip()]
-            bad = [v for v in values if v not in SELECT_KEYS[key]]
-            if not values or bad:
-                raise SpaceError(f"--select {raw!r}: {bad or 'no values'} not in the {key} vocabulary "
-                                 f"{SELECT_KEYS[key]}")
-            if op == "=" and key == "derivation" and BOOKKEEPING in values:
-                raise SpaceError("--select derivation=bookkeeping: bookkeeping columns are never swept into a "
-                                 "feature space")
-            vocab = SELECT_KEYS[key]
-            ordered = tuple(sorted(set(values), key=vocab.index))
+            if op in _BOUNDS:
+                if key != "window_sec":
+                    raise SpaceError(f"--select {raw!r}: {op} compares seconds; only window_sec takes it")
+                if len(values) != 1 or _window_value(values[0], raw) in WINDOW_TOKENS:
+                    raise SpaceError(f"--select {raw!r}: a bound takes one number of seconds")
+                clauses.append(Clause(key, _BOUNDS[op], (_window_value(values[0], raw),)))
+                continue
+            if not values:
+                raise SpaceError(f"--select {raw!r}: no values")
+            if key == "window_sec":
+                parsed = [_window_value(v, raw) for v in values]
+                toks = sorted({v for v in parsed if isinstance(v, str)}, key=WINDOW_TOKENS.index)
+                nums = sorted({v for v in parsed if not isinstance(v, str)})
+                ordered = tuple(toks) + tuple(nums)
+            else:
+                bad = [v for v in values if v not in SELECT_KEYS[key]]
+                if bad:
+                    raise SpaceError(f"--select {raw!r}: {bad} not in the {key} vocabulary "
+                                     f"{SELECT_KEYS[key]}")
+                if op == "=" and key == "derivation" and BOOKKEEPING in values:
+                    raise SpaceError("--select derivation=bookkeeping: bookkeeping columns are never swept into "
+                                     "a feature space")
+                vocab = SELECT_KEYS[key]
+                ordered = tuple(sorted(set(values), key=vocab.index))
             clauses.append(Clause(key, "in" if op == "=" else "not_in", ordered))
     if not clauses and parts:
         raise SpaceError(f"--select is empty.\n{SELECT_GRAMMAR}")
     return clauses
+
+
+def needs_windows(clauses: Sequence[Clause]) -> bool:
+    """True when a selection reads ``window_sec`` (so every column must declare one)."""
+    return any(c.key == "window_sec" for c in clauses)
 
 
 def select_text(clauses: Sequence[Clause]) -> str:

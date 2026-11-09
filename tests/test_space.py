@@ -319,7 +319,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.16"
+        assert meta["space_schema_version"] == "1.17"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -708,7 +708,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.16"
+        assert meta["space_schema_version"] == "1.17"
 
 
 
@@ -1285,9 +1285,19 @@ class TestMemberWindows:
     def test_battery_fallback_and_undeclared(self):
         got = resolve_member_windows(["clap", "egemaps", "faces_extent", "a"])
         assert got["clap"] == {"window_sec": 10.0, "window_source": "battery"}
-        assert got["egemaps"] == {"window_sec": None, "window_source": "battery"}  # its own grid step
-        assert got["faces_extent"]["window_source"] == "battery"  # a split member reads its source model
+        assert got["egemaps"] == {"window_sec": "grid", "window_source": "battery"}  # pinned explicitly
+        # a split member reads its source model; faces has no pin, so it is undeclared, not "no window"
+        assert got["faces_extent"] == {"window_sec": None, "window_source": "undeclared"}
         assert got["a"] == {"window_sec": None, "window_source": "undeclared"}
+
+    def test_an_unpinned_registry_entry_is_undeclared_not_grid(self):
+        """Contract B 1.4: rhythm mixes 3 / 8.92 / 4 s windows and cannot be pinned;
+        before 1.17 it resolved to ("battery", None), which a release read as "no window"."""
+        for m in ("rhythm", "psychoacoustic", "onsets", "conversation", "speech_rate"):
+            assert resolve_member_windows([m])[m] == {"window_sec": None, "window_source": "undeclared"}, m
+        assert resolve_member_windows(["tonal"])["tonal"] == {"window_sec": 3.0, "window_source": "battery"}
+        with pytest.raises(SpaceError, match="battery registry pins grid"):
+            resolve_member_windows(["loudness"], {"loudness": {2.0}})
 
     def test_sidecar_declaration_wins_when_it_agrees(self):
         got = resolve_member_windows(["clap", "a"], {"clap": {10.0}, "a": {3.0}})
@@ -1348,3 +1358,52 @@ def test_targets_are_refused_when_they_are_members_or_unscored(members):
         fit_block(spaces, ["a", "b"], targets=["zz"], **_fit_kwargs())
     with pytest.raises(SpaceError, match="scored by the criterion"):
         fit_block(spaces, ["a", "b"], targets=["c"], fixed_k=4, score=False, **_fit_kwargs())
+
+
+class TestLabelWindows:
+    """Contract B 1.4: a member's window summary comes from its per-column labels (space schema 1.17)."""
+
+    @staticmethod
+    def cols(**wins):
+        out = {}
+        for c, w in wins.items():
+            e = {"interpretability": "nameable", "derivation": "formula"}
+            if w is not None:
+                e["window_sec"] = w
+                if not isinstance(w, str):
+                    e["window_align"] = "centred"
+            out[c] = e
+        return out
+
+    def test_longest_window_and_counts(self):
+        from psytwill.space import label_windows
+
+        got = label_windows(self.cols(r_pulse=3.0, r_beat=8.92, r_nov=4.0))
+        assert got["window_sec"] == 8.92 and got["window_align"] == "centred"
+        assert got["window_columns"] == {"grid": 0, "event": 0, "windowed": 3}
+        assert got["window_source"] == "labels" and got["window_undeclared_columns"] == []
+        got = label_windows(self.cols(rate="grid", dur="event"))
+        assert got["window_sec"] == "event" and got["window_align"] is None
+        assert label_windows(self.cols(a="grid", b="grid"))["window_sec"] == "grid"
+
+    def test_unlabelled_or_windowless_members_fall_back(self):
+        from psytwill.space import label_windows
+
+        assert label_windows(None) is None
+        assert label_windows(self.cols(a=None, b=None)) is None
+
+    def test_a_partly_declared_member_is_undeclared(self):
+        from psytwill.space import label_windows
+
+        got = label_windows(self.cols(a="grid", b=None))
+        assert got["window_source"] == "undeclared" and got["window_undeclared_columns"] == ["b"]
+
+    def test_labels_must_agree_with_the_model_level_declaration(self):
+        from psytwill.space import label_windows
+
+        assert label_windows(self.cols(a=3.0, b=3.0), {"window_sec": 3.0, "window_source": "battery"})
+        assert label_windows(self.cols(a="grid"), {"window_sec": "grid", "window_source": "battery"})
+        with pytest.raises(SpaceError, match="contradict the battery window_sec grid"):
+            label_windows(self.cols(a="grid", b=2.0), {"window_sec": "grid", "window_source": "battery"})
+        with pytest.raises(SpaceError, match="contradict the sidecar window_sec 10.0"):
+            label_windows(self.cols(a=2.0), {"window_sec": 10.0, "window_source": "sidecar"})

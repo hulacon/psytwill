@@ -953,8 +953,12 @@ def _run_space_fit(args: argparse.Namespace) -> None:
 
     fit.manifest["member_sources"] = {m: member_source(m)[0] for m in members
                                       if member_source(m)[1] is not None}
+    from psytwill.space import label_windows
+
     for m, w in windows.items():
-        fit.manifest["per_member"][m].update(w)
+        pm = fit.manifest["per_member"][m]
+        lw = label_windows(pm.get("labels"), w)
+        pm.update(lw if lw is not None else w)
     fit.manifest["inputs"] = [str(p) for p in args.features]
     fit.manifest["key"] = args.key
     fit.manifest["window"] = args.window

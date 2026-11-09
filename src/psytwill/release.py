@@ -46,7 +46,11 @@ from psytwill.relate import RelationFit, load_relation, sha256_file
 #: release) of the per-column Contract B 1.2 labels table of every pinned block
 #: and its BIDS-style column dictionary, written by :func:`write_release` when
 #: any block recorded labels (space schema >= 1.16).
-RELEASE_SCHEMA_VERSION = "1.3"
+#: 1.4: `member_windows` values may be "grid" or "event" as well as seconds
+#: (Contract B 1.4 window labels, space schema 1.17). A time-keyed block whose
+#: member is undeclared -- including a 1.14-1.16 manifest's registry entry with
+#: no pin, which those schemas recorded as "battery" with null -- is refused.
+RELEASE_SCHEMA_VERSION = "1.4"
 #: Block / relation manifest fields that name an exclusion file.
 EXCLUSION_FIELDS = ("exclude_ids_file", "exclude_rows_file")
 
@@ -88,8 +92,11 @@ def member_windows(meta: dict) -> dict | None:
     for m in meta["members"]:
         pm = meta["per_member"][m]
         w, src = pm.get("window_sec"), pm.get("window_source", "undeclared")
-        if timed and src == "undeclared":
-            bad.append(f"{m}: no window declared (neither its producer's sidecar nor the battery registry)")
+        if timed and (src == "undeclared" or w is None):
+            cols = pm.get("window_undeclared_columns") or []
+            what = (f"{len(cols)} column(s) without a window label, e.g. {cols[0]}" if cols else
+                    "no window declared (no Contract B 1.4 window labels, no producer window_sec, no registry pin)")
+            bad.append(f"{m}: {what}")
         if not timed and w is not None:
             bad.append(f"{m}: window_sec {w} in a block keyed without time ({meta.get('key')})")
         out[m] = w
