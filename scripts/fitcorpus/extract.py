@@ -71,9 +71,22 @@ NSD_TOTAL = 73000
 
 # Block members by extractor (psytwill-space block basis, ratified
 # 2026-09-07). caption / transcribe are producers; diarize is a schema.
-V_MODELS = [m.model for m in BATTERY.values() if m.extractor == "viz2psy" and m.model != "caption"]
+# Text-kind viz2psy models (caption, caption_vlm) are producers, never V
+# members: excluded by kind, so a new captioner cannot leak into stills.
+V_MODELS = [m.model for m in BATTERY.values() if m.extractor == "viz2psy" and m.kind != "text"]
 A_MODELS = [m.model for m in BATTERY.values() if m.extractor == "aud2psy"]
 L_MODELS = [m.model for m in BATTERY.values() if m.extractor == "word2psy"]
+
+# Frame captions from a prompted VLM (viz2psy caption_vlm; psytwill-space
+# 0.2.0 caption member, DECIDED 2026-11-05): video corpora only, scored as
+# text by the word2psy vlmcap_ source. Greedy bf16 captions differ across GPU
+# types (~12 % of frames reword between two H100s, ~34 % A100 vs H100;
+# mmmdata-agents log 2026-11-09), so a caption_vlm cell runs only on a GPU
+# whose name contains CAPTION_VLM_GPU ($CAPTION_VLM_GPU overrides; "" turns
+# the check off), at the batch size the reference run used.
+CAPTION_VLM = "caption_vlm"
+CAPTION_VLM_GPU = os.environ.get("CAPTION_VLM_GPU", "H100")
+VIZ_BATCH = {CAPTION_VLM: 32}  # every other viz2psy model: 64
 
 # aud2psy models that consume another cell's table (no second inference pass).
 # egemaps / speech_emotion read diarize's turns for their speech gate
@@ -241,6 +254,21 @@ def _cneuromod_transcript_units(corpus: str) -> list[Unit]:
     return out
 
 
+def _cneuromod_vlmcap_units(corpus: str) -> list[Unit]:
+    """word2psy over each segment's caption_vlm table (frames source output)."""
+    out = []
+    for p in _cneuromod_media(corpus):
+        native = _cneuromod_native(corpus, p)
+        d = ROOTS.durable / corpus / "features" / native
+        out.append(Unit(
+            id=native,
+            out_dir=d,
+            inputs=[str(d / f"{CAPTION_VLM}.csv")],
+            extra=["--text-column", f"{CAPTION_VLM}_text", "--id-column", "stimulus_id"],
+        ))
+    return out
+
+
 # Corpora staged by stage.py into one wav per unit (`<corpus>/inputs/units.csv`).
 # Speech corpora with curated text ship their own transcript input (stage.py
 # writes it); narratives has none in ds002345, so its L input is the unit's
@@ -338,9 +366,16 @@ def build_sources() -> list[Source]:
     ))
     for corpus in ("movie10", "friends"):
         S.append(Source(
-            corpus, "frames", "viz2psy", "", V_MODELS,
-            f"staged CNeuroMod {corpus} segments, frames every {GRID_HOP} s",
+            corpus, "frames", "viz2psy", "", V_MODELS + [CAPTION_VLM],
+            f"staged CNeuroMod {corpus} segments, frames every {GRID_HOP} s "
+            f"({CAPTION_VLM} only on {CAPTION_VLM_GPU or 'any GPU'})",
             lambda c=corpus: _cneuromod_units(c),
+        ))
+        S.append(Source(
+            corpus, "vlmcap", "word2psy", "vlmcap_", L_MODELS,
+            f"{CAPTION_VLM} frame captions of {corpus}, scored as text",
+            lambda c=corpus: _cneuromod_vlmcap_units(c),
+            depends=f"{corpus}/frames/{CAPTION_VLM}",
         ))
         S.append(Source(
             corpus, "audio", "aud2psy", "", _ordered_audio(),
@@ -439,7 +474,7 @@ def command_for(src: Source, unit: Unit, model: str) -> list[str]:
     stem = stem_for(src, unit, model)
     if src.package == "viz2psy":
         cmd = [PY, "-m", "viz2psy.cli", model, *unit.inputs,
-               "-o", str(stem), "--batch-size", "64", "--no-viz", "--quiet"]
+               "-o", str(stem), "--batch-size", str(VIZ_BATCH.get(model, 64)), "--no-viz", "--quiet"]
         if src.source == "frames":
             cmd += ["--frame-interval", str(GRID_HOP), "--no-save-frames"]
         if is_video_cell(src, unit):
@@ -591,10 +626,36 @@ def _ensure_transcript_input(corpus: str, unit: Unit, force: bool = False) -> bo
     return True
 
 
+def gpu_names() -> list[str]:
+    """Names of the GPUs this process can see (nvidia-smi; [] when there is none)."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [n.strip() for n in r.stdout.splitlines() if n.strip()] if r.returncode == 0 else []
+
+
+def caption_vlm_gpu_problem(models: set[str], names: list[str], want: str = CAPTION_VLM_GPU) -> str | None:
+    """Why caption_vlm cells may not run on these GPUs, or None when they may."""
+    if CAPTION_VLM not in models or not want:
+        return None
+    if names and all(want in n for n in names):
+        return None
+    return (f"{CAPTION_VLM} cells must run on {want} GPUs (captions differ across GPU types); "
+            f"this job sees {names or 'no GPU'}. Submit them on {want} nodes, run the rest with "
+            f"--skip-model {CAPTION_VLM}, or set CAPTION_VLM_GPU to override.")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cells = _filtered(args)
     todo = [(s, u, m) for s, u, m in cells if args.redo or not is_done(stem_for(s, u, m), s, u)]
     print(f"{len(cells)} cells matched: {len(todo)} to run, {len(cells) - len(todo)} already done")
+    if not args.dry_run:
+        problem = caption_vlm_gpu_problem({m for _, _, m in todo}, gpu_names())
+        if problem:
+            print(f"ERROR: {problem}", file=sys.stderr)
+            return 2
     n_ok = n_fail = 0
     failures: list[str] = []
     for i, (src, unit, model) in enumerate(todo, 1):

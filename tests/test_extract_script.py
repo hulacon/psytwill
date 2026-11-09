@@ -98,3 +98,50 @@ def test_cneuromod_media_comes_from_the_media_root(tmp_path, monkeypatch):
     (d / "bourne01.mkv").write_bytes(b"x")
     got = extract._cneuromod_media("movie10")
     assert got == [d / "bourne01.mkv"]
+
+
+# ---- caption_vlm wiring (psytwill-space 0.2.0 caption member) ----------------
+
+def _models_by_source():
+    return {s.key: s.models for s in extract.build_sources()}
+
+
+def test_text_kind_viz2psy_models_never_enter_V():
+    assert "caption" not in extract.V_MODELS and "caption_vlm" not in extract.V_MODELS
+
+
+def test_caption_vlm_runs_on_video_corpora_only():
+    by = _models_by_source()
+    with_vlm = sorted(k for k, models in by.items() if "caption_vlm" in models)
+    assert with_vlm == ["friends/frames", "movie10/frames"]
+    assert "caption_vlm" not in by["nsd/image"] and "caption_vlm" not in by["avcaps/frames"]
+
+
+def test_vlmcap_sources_score_the_caption_vlm_tables_as_text():
+    srcs = {s.key: s for s in extract.build_sources()}
+    for corpus in ("movie10", "friends"):
+        s = srcs[f"{corpus}/vlmcap"]
+        assert (s.package, s.prefix, s.depends) == ("word2psy", "vlmcap_", f"{corpus}/frames/caption_vlm")
+        assert s.models == extract.L_MODELS
+
+
+def test_caption_vlm_batch_size_is_the_reference_runs(tmp_path):
+    src = extract.Source("c", "image", "viz2psy", "", ["clip", "caption_vlm"], "synthetic", lambda: [])
+    unit = extract.Unit(id="u", out_dir=tmp_path, inputs=[str(tmp_path / "a.png")])
+
+    def batch(model):
+        cmd = extract.command_for(src, unit, model)
+        return cmd[cmd.index("--batch-size") + 1]
+    assert (batch("caption_vlm"), batch("clip")) == ("32", "64")
+
+
+def test_caption_vlm_gpu_guard():
+    problem = extract.caption_vlm_gpu_problem
+    h100, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA A100 80GB PCIe"
+    assert problem({"clip"}, []) is None                       # no caption_vlm cell: no check
+    assert problem({"caption_vlm"}, [h100], "H100") is None
+    assert problem({"caption_vlm"}, [h100], "") is None        # override off
+    msg = problem({"caption_vlm", "clip"}, [a100], "H100")
+    assert "--skip-model caption_vlm" in msg and "A100" in msg
+    assert "no GPU" in problem({"caption_vlm"}, [], "H100")
+    assert problem({"caption_vlm"}, [h100, a100], "H100")      # every visible GPU must match

@@ -3,6 +3,32 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.53.0 — 2026-11-09
+
+Minor bump: battery 0.3 admits viz2psy 0.18.0's `caption_vlm`; the fit-corpus
+extractor runs it on video corpora and scores its text.
+
+### Added
+- **Battery 0.3** (clamped 2026-11-09 against viz2psy 0.18.0): `caption_vlm`,
+  a text-kind producer like `caption` (column `caption_vlm_text`, string;
+  checkpoint `Qwen/Qwen3-VL-8B-Instruct@<revision>`). Nested-prefix exception
+  `(caption_vlm, caption)`, resolved by the longest-match rule. Text-kind
+  models never enter a block basis, so no fit changes.
+- **`scripts/fitcorpus/extract.py`:** `caption_vlm` joins the movie10 and
+  friends `frames` sources, and a new word2psy `vlmcap` source (prefix
+  `vlmcap_`, every L model) scores each segment's `caption_vlm.csv`.
+  `caption_vlm` runs at `--batch-size 32` (the reference run's), every other
+  viz2psy model at 64.
+- **GPU guard:** `run` refuses, before any cell, a selection holding
+  `caption_vlm` cells unless every visible GPU's name contains
+  `$CAPTION_VLM_GPU` (default `H100`; empty turns it off). Greedy bf16
+  captions differ across GPU types, so one campaign uses one type. The error
+  names the fix (`--skip-model caption_vlm`).
+
+### Changed
+- `V_MODELS` excludes viz2psy models by kind (`text`) instead of by the name
+  `caption`, so no captioner can reach NSD stills or AVCaps frames.
+
 ## 0.52.0 — 2026-11-08
 
 Minor bump: read-time window handling for time-keyed tables, driven by the

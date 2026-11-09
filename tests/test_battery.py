@@ -26,8 +26,8 @@ class TestPins:
         by = {}
         for m in BATTERY.values():
             by[m.extractor] = by.get(m.extractor, 0) + 1
-        assert by == {"viz2psy": 15, "aud2psy": 20, "word2psy": 13}
-        assert len(BATTERY) == 48
+        assert by == {"viz2psy": 16, "aud2psy": 20, "word2psy": 13}
+        assert len(BATTERY) == 49
 
     def test_every_learned_model_names_a_checkpoint(self):
         # §4.1: checkpoint REQUIRED for any model with learned weights. The
@@ -55,7 +55,7 @@ class TestPins:
 
     def test_prefixes_unique_and_nesting_documented(self):
         prefixes = [p for m in BATTERY.values() for p in m.prefixes]
-        assert len(prefixes) == len(set(prefixes)) == 49
+        assert len(prefixes) == len(set(prefixes)) == 50
         nested = {
             (c, p) for c in prefixes for p in prefixes
             if c != p and c.startswith(p + "_")
@@ -81,7 +81,7 @@ class TestPins:
 
     def test_records_export(self):
         rows = to_records()
-        assert len(rows) == 48
+        assert len(rows) == 49
         assert rows[0]["extractor"] == "viz2psy"
         assert all(r["battery_version"] == BATTERY_VERSION for r in rows)
         assert all(r["extractor_version"] == EXTRACTOR_VERSIONS[r["extractor"]] for r in rows)
@@ -185,7 +185,7 @@ class TestCli:
         assert "clip_text" in text and BATTERY_VERSION in text
         assert main(["battery", "--json"]) == 0
         rows = json.loads(capsys.readouterr().out)
-        assert len(rows) == 48
+        assert len(rows) == 49
 
     def test_check_files(self, tmp_path, capsys):
         good = tmp_path / "clip.meta.json"
