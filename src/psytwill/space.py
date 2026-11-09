@@ -253,7 +253,11 @@ def split_members(models: Sequence[str]) -> list[str]:
 # "labels". A registry entry with no pin now resolves to "undeclared" (before
 # 1.17 it read "battery" with window_sec null, which a release took as "no
 # window"); the registry pins "grid" explicitly where every column is.
-SPACE_SCHEMA_VERSION = "1.17"
+# 1.18: item masks (:mod:`psytwill.windows`). Top-level `item_masks` ({hop,
+# segments_units_per_table: {table: n units | null}}); per member
+# `item_masked_rows`, the rows it is absent from because a column it kept read
+# a window across two items of a packed unit. Rows are never dropped for it.
+SPACE_SCHEMA_VERSION = "1.18"
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
@@ -1187,7 +1191,7 @@ class BlockFit:
     manifest: dict = field(default_factory=dict)
 
     def project(self, spaces: dict[str, SpaceMatrix], view: str = "covariance",
-                k: int | None = None) -> tuple[np.ndarray, list[str]]:
+                k: int | None = None, absent: dict[str, set] | None = None) -> tuple[np.ndarray, list[str]]:
         """Block scores for every aligned row the block can place.
 
         ``view`` (see :func:`block_view`): "covariance" keeps each component's
@@ -1204,10 +1208,23 @@ class BlockFit:
         members cannot determine ``k`` directions is unplaced; both are left
         out rather than filled, and the returned labels say which rows were
         scored.
+
+        ``absent`` ({member: row labels}) makes a member absent from those rows
+        (item masks and the causal shift, :mod:`psytwill.windows`); its NaN
+        there never counts as an `undefinable` drop.
         """
         picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
         aligned, labels = align_spaces(picked)
-        aligned, labels, _ = _drop_undefinable(self, aligned, labels)
+        aligned, labels, _ = _drop_undefinable(self, aligned, labels, absent)
+        for m, rows in (absent or {}).items():
+            if m in aligned and rows:
+                hit = np.array([lab in rows for lab in labels])
+                if hit.any():
+                    X = np.array(aligned[m].X, dtype=float, copy=True)
+                    X[hit] = np.nan
+                    aligned[m] = SpaceMatrix(name=aligned[m].name, labels=list(aligned[m].labels), X=X,
+                                             features=list(aligned[m].features), modality=aligned[m].modality,
+                                             extractor=aligned[m].extractor, n_replicates=aligned[m].n_replicates)
         k = self.k if k is None else int(k)
         if not 1 <= k <= self.k:
             raise SpaceError(f"k {k} is outside this block's 1..{self.k}; a projection can only drop components")
@@ -1237,10 +1254,14 @@ def block_view(S: np.ndarray, block_eigenvalues: np.ndarray, view: str = "covari
     return S / np.sqrt(lam)
 
 
-def _drop_undefinable(fit: "BlockFit", aligned: dict[str, SpaceMatrix], labels: list[str]):
+def _drop_undefinable(fit: "BlockFit", aligned: dict[str, SpaceMatrix], labels: list[str],
+                      absent: dict[str, set] | None = None):
     kinds = {m: {f: "undefinable" for f in fit.map.whiteners[m].undefinable} for m in fit.members}
     drop = np.zeros(len(labels), dtype=bool)
-    for mask in undefinable_rows(aligned, kinds).values():
+    for m, mask in undefinable_rows(aligned, kinds).items():
+        rows = (absent or {}).get(m)
+        if rows:  # a member made absent on a row does not drop it
+            mask = mask & ~np.array([lab in rows for lab in labels])
         drop |= mask
     if not drop.any():
         return aligned, labels, drop
@@ -1364,6 +1385,7 @@ def fit_block(
     checkpoints: dict[str, str | None] | None = None,
     select: str | Sequence[str] | None = None,
     label_sources: dict[str, Sequence[str]] | None = None,
+    absent: dict[str, dict[str, set]] | None = None,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
@@ -1539,6 +1561,26 @@ def fit_block(
         aligned[m], dropped = drop_low_support(aligned[m], min_support)
         if dropped:
             low_support[m] = dropped
+    # 3c. item masks (Contract B 1.4 windows; :mod:`psytwill.windows`): a member is
+    #     absent from a row where a column it still has read a window across
+    #     two items. Applied after the undefinable drop, so a mask never drops
+    #     the row for the other members, and after the column drops, so a
+    #     column no longer in the member cannot mask it.
+    item_masked: dict[str, int] = {}
+    for m, by_col in (absent or {}).items():
+        if m not in aligned:
+            continue
+        rows = set().union(*(r for c, r in by_col.items() if c in aligned[m].features)) if by_col else set()
+        if not rows:
+            continue
+        hit = np.array([lab in rows for lab in labels])
+        if hit.any():
+            X = np.array(aligned[m].X, dtype=float, copy=True)
+            X[hit] = np.nan
+            aligned[m] = SpaceMatrix(name=aligned[m].name, labels=list(aligned[m].labels), X=X,
+                                     features=list(aligned[m].features), modality=aligned[m].modality,
+                                     extractor=aligned[m].extractor, n_replicates=aligned[m].n_replicates)
+            item_masked[m] = int(hit.sum())
     present = {m: member_present(aligned[m]) for m in every}
     n = len(labels)
     if n < 3 * n_splits:
@@ -1764,6 +1806,7 @@ def fit_block(
             "rows_present": int(present[m].sum()),
             "nulls_declared": nulls.get(m) is not None,
             "undefinable_rows_dropped": undefinable_dropped.get(m, 0),
+            "item_masked_rows": item_masked.get(m, 0),
             "declared_never_null": declared_never_null.get(m, []),
             "suspected_gated_missing": suspected_gated.get(m, []),
             "labelled": lp.resolved.get(m) is not None,

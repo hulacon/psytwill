@@ -807,6 +807,18 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
             continue
         print(f"  ok   {label}: {summary['rows']:,} rows, {summary['n_stimuli']:,} stimuli, "
               f"{len(summary['models'])} models, {out.stat().st_size/1e6:.0f} MB, {time.time() - t0:.0f}s", flush=True)
+        # packed short-file corpora: record the staging layout so fits mask rows whose
+        # window reads two items (psytwill.windows); continuous corpora have no tables
+        inputs = ROOTS.durable / key[0] / "inputs"
+        if any(inputs.glob("*_segments.csv")):
+            from psytwill.exceptions import InputError
+            from psytwill.windows import record_table_segments
+
+            try:
+                rec = record_table_segments(out, inputs)
+                print(f"       segments: {len(rec['files'])} unit(s) recorded from {inputs}", flush=True)
+            except InputError as exc:  # a table keyed on other ids (e.g. a captions group)
+                print(f"       segments: none recorded ({exc})", flush=True)
     print(f"\n{len(todo) - n_fail}/{len(todo)} group(s) built")
     return 1 if n_fail else 0
 

@@ -3,6 +3,38 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.52.0 — 2026-11-08
+
+Minor bump: read-time window handling for time-keyed tables, driven by the
+Contract B 1.4 window labels (0.51.0). Space schema 1.17 → 1.18.
+
+### Added
+- **Item masks.** Packed short-file corpora concatenate items with a silence
+  gap (`staging`), so a windowed column's value near an item boundary was
+  computed over two unrelated items. `space fit` and `space project` now make
+  the member **absent** from a row where a column it kept read a window
+  across two groups of the unit's segments table: the "absent unless
+  complete" path, never a fill and never a row drop for the other members.
+  A deselected column cannot mask its member. Per member
+  `item_masked_rows`; top-level `item_masks`.
+- **Segments record.** `psytwill features --segments-dir DIR` (at build) and
+  `--refresh-segments DIR` (JSON only) record the staging `*_segments.csv`
+  tables a features table was extracted against, each with its sha256, keyed
+  by the `stimulus_id` inside the file. A missing or changed table refuses
+  the read. `scripts/fitcorpus/extract.py aggregate` records them for every
+  packed corpus. A table with no record is read as one item per clip, and
+  the manifest says which tables had none.
+- **`space project --causal`.** Each centred windowed column is shifted
+  later by half its window (rounded to the grid; the rounding is recorded),
+  so a row's value reads only input up to the row's end. The first
+  half-window of each clip has no value: the member is absent there. A value
+  whose source row was item-masked stays masked where it lands. Refuses a
+  fit without window labels. The projection sidecar records `causal`,
+  `window_reads` (shifts, item-masked and absent rows per member) and the
+  segments per table.
+- `BlockFit.project(..., absent=)` and `fit_block(..., absent=)`; a member
+  made absent on a row never triggers that row's `undefinable` drop.
+
 ## 0.51.0 — 2026-11-08
 
 Minor bump: Contract B 1.4 window labels on the consumer side (aud2psy

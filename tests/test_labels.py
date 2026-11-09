@@ -190,7 +190,7 @@ def labelled_table(tmp_path):
 
 def test_bookkeeping_is_never_swept_in_and_probes_are_flagged_circular(labelled_table, tmp_path, capsys):
     manifest, _ = _fit(tmp_path, labelled_table, "V_all")
-    assert manifest["space_schema_version"] == "1.17"
+    assert manifest["space_schema_version"] == "1.18"
     aes = manifest["per_member"]["aesthetics"]
     assert aes["bookkeeping_columns"] == ["aesthetics_n_crops"]
     assert "aesthetics_n_crops" not in manifest["member_features"]["aesthetics"]
