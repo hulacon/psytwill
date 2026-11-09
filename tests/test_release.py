@@ -118,16 +118,34 @@ def _new_block(tmp_path, block, key, windows, **extra):
 
 
 def test_member_windows_are_recorded_and_checked(tmp_path):
-    ok = _new_block(tmp_path, "A", "stimulus_id,time", {"clap": (10.0, "battery"), "pitch": (None, "battery")})
+    ok = _new_block(tmp_path, "A", "stimulus_id,time",
+                    {"clap": (10.0, "battery"), "pitch": ("grid", "battery"), "conv": ("event", "labels")})
     rel = build_release(name="sp", version="0.2.0", blocks=[ok])
-    assert rel["release_schema_version"] == "1.3"
-    assert rel["blocks"]["A"]["member_windows"] == {"clap": 10.0, "pitch": None}
+    assert rel["release_schema_version"] == "1.4"
+    assert rel["blocks"]["A"]["member_windows"] == {"clap": 10.0, "pitch": "grid", "conv": "event"}
     bad = _new_block(tmp_path, "B", "stimulus_id,time", {"x": (None, "undeclared")})
     with pytest.raises(SpaceError, match="x: no window declared"):
         build_release(name="sp", version="0.2.0", blocks=[bad])
     untimed = _new_block(tmp_path, "C", "stimulus_id", {"x": (2.0, "sidecar"), "y": (None, "undeclared")})
     with pytest.raises(SpaceError, match="keyed without time"):
         build_release(name="sp", version="0.2.0", blocks=[untimed])
+
+
+def test_an_unpinned_battery_window_is_not_read_as_no_window(tmp_path):
+    """Contract B 1.4: 1.14-1.16 manifests wrote ("battery", null) for a registry entry with no pin
+    (tonal, rhythm, psychoacoustic); that is undeclared, not "grid"."""
+    old = _new_block(tmp_path, "A", "stimulus_id,time", {"tonal": (None, "battery")})
+    with pytest.raises(SpaceError, match="tonal: no window declared"):
+        build_release(name="sp", version="0.2.0", blocks=[old])
+
+
+def test_a_partly_labelled_member_names_its_undeclared_columns(tmp_path):
+    bad = _new_block(tmp_path, "A", "stimulus_id,time", {"rhythm": (None, "undeclared")})
+    meta = json.loads(bad.read_text())
+    meta["per_member"]["rhythm"]["window_undeclared_columns"] = ["rhythm_novelty"]
+    bad.write_text(json.dumps(meta))
+    with pytest.raises(SpaceError, match="rhythm: 1 column.*rhythm_novelty"):
+        build_release(name="sp", version="0.2.0", blocks=[bad])
 
 
 def test_a_block_before_schema_1_14_is_recorded_as_undeclared(fitted):
@@ -143,7 +161,7 @@ def test_exclusion_lists_must_live_under_the_data_root(tmp_path):
     outside = tmp_path / "repo" / "ids.txt"
     outside.parent.mkdir()
     outside.write_text("ext-t-000\n")
-    w = {"pitch": (None, "battery")}
+    w = {"pitch": ("grid", "battery")}
     good = _new_block(tmp_path, "A", "stimulus_id,time", w, exclude_ids_file=str(inside))
     with pytest.raises(SpaceError, match="give the release a data root"):
         build_release(name="sp", version="0.2.0", blocks=[good])
@@ -165,7 +183,7 @@ def test_cli_write_takes_a_data_root(tmp_path, capsys):
     root.mkdir()
     ids = root / "ids.txt"
     ids.write_text("ext-t-000\n")
-    m = _new_block(tmp_path, "A", "stimulus_id,time", {"pitch": (None, "battery")}, exclude_ids_file=str(ids))
+    m = _new_block(tmp_path, "A", "stimulus_id,time", {"pitch": ("grid", "battery")}, exclude_ids_file=str(ids))
     assert main(["space", "release", "write", "--name", "sp", "--version", "0.2.0", "--blocks", str(m),
                  "--data-root", str(root), "-o", str(tmp_path / "rel")]) == 0
     capsys.readouterr()

@@ -190,7 +190,7 @@ def labelled_table(tmp_path):
 
 def test_bookkeeping_is_never_swept_in_and_probes_are_flagged_circular(labelled_table, tmp_path, capsys):
     manifest, _ = _fit(tmp_path, labelled_table, "V_all")
-    assert manifest["space_schema_version"] == "1.16"
+    assert manifest["space_schema_version"] == "1.17"
     aes = manifest["per_member"]["aesthetics"]
     assert aes["bookkeeping_columns"] == ["aesthetics_n_crops"]
     assert "aesthetics_n_crops" not in manifest["member_features"]["aesthetics"]
@@ -318,7 +318,7 @@ def test_release_write_emits_labels_beside_it(labelled_table, tmp_path):
             "--blocks", str(out / "V_rel.json"), "-o", str(rel_dir)]
     assert main(argv) == 0
     rel = json.loads((rel_dir / "demo_0.1.0.json").read_text())
-    assert rel["release_schema_version"] == "1.3"
+    assert rel["release_schema_version"] == "1.4"
     assert rel["labels"] == {"table": "demo_0.1.0_labels.csv", "columns": "demo_0.1.0_labels.columns.json"}
     table = pd.read_csv(rel_dir / rel["labels"]["table"])
     assert set(table["block"]) == {"V"}
@@ -384,3 +384,76 @@ def test_inventory_matcher_none_without_inventory():
     from psytwill.labels import inventory_matcher
 
     assert inventory_matcher({"checkpoint": "x"}) is None
+
+
+# --- Contract B 1.4 window labels ---------------------------
+
+
+def _windowed_models():
+    """The labelled fixture with window labels: llstat_contrast reads 3 s, everything else its grid step."""
+    models = labelled_models()
+    for m in models.values():
+        m["labels"]["default"]["window_sec"] = "grid"
+    models["llstat"]["labels"]["columns"]["llstat_contrast"] = {"window_sec": 3.0, "window_align": "centred"}
+    return models
+
+
+@pytest.mark.parametrize("mutate, match", [
+    (lambda m: m["llstat"]["labels"]["default"].update(window_sec="soon"), "window_sec='soon'"),
+    (lambda m: m["llstat"]["labels"]["default"].update(window_sec=-1.0), "window_sec=-1.0"),
+    (lambda m: m["llstat"]["labels"]["columns"]["llstat_contrast"].pop("window_align"), "requires `window_align`"),
+    (lambda m: m["clip"]["labels"]["default"].update(window_align="centred"), "only allowed with a numeric"),
+    (lambda m: m["llstat"]["labels"]["columns"]["llstat_contrast"].update(window_align="sideways"),
+     "window_align='sideways'"),
+])
+def test_malformed_window_labels_fail_loudly(tmp_path, mutate, match):
+    models = _windowed_models()
+    mutate(models)
+    csv = labelled_fixture(tmp_path, models=models)
+    with pytest.raises(InputError, match=match):
+        build_features([csv], tmp_path / "f.parquet")
+
+
+def test_a_window_difference_refuses_the_stack(tmp_path):
+    """Declared vs undeclared windows are a structural difference: refresh every input first."""
+    a = labelled_fixture(tmp_path, name="a.csv", models=_windowed_models())
+    b = labelled_fixture(tmp_path, name="b.csv", ids=[f"other{i:03d}" for i in range(60)])
+    with pytest.raises(SpaceError, match=r"`labels` mismatch for model '\w+'.*window_sec"):
+        build_features([a, b], tmp_path / "f.parquet")
+
+
+def test_select_grammar_window_bounds():
+    c = parse_select("window_sec<=0.5")
+    assert select_text(c) == "window_sec<=0.5" and parse_select(select_text(c)) == c
+    assert select_text(parse_select("window_sec=10,event,grid")) == "window_sec=grid,event,10"
+    for bad, match in (("window_sec<=grid", "one number"), ("window_sec<=-2", "> 0 s"),
+                       ("interpretability<=1", "only window_sec"), ("window_sec=soon", "not seconds")):
+        with pytest.raises(SpaceError, match=match):
+            parse_select(bad)
+    le, ev = parse_select("window_sec<=0.5")[0], parse_select("window_sec=event")[0]
+    assert [le.admits({"window_sec": w}) for w in ("grid", 0.5, 3.0, "event")] == [True, True, False, False]
+    assert not le.admits({})  # undeclared never passes a window clause
+    assert [ev.admits({"window_sec": w}) for w in ("event", "grid", 3.0)] == [True, False, False]
+
+
+def test_select_by_window_and_the_member_summary(tmp_path):
+    table = _features(tmp_path, [labelled_fixture(tmp_path, models=_windowed_models())])
+    manifest, _ = _fit(tmp_path, table, "V_win")
+    ll = manifest["per_member"]["llstat"]
+    assert ll["window_sec"] == 3.0 and ll["window_align"] == "centred" and ll["window_source"] == "labels"
+    assert ll["window_columns"] == {"grid": 4, "event": 0, "windowed": 1}
+    assert manifest["per_member"]["clip"]["window_sec"] == "grid"
+    manifest, _ = _fit(tmp_path, table, "V_clean", "--select", "window_sec<=0.5")
+    assert "llstat_contrast" not in manifest["member_features"]["llstat"]
+    assert manifest["per_member"]["llstat"]["deselected_columns"] == ["llstat_contrast"]
+    assert manifest["per_member"]["llstat"]["window_sec"] == "grid"
+
+
+def test_a_window_selection_refuses_columns_without_window_labels(labelled_table, tmp_path, capsys):
+    argv = ["space", "fit", "--features", str(labelled_table), "--block", "V", "--members",
+            "clip,aesthetics,llstat", "-o", str(tmp_path / "space"), "--stem", "V_nowin", *FAST,
+            "--select", "window_sec<=0.5"]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert "reads window_sec, and these columns declare none" in err and "aud2psy >= 0.22.0" in err
+    assert not (tmp_path / "space" / "V_nowin.json").exists()

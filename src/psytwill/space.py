@@ -56,7 +56,8 @@ from psytwill.compare import (
     ridge_predictivity,
 )
 from psytwill.exceptions import SpaceError
-from psytwill.labels import BOOKKEEPING, admits, circular_with, parse_select, resolve, select_text
+from psytwill.labels import (BOOKKEEPING, WINDOW_TOKENS, admits, circular_with, needs_windows, parse_select,
+                             resolve, select_text)
 from psytwill.store import SpaceMatrix, align_spaces
 
 DEFAULT_K_SCHEDULE: tuple[int, ...] = (8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256)
@@ -110,14 +111,16 @@ def member_source(member: str) -> tuple[str, tuple[str, ...] | None]:
 
 def resolve_member_windows(members: Sequence[str],
                            declared: dict[str, set[float]] | None = None) -> dict[str, dict]:
-    """``{member: {"window_sec", "window_source"}}`` -- the context window each
-    member's rows see (Contract B ``window_sec``; None = only its own grid step).
+    """``{member: {"window_sec", "window_source"}}`` from the model-level declarations.
 
-    From the producers' sidecars when the inputs declare it (``declared``,
-    model -> values, as :func:`psytwill.features.group_window_sec` reads
-    them), else from the battery registry, else "undeclared". Refused: inputs
-    declaring two windows for one model, or a declaration contradicting the
-    registry -- either way the member's rows do not see one window.
+    This is the pre-1.4 route, kept for inputs without window labels: the
+    producers' model-level ``window_sec`` (``declared``, model -> values, as
+    :func:`psytwill.features.group_window_sec` reads them), else the battery
+    registry's pin (seconds or ``"grid"``), else ``"undeclared"``. A registry
+    entry with no pin is undeclared, never "no window" (Contract B 1.4,
+    2026-11-08). Columns with Contract B 1.4 window labels supersede this
+    after the fit (:func:`label_windows`). Refused: inputs declaring two
+    windows for one model, or a declaration contradicting the registry.
     """
     from psytwill.battery import BATTERY
 
@@ -127,19 +130,67 @@ def resolve_member_windows(members: Sequence[str],
         model = member_source(m)[0]
         vals = declared.get(model, set())
         pinned = BATTERY.get(model)
+        pin = None if pinned is None else pinned.window_sec
         if len(vals) > 1:
             raise SpaceError(f"member {m!r}: its inputs declare windows {sorted(vals)} s for {model!r}; "
                              "a member's rows must all see one window")
         if vals:
             (w,) = vals
-            if pinned is not None and pinned.window_sec != w:
+            if pin is not None and pin != w:
                 raise SpaceError(f"member {m!r}: the inputs declare window_sec {w} for {model!r} but the "
-                                 f"battery registry pins {pinned.window_sec}; fix whichever is wrong")
+                                 f"battery registry pins {pin}; fix whichever is wrong")
             out[m] = {"window_sec": w, "window_source": "sidecar"}
-        elif pinned is not None:
-            out[m] = {"window_sec": pinned.window_sec, "window_source": "battery"}
+        elif pin is not None:
+            out[m] = {"window_sec": pin, "window_source": "battery"}
         else:
             out[m] = {"window_sec": None, "window_source": "undeclared"}
+    return out
+
+
+def label_windows(columns: dict[str, dict] | None, fallback: dict | None = None) -> dict | None:
+    """A member's window summary from its resolved per-column labels (Contract B 1.4).
+
+    ``columns`` is ``{column: resolved labels}`` for the columns that entered
+    the fit. Returns None when the member is unlabelled or no column carries
+    a window label (the caller keeps the model-level route). Otherwise:
+
+    - ``window_sec``: the member's longest window -- the largest number of
+      seconds if any column has one, else "event" if any column is
+      event-extent, else "grid";
+    - ``window_align``: the numeric columns' alignment ("mixed" if they differ);
+    - ``window_columns``: counts of grid / event / windowed columns;
+    - ``window_undeclared_columns``: columns with no window label (the member
+      is then ``window_source: "undeclared"``);
+    - ``window_source``: "labels" | "undeclared".
+
+    A model-level declaration in ``fallback`` (sidecar or registry) must agree
+    with the labels where both speak: a number equal to the shared number of
+    a member whose columns all have it, or "grid" for an all-grid member.
+    """
+    if not columns:
+        return None
+    wins = {c: e.get("window_sec") for c, e in columns.items()}
+    if all(w is None for w in wins.values()):
+        return None
+    undeclared = sorted(c for c, w in wins.items() if w is None)
+    nums = [float(w) for w in wins.values() if w is not None and w not in WINDOW_TOKENS]
+    n_event = sum(w == "event" for w in wins.values())
+    n_grid = sum(w == "grid" for w in wins.values())
+    aligns = {columns[c].get("window_align") for c, w in wins.items() if w is not None and w not in WINDOW_TOKENS}
+    longest = max(nums) if nums else ("event" if n_event else "grid")
+    out = {"window_sec": longest,
+           "window_align": (aligns.pop() if len(aligns) == 1 else "mixed") if nums else None,
+           "window_columns": {"grid": n_grid, "event": n_event, "windowed": len(nums)},
+           "window_undeclared_columns": undeclared,
+           "window_source": "undeclared" if undeclared else "labels"}
+    fb = (fallback or {}).get("window_sec")
+    if fb is not None and not undeclared:
+        shared = (longest if len(set(nums)) == 1 and len(nums) == len(wins) else
+                  "grid" if n_grid == len(wins) else None)
+        if shared is None or not (fb == shared or (not isinstance(fb, str) and not isinstance(shared, str)
+                                                    and abs(float(fb) - float(shared)) < 1e-9)):
+            raise SpaceError(f"window labels ({out['window_columns']}, longest {longest}) contradict the "
+                             f"{(fallback or {}).get('window_source')} window_sec {fb}; fix whichever is wrong")
     return out
 
 
@@ -195,7 +246,14 @@ def split_members(models: Sequence[str]) -> list[str]:
 # in), `deselected_columns` and `circular_with` ({column: [members whose
 # checkpoint the column is derived_from]}); per target `labelled` and
 # `bookkeeping_columns`. Older manifests load unchanged (no labels).
-SPACE_SCHEMA_VERSION = "1.16"
+# 1.17: Contract B 1.4 window labels. Per member
+# `window_sec` is the longest window over the columns in the fit (seconds,
+# "grid" or "event"), with `window_align`, `window_columns` ({grid, event,
+# windowed} counts) and `window_undeclared_columns`; `window_source` gains
+# "labels". A registry entry with no pin now resolves to "undeclared" (before
+# 1.17 it read "battery" with window_sec null, which a release took as "no
+# window"); the registry pins "grid" explicitly where every column is.
+SPACE_SCHEMA_VERSION = "1.17"
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
@@ -858,6 +916,19 @@ def apply_labels(spaces: dict[str, SpaceMatrix], members: Sequence[str], targets
                 f"--select {select_text(clauses)!r} needs labels, and member(s) {unl} have none (Contract B "
                 f"1.0/1.1 input). Tables to refresh -- {src}. Fix: `<extractor> sidecar refresh` the "
                 "producer sidecars, then `psytwill features --refresh-labels` those tables.")
+    if needs_windows(clauses):
+        lacking = {}
+        for m in members:
+            res = resolve(column_labels.get(m), spaces[m].features, model=m, where=f"member {m!r}") or {}
+            cols = [f for f, e in res.items() if e["derivation"] != BOOKKEEPING and "window_sec" not in e]
+            if cols:
+                lacking[m] = cols
+        if lacking:
+            shown = "; ".join(f"{m}: {len(c)} column(s), e.g. {c[0]}" for m, c in lacking.items())
+            raise SpaceError(
+                f"--select {select_text(clauses)!r} reads window_sec, and these columns declare none "
+                f"(Contract B < 1.4 input) -- {shown}. Fix: `<extractor> sidecar refresh` with an extractor "
+                "that declares windows (aud2psy >= 0.22.0), then `psytwill features --refresh-labels`.")
     out = LabelPass(spaces=dict(spaces), members=list(members), clauses=clauses)
     for m in list(members) + list(targets):
         sp = spaces[m]
