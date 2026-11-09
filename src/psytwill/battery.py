@@ -45,8 +45,10 @@ from psytwill.exceptions import BatteryError
 #: 0.2 (2026-10-15): places 416 -> 467 columns, re-clamped against viz2psy
 #: 0.13.0, whose Places365 label fix changed the inventory under an unchanged
 #: checkpoint string. A fit founded on battery 0.1 saw 314 scene columns.
-BATTERY_VERSION = "0.2"
-BATTERY_CLAMPED_ON = "2026-10-15"
+#: 0.3 (2026-11-09): caption_vlm admitted (viz2psy 0.18.0), a text-kind
+#: producer like caption; no block basis changes (text never enters V).
+BATTERY_VERSION = "0.3"
+BATTERY_CLAMPED_ON = "2026-11-09"
 
 #: Extractor versions the battery was clamped against. Outputs already in
 #: the mmmdata store span earlier versions of the same checkpoints (aud2psy
@@ -56,7 +58,7 @@ BATTERY_CLAMPED_ON = "2026-10-15"
 #: places, whose columns viz2psy 0.13.0 changed under the same checkpoint
 #: (battery 0.2): viz2psy stores older than 0.13.0 hold the 314-column form.
 EXTRACTOR_VERSIONS: dict[str, str] = {
-    "viz2psy": "0.13.0",  # 0.9.0 in battery 0.1; registry and checkpoints unchanged
+    "viz2psy": "0.18.0",  # 0.9.0 in battery 0.1, 0.13.0 in 0.2; 0.18.0 adds caption_vlm
     "aud2psy": "0.17.0",
     "word2psy": "0.9.0",
 }
@@ -71,6 +73,7 @@ NESTED_PREFIX_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset(
         ("ebind_audio", "ebind"),
         ("speech_emotion", "speech"),
         ("speech_rate", "speech"),
+        ("caption_vlm", "caption"),
     }
 )
 
@@ -120,12 +123,17 @@ _FASTTEXT = "crawl-300d-2M-subword"
 BATTERY: dict[str, BatteryModel] = {
     m.model: m
     for m in (
-        # ---- viz2psy 0.13.0 (15) ------------------------------------------
+        # ---- viz2psy 0.18.0 (16) ------------------------------------------
         _m("aesthetics", "viz2psy", "visual", "profile", 1,
            "ViT-L-14/openai+sac+logos+ava1-l14-linearMSE"),
         _m("caption", "viz2psy", "visual", "text", None,
            "Salesforce/blip-image-captioning-large",
            notes="caption_text (dtype string); the word2psy cap: source"),
+        _m("caption_vlm", "viz2psy", "visual", "text", None,
+           "Qwen/Qwen3-VL-8B-Instruct@0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+           notes="caption_vlm_text (dtype string), caption-prompt v1; video only, "
+                 "the word2psy vlmcap_ source. Greedy bf16 captions differ across GPU "
+                 "types: extract every cell on one (H100)"),
         _m("clip", "viz2psy", "visual", "embedding", 512, _CLIP),
         _m("depth", "viz2psy", "visual", "profile", 6,
            "depth-anything/Depth-Anything-V2-Small-hf",
