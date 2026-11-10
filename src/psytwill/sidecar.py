@@ -139,6 +139,9 @@ def model_checkpoint(sidecar: dict[str, Any] | None, space_name: str) -> str | N
 FRAMING_RULE_KEYS = ("stage0", "stage0_version", "framing_table_sha256")
 STILL_FRAME_SOURCE = "still image"
 UNDECLARED = "undeclared"
+#: viz2psy input types read from video: one file, or a video set (viz2psy
+#: >= 0.20.0, several files under one framing rule recorded once).
+VIDEO_INPUT_TYPES = ("video", "video_set")
 
 
 def input_framing_rule(sidecar: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -148,7 +151,8 @@ def input_framing_rule(sidecar: dict[str, Any] | None) -> dict[str, Any] | None:
       compared: stills have no bars and square pixels);
     * a video input written before stage 0 existed (no ``input.framing.stage0``):
       ``{"stage0": "undeclared"}``, so it cannot be mixed with a declared one;
-    * a video input with stage 0: ``frame_source`` + :data:`FRAMING_RULE_KEYS`;
+    * a video input with stage 0 (one file or a video set, whose rule is
+      recorded once): ``frame_source`` + :data:`FRAMING_RULE_KEYS`;
     * anything else (no ``input``, a non-visual extractor): ``None``.
     """
     inp = (sidecar or {}).get("input")
@@ -157,7 +161,7 @@ def input_framing_rule(sidecar: dict[str, Any] | None) -> dict[str, Any] | None:
     fr = inp.get("framing") if isinstance(inp.get("framing"), dict) else {}
     if fr.get("frame_source") == STILL_FRAME_SOURCE:
         return {"frame_source": STILL_FRAME_SOURCE}
-    if inp.get("type") != "video" and "stage0" not in fr:
+    if inp.get("type") not in VIDEO_INPUT_TYPES and "stage0" not in fr:
         return None
     if "stage0" not in fr:
         return {"frame_source": fr.get("frame_source"), "stage0": UNDECLARED}

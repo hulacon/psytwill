@@ -64,6 +64,9 @@ def test_rule_reader_kinds():
     assert input_framing_rule({"input": {"type": "image_folder", "framing": {"frame_source": "still image"}}}) == \
         {"frame_source": "still image"}
     assert input_framing_rule({"input": {"type": "image_folder"}}) is None
+    vs = {"input": {"type": "video_set", "framing": stage0(), "videos": [{"path": "/m/a.mp4"}]}}
+    assert input_framing_rule(vs) == input_framing_rule({"input": {"type": "video", "framing": stage0()}})
+    assert input_framing_rule({"input": {"type": "video_set"}})["stage0"] == "undeclared"
     assert input_framing_rule({}) is None
 
 
