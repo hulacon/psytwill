@@ -167,3 +167,75 @@ def test_caption_vlm_gpu_guard():
     assert "--skip-model caption_vlm" in msg and "A100" in msg
     assert "no GPU" in problem({"caption_vlm"}, [], "H100")
     assert problem({"caption_vlm"}, [h100, a100], "H100")      # every visible GPU must match
+
+
+# ---- AVCaps through the video path (viz2psy video sets) ------------------------
+
+def _avcaps_media(tmp_path, split, names):
+    d = tmp_path / "media" / "avcaps" / f"{split}_videos" / f"{split}_videos"
+    d.mkdir(parents=True, exist_ok=True)
+    for n in names:
+        (d / n).write_bytes(b"x")
+    return d
+
+
+def test_avcaps_video_units_are_whole_clips_per_split(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path), raising=False)
+    monkeypatch.setattr(extract, "AVCAPS_VIDEO_UNIT", 2)
+    tr = _avcaps_media(tmp_path, "train", ["30.mp4", "10.mp4", "20.mp4", "notes.txt"])
+    va = _avcaps_media(tmp_path, "val", ["40.mp4"])
+    units = extract._avcaps_video_units()
+    assert [u.id for u in units] == ["train-000", "train-001", "val-000"]
+    assert units[0].inputs == [str(tr / "10.mp4"), str(tr / "20.mp4")]
+    assert units[1].inputs == [str(tr / "30.mp4")] and units[2].inputs == [str(va / "40.mp4")]
+    assert units[0].extra == ["--id-pattern", "ext-avcaps-{stem}"]
+    assert units[0].out_dir == tmp_path / "durable" / "avcaps" / "features" / "video" / "train-000"
+
+
+def test_avcaps_clip_with_a_bad_native_id_fails(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path), raising=False)
+    _avcaps_media(tmp_path, "test", ["Bad_Name.mp4"])
+    with pytest.raises(Exception, match="native id"):
+        extract._avcaps_video_units()
+
+
+def test_avcaps_video_source_is_framed_and_keeps_the_stills_source():
+    srcs = {s.key: s for s in extract.build_sources()}
+    assert srcs["avcaps/video"].models == srcs["avcaps/frames"].models
+    assert "motion" not in srcs["avcaps/video"].models and "caption_vlm" not in srcs["avcaps/video"].models
+
+
+def test_video_set_cell_command(tmp_path, monkeypatch):
+    table = _table(tmp_path)
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, table), raising=False)
+    tr = _avcaps_media(tmp_path, "train", ["10.mp4", "20.mp4"])
+    src = {s.key: s for s in extract.build_sources()}["avcaps/video"]
+    unit = extract._avcaps_video_units()[0]
+    assert extract.is_video_cell(src, unit)
+    cmd = extract.command_for(src, unit, "clip")
+    assert cmd[cmd.index("clip") + 1: cmd.index("clip") + 3] == [str(tr / "10.mp4"), str(tr / "20.mp4")]
+    assert cmd[cmd.index("--framing-table") + 1] == str(table)
+    assert cmd[cmd.index("--frame-interval") + 1] == str(extract.GRID_HOP)
+    assert cmd[cmd.index("--id-pattern") + 1] == "ext-avcaps-{stem}"
+
+
+def test_video_set_done_only_for_exactly_its_clips(tmp_path, monkeypatch):
+    import json
+
+    sha = "new" * 8
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, _table(tmp_path, sha=sha)), raising=False)
+    monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
+    tr = _avcaps_media(tmp_path, "train", ["10.mp4", "20.mp4"])
+    src = {s.key: s for s in extract.build_sources()}["avcaps/video"]
+    unit = extract._avcaps_video_units()[0]
+    stem = extract.stem_for(src, unit, "clip")
+    stem.parent.mkdir(parents=True)
+    a, b = str((tr / "10.mp4").resolve()), str((tr / "20.mp4").resolve())
+    for listed, table_sha, want in [([a, b], sha, True), ([a], sha, False), ([b, a], sha, False),
+                                    ([a, b], "old" * 8, False)]:
+        side = {"input": {"type": "video_set", "framing": {"framing_table_sha256": table_sha},
+                          "videos": [{"path": p} for p in listed]}}
+        extract.sidecar_for(stem).write_text(json.dumps(side))
+        assert extract.is_done(stem, src, unit) is want

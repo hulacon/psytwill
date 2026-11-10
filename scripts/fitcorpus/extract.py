@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from psytwill.battery import BATTERY, check_sidecar
-from psytwill.fitcorpus import CORPORA, ext_id
+from psytwill.fitcorpus import CORPORA, EXT_PREFIX, ext_id
 
 PY = sys.executable
 GRID_HOP = 0.5  # shared frame grid, matching the mmmdata store
@@ -363,6 +363,46 @@ def _avcaps_frame_units() -> list[Unit]:
     return out
 
 
+# AVCaps through viz2psy's video path (psytwill-space 0.2.0, DECIDED 2026-11-09):
+# the framing table applies, unlike the PNG stills above, which bypass it. A
+# viz2psy video set (>= 0.20.0) scores many clips per call with each model
+# loaded once; batches never span clips, so clips of any size share a unit.
+# Units are whole clips of one split, AVCAPS_VIDEO_UNIT per call, in native-id
+# order; a cell is done only if its sidecar lists exactly the unit's clips.
+AVCAPS_SPLITS = ("train", "val", "test")
+AVCAPS_VIDEO_UNIT = 100  # clips per call (~50 s median -> ~10k frames)
+
+
+def _avcaps_media() -> dict[str, list[Path]]:
+    """AVCaps clips under ``<media root>/avcaps/<split>_videos/<split>_videos/``
+    (the layout `fetch.py avcaps` unpacks), spelled as found there (the
+    framing table's keys), sorted by native id."""
+    if ROOTS.media is None:
+        return {}
+    out = {}
+    for split in AVCAPS_SPLITS:
+        d = ROOTS.media / "avcaps" / f"{split}_videos" / f"{split}_videos"
+        if d.exists():
+            out[split] = sorted((p for p in d.iterdir()
+                                 if p.suffix.lower() in VIDEO_SUFFIXES and p.is_file()),
+                                key=lambda p: p.stem)
+    return out
+
+
+def _avcaps_video_units() -> list[Unit]:
+    out = []
+    for split, clips in _avcaps_media().items():
+        for k in range(0, len(clips), AVCAPS_VIDEO_UNIT):
+            chunk = clips[k:k + AVCAPS_VIDEO_UNIT]
+            for p in chunk:
+                ext_id("avcaps", p.stem)  # a clip whose name is not a native id fails here
+            uid = f"{split}-{k // AVCAPS_VIDEO_UNIT:03d}"
+            out.append(Unit(id=uid, out_dir=ROOTS.durable / "avcaps" / "features" / "video" / uid,
+                            inputs=[str(p) for p in chunk],
+                            extra=["--id-pattern", f"{EXT_PREFIX}avcaps-{{stem}}"]))
+    return out
+
+
 def _caption_shards(corpus: str, ctype: str) -> list[Path]:
     return sorted((ROOTS.durable / corpus / "inputs" / "captions").glob(f"{ctype}-*.csv"))
 
@@ -450,8 +490,16 @@ def build_sources() -> list[Source]:
     S.append(Source(
         "avcaps", "frames", "viz2psy", "", [m for m in V_MODELS if m != "motion"],
         f"AVCaps frames every {GRID_HOP} s via viz2psy's video sampler, staged as PNG and scored "
-        "as images ~1,000 per call (motion is video-only and belongs to D, not V)",
+        "as images ~1,000 per call (motion is video-only and belongs to D, not V); "
+        "0.1.0 / l-hub, unframed: superseded by avcaps/video",
         _avcaps_frame_units,
+    ))
+    S.append(Source(
+        "avcaps", "video", "viz2psy", "", [m for m in V_MODELS if m != "motion"],
+        f"AVCaps clips through viz2psy's video path, framing table applied, frames every "
+        f"{GRID_HOP} s, {AVCAPS_VIDEO_UNIT} clips per call (viz2psy >= 0.20.0 video sets; "
+        "motion left out as for the stills)",
+        _avcaps_video_units,
     ))
     return S
 
@@ -472,9 +520,10 @@ VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v"}
 
 
 def is_video_cell(src: Source, unit: Unit) -> bool:
-    """A viz2psy cell whose input is a video file (not staged PNG frames)."""
-    return (src.package == "viz2psy" and len(unit.inputs) == 1
-            and Path(unit.inputs[0]).suffix.lower() in VIDEO_SUFFIXES)
+    """A viz2psy cell whose inputs are video files (one, or a video set), not
+    staged PNG frames."""
+    return (src.package == "viz2psy" and bool(unit.inputs)
+            and all(Path(p).suffix.lower() in VIDEO_SUFFIXES for p in unit.inputs))
 
 
 def is_done(stem: Path, src: Source | None = None, unit: Unit | None = None) -> bool:
@@ -490,8 +539,13 @@ def is_done(stem: Path, src: Source | None = None, unit: Unit | None = None) -> 
     if check_sidecar(sidecar, source=str(meta)):
         return False
     if src is not None and unit is not None and is_video_cell(src, unit):
-        framing = (sidecar.get("input") or {}).get("framing") or {}
-        return framing.get("framing_table_sha256") == ROOTS.framing_sha256()
+        inp = sidecar.get("input") or {}
+        framing = inp.get("framing") or {}
+        if framing.get("framing_table_sha256") != ROOTS.framing_sha256():
+            return False
+        if len(unit.inputs) > 1:  # a video set: exactly this unit's clips, in order
+            listed = [v.get("path") for v in inp.get("videos") or []]
+            return listed == [str(Path(p).resolve()) for p in unit.inputs]
     return True
 
 
@@ -500,7 +554,7 @@ def command_for(src: Source, unit: Unit, model: str) -> list[str]:
     if src.package == "viz2psy":
         cmd = [PY, "-m", "viz2psy.cli", model, *unit.inputs,
                "-o", str(stem), "--batch-size", str(VIZ_BATCH.get(model, 64)), "--no-viz", "--quiet"]
-        if src.source == "frames":
+        if src.source in ("frames", "video"):
             cmd += ["--frame-interval", str(GRID_HOP), "--no-save-frames"]
         if is_video_cell(src, unit):
             ROOTS.framing_sha256()  # refuses without a table

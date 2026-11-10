@@ -3,6 +3,34 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.55.0 — 2026-11-10
+
+Minor bump: AVCaps V goes through viz2psy's video path, as viz2psy video sets.
+
+### Added
+- **`extract.py` source `avcaps/video`:** AVCaps clips through viz2psy's video
+  path, so the framing table applies, frames every 0.5 s, with the frame
+  models minus `motion` (as for the stills). A cell is one viz2psy video set
+  (viz2psy >= 0.20.0): `AVCAPS_VIDEO_UNIT` (100) whole clips of one split per
+  call, in native-id order, each model loaded once per call.
+  - Clips are read from `<media root>/avcaps/<split>_videos/<split>_videos/`,
+    spelled as found there (the framing table's keys).
+  - Units are `<split>-NNN`; rows are keyed `ext-avcaps-<native id>` through
+    `--id-pattern`.
+  - A clip whose name is not a native id fails at planning.
+  - A cell counts as done only when its sidecar has the current table's
+    sha256 and lists exactly the unit's clips, in order.
+- **`psytwill.sidecar.VIDEO_INPUT_TYPES`** = (`video`, `video_set`).
+  `input_framing_rule` reads a video set's rule (recorded once under
+  `input.framing`) exactly as a single video's, so set and single-video
+  outputs under one table are uniform.
+
+### Changed
+- `avcaps/frames` (staged PNG stills, which bypass the framing table) is
+  marked superseded by `avcaps/video` in its description. It stays in the
+  plan, so the 0.1.0 outputs remain addressable.
+- `is_video_cell` accepts several video inputs (a set), not just one.
+
 ## 0.54.0 — 2026-11-09
 
 Minor bump: the blender fit corpus gets a fetch verb and an extraction path.
