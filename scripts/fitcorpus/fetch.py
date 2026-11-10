@@ -24,6 +24,7 @@ Usage:
     fetch.py fma | musopen | gigaspeech | narratives --scratch-root /path/...
     fetch.py clotho [--clotho-splits development,evaluation] --scratch-root /path/...
     fetch.py avcaps --scratch-root /path/...
+    fetch.py blender --media-root /path/to/fit-corpus-media
 
 After fetching, short-file corpora are packed into units by stage.py.
 """
@@ -74,6 +75,25 @@ AVCAPS_SPLITS = ("train", "val", "test")
 # vs Zenodo's ~0.1-1 MB/s per connection). Downloaded from here, verified
 # against the Zenodo record's md5 and size, so Zenodo stays the reference.
 AVCAPS_MIRROR = "https://huggingface.co/datasets/TUT-ARG/AVCaps/resolve/main/{key}"
+# Blender open movies (CC-BY; Elephants Dream CC-BY 2.5, the rest CC-BY 3.0).
+# Only films Blender serves as free official single files: every later open
+# movie's master needs a Blender Studio login (checked 2026-11-09), and
+# Cosmos Laundromat's "free" link redirects to a 403. native id ->
+# (url, expected bytes, how the file arrives). Sizes are the server's
+# Content-Length on 2026-11-09: a changed file is a loud error, not a new
+# corpus. Files land in <media root>/blender/<native><ext>, the paths the
+# framing table keys on, so they live on durable storage, not scratch.
+BLENDER_FILMS = {
+    "big-buck-bunny": ("https://download.blender.org/peach/bigbuckbunny_movies/"
+                       "big_buck_bunny_1080p_h264.mov.zip", 725_106_348, "zip"),
+    "sintel": ("https://download.blender.org/durian/movies/Sintel.2010.1080p.mkv",
+               1_180_090_590, "file"),
+    "caminandes-2": ("https://download.blender.org/demo/movies/caminandes_gran_dillama.mp4.zip",
+                     125_632_282, "zip"),
+    "elephants-dream": ("https://download.blender.org/ED/elephantsdream-1024-h264-st-aac.mov",
+                        326_632_467, "file"),
+}
+BLENDER_VIDEO_SUFFIXES = (".mov", ".mkv", ".mp4")
 LIBRISPEECH_SUBSETS = (
     "dev-clean",
     "test-clean",
@@ -433,6 +453,47 @@ def fetch_avcaps(scratch_root: Path) -> Path:
     return corpus_dir
 
 
+def _blender_film(corpus_dir: Path, native: str, url: str, size: int, how: str) -> Path:
+    """One film as ``<native><ext>``; the download is checked against ``size``."""
+    present = [p for p in corpus_dir.glob(f"{native}.*") if p.suffix in BLENDER_VIDEO_SUFFIXES]
+    if present:
+        return present[0]
+    raw = corpus_dir / ("." + native + "-" + url.rsplit("/", 1)[-1])
+    download(url, raw)
+    if raw.stat().st_size != size:
+        raise SystemExit(f"{native}: {raw.name} is {raw.stat().st_size:,} bytes, expected {size:,} "
+                         f"(the file at {url} changed); delete it and decide before re-fetching")
+    if how == "file":
+        dest = corpus_dir / (native + Path(url).suffix.lower())
+        raw.rename(dest)
+        return dest
+    with zipfile.ZipFile(raw) as z:
+        videos = [m for m in z.namelist()
+                  if Path(m).suffix.lower() in BLENDER_VIDEO_SUFFIXES and not m.startswith("__MACOSX/")]
+        if len(videos) != 1:
+            raise SystemExit(f"{native}: expected one video in {raw.name}, found {videos}")
+        dest = corpus_dir / (native + Path(videos[0]).suffix.lower())
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with z.open(videos[0]) as src, tmp.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1 << 20)
+        tmp.rename(dest)
+    raw.unlink()  # the zip re-downloads; only the film is kept
+    return dest
+
+
+def fetch_blender(media_root: Path) -> Path:
+    """The free Blender open movies, one file per film, under ``<media root>/blender``."""
+    corpus_dir = media_root / "blender"
+    if manifest_ok(corpus_dir) and all(any(corpus_dir.glob(f"{n}.*")) for n in BLENDER_FILMS):
+        print(f"blender already present and verified at {corpus_dir}")
+        return corpus_dir
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    kept = [_blender_film(corpus_dir, n, *spec) for n, spec in BLENDER_FILMS.items()]
+    write_manifest(corpus_dir, kept)
+    print(f"blender ready: {', '.join(p.name for p in kept)} under {corpus_dir}")
+    return corpus_dir
+
+
 def resolve_root(flag: str | None, env: str, kind: str) -> Path:
     value = flag or os.environ.get(env)
     if not value:
@@ -448,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="list corpora")
     parser.add_argument("--durable-root", default=None)
     parser.add_argument("--scratch-root", default=None)
+    parser.add_argument("--media-root", default=None,
+                        help="durable raw video for framed corpora (blender); $PSYTWILL_FITCORPUS_MEDIA")
     parser.add_argument(
         "--subset", default="train-clean-100",
         help="librispeech subset (default: train-clean-100)",
@@ -464,7 +527,7 @@ def main(argv: list[str] | None = None) -> int:
 
     scripted = {"librispeech": None, "fma": fetch_fma, "musopen": fetch_musopen,
                 "gigaspeech": fetch_gigaspeech, "narratives": fetch_narratives,
-                "clotho": None, "avcaps": fetch_avcaps}
+                "clotho": None, "avcaps": fetch_avcaps, "blender": None}
     if args.list or not args.corpus:
         for key, spec in sorted(CORPORA.items()):
             mode = "scripted" if key in scripted else "manual"
@@ -483,6 +546,10 @@ def main(argv: list[str] | None = None) -> int:
         fetch_librispeech(resolve_root(
             args.scratch_root, "PSYTWILL_FITCORPUS_SCRATCH", "scratch"),
             args.subset)
+        return 0
+    if args.corpus == "blender":
+        fetch_blender(resolve_root(
+            args.media_root, "PSYTWILL_FITCORPUS_MEDIA", "media"))
         return 0
     if args.corpus == "clotho":
         fetch_clotho(resolve_root(

@@ -84,3 +84,34 @@ def test_cli_lists_new_corpora_as_scripted(capsys):
     for key in ("clotho", "avcaps"):
         line = next(l for l in out.splitlines() if l.startswith(key))
         assert "[scripted]" in line
+
+
+class TestBlender:
+    def _films(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "Sintel.2010.1080p.mkv").write_bytes(b"sintel")
+        with zipfile.ZipFile(src / "bbb.mov.zip", "w") as z:
+            z.writestr("bbb/big_buck_bunny_1080p_h264.mov", b"bunny")
+            z.writestr("__MACOSX/bbb/._big_buck_bunny_1080p_h264.mov", b"junk")
+        return {
+            "sintel": ((src / "Sintel.2010.1080p.mkv").as_uri(), 6, "file"),
+            "big-buck-bunny": ((src / "bbb.mov.zip").as_uri(), (src / "bbb.mov.zip").stat().st_size, "zip"),
+        }
+
+    def test_one_file_per_film_with_a_manifest(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fetch, "BLENDER_FILMS", self._films(tmp_path))
+        d = fetch.fetch_blender(tmp_path / "media")
+        names = sorted(p.name for p in d.iterdir())
+        assert names == ["MANIFEST.sha256", "big-buck-bunny.mov", "sintel.mkv"]
+        assert (d / "big-buck-bunny.mov").read_bytes() == b"bunny"
+        assert fetch.manifest_ok(d)
+        fetch.fetch_blender(tmp_path / "media")  # rerun: verified, nothing fetched
+        assert sorted(p.name for p in d.iterdir()) == names
+
+    def test_a_changed_file_is_a_loud_error(self, tmp_path, monkeypatch):
+        films = self._films(tmp_path)
+        url, _, how = films["sintel"]
+        monkeypatch.setattr(fetch, "BLENDER_FILMS", {"sintel": (url, 999, how)})
+        with pytest.raises(SystemExit, match="expected 999"):
+            fetch.fetch_blender(tmp_path / "media")

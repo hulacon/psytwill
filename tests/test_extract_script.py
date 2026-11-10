@@ -100,6 +100,28 @@ def test_cneuromod_media_comes_from_the_media_root(tmp_path, monkeypatch):
     assert got == [d / "bourne01.mkv"]
 
 
+def test_blender_films_are_units_from_the_media_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path), raising=False)
+    d = tmp_path / "media" / "blender"
+    d.mkdir(parents=True)
+    for name in ("sintel.mkv", "big-buck-bunny.mov", "MANIFEST.sha256", "notes.txt"):
+        (d / name).write_bytes(b"x")
+    units = extract._video_units("blender")
+    assert [u.id for u in units] == ["big-buck-bunny", "sintel"]
+    assert units[0].inputs == [str(d / "big-buck-bunny.mov")]
+    assert units[0].extra == ["--stimulus-id", "ext-blender-big-buck-bunny"]
+    assert units[0].out_dir == tmp_path / "durable" / "blender" / "features" / "big-buck-bunny"
+    tr = extract._video_transcript_units("blender")[1]
+    assert tr.inputs == [str(tmp_path / "durable" / "blender" / "inputs" / "sintel_transcript.csv")]
+
+
+def test_blender_runs_like_the_other_video_corpora():
+    srcs = {s.key: s for s in extract.build_sources()}
+    for source in ("frames", "audio", "transcript", "vlmcap"):
+        assert srcs[f"blender/{source}"].models == srcs[f"movie10/{source}"].models
+    assert srcs["blender/transcript"].depends == "blender/audio/transcribe"
+
+
 # ---- caption_vlm wiring (psytwill-space 0.2.0 caption member) ----------------
 
 def _models_by_source():
@@ -113,13 +135,13 @@ def test_text_kind_viz2psy_models_never_enter_V():
 def test_caption_vlm_runs_on_video_corpora_only():
     by = _models_by_source()
     with_vlm = sorted(k for k, models in by.items() if "caption_vlm" in models)
-    assert with_vlm == ["friends/frames", "movie10/frames"]
+    assert with_vlm == ["blender/frames", "friends/frames", "movie10/frames"]
     assert "caption_vlm" not in by["nsd/image"] and "caption_vlm" not in by["avcaps/frames"]
 
 
 def test_vlmcap_sources_score_the_caption_vlm_tables_as_text():
     srcs = {s.key: s for s in extract.build_sources()}
-    for corpus in ("movie10", "friends"):
+    for corpus in extract.VIDEO_CORPORA:
         s = srcs[f"{corpus}/vlmcap"]
         assert (s.package, s.prefix, s.depends) == ("word2psy", "vlmcap_", f"{corpus}/frames/caption_vlm")
         assert s.models == extract.L_MODELS
