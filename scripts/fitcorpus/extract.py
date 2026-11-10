@@ -219,17 +219,40 @@ def _cneuromod_media(corpus: str) -> list[Path]:
     return files
 
 
-def _cneuromod_native(corpus: str, path: Path) -> str:
-    stem = path.stem  # bourne01 | friends_s01e02a
+def _blender_media() -> list[Path]:
+    """Blender open movies under ``<media root>/blender/``: one file per film,
+    named ``<native>.<ext>`` by ``fetch.py blender`` (the framing table's keys)."""
+    if ROOTS.media is None:
+        return []
+    root = ROOTS.media / "blender"
+    if not root.exists():
+        return []
+    return sorted(p for p in root.iterdir() if p.suffix.lower() in VIDEO_SUFFIXES and p.is_file())
+
+
+#: Video fit corpora: whole films or segments, one unit per media file, each
+#: run through V (frames), A (soundtrack), Whisper transcript (L) and the
+#: caption_vlm text (L). movie10/friends = CNeuroMod (tier b); blender = the
+#: CC-BY open movies (tier a, the animated wedge; DECIDED 2026-08-25, joined
+#: step 3 2026-11-09: the freely downloadable films only).
+VIDEO_CORPORA = ("movie10", "friends", "blender")
+
+
+def _video_media(corpus: str) -> list[Path]:
+    return _blender_media() if corpus == "blender" else _cneuromod_media(corpus)
+
+
+def _video_native(corpus: str, path: Path) -> str:
+    stem = path.stem  # bourne01 | friends_s01e02a | big-buck-bunny
     if corpus == "friends" and stem.startswith("friends_"):
         stem = stem[len("friends_"):]
     return stem.lower().replace("_", "-")
 
 
-def _cneuromod_units(corpus: str) -> list[Unit]:
+def _video_units(corpus: str) -> list[Unit]:
     out = []
-    for p in _cneuromod_media(corpus):
-        native = _cneuromod_native(corpus, p)
+    for p in _video_media(corpus):
+        native = _video_native(corpus, p)
         out.append(Unit(
             id=native,
             out_dir=ROOTS.durable / corpus / "features" / native,
@@ -239,10 +262,10 @@ def _cneuromod_units(corpus: str) -> list[Unit]:
     return out
 
 
-def _cneuromod_transcript_units(corpus: str) -> list[Unit]:
+def _video_transcript_units(corpus: str) -> list[Unit]:
     out = []
-    for p in _cneuromod_media(corpus):
-        native = _cneuromod_native(corpus, p)
+    for p in _video_media(corpus):
+        native = _video_native(corpus, p)
         d = ROOTS.durable / corpus / "features" / native
         shard = ROOTS.durable / corpus / "inputs" / f"{native}_transcript.csv"
         out.append(Unit(
@@ -254,11 +277,11 @@ def _cneuromod_transcript_units(corpus: str) -> list[Unit]:
     return out
 
 
-def _cneuromod_vlmcap_units(corpus: str) -> list[Unit]:
-    """word2psy over each segment's caption_vlm table (frames source output)."""
+def _video_vlmcap_units(corpus: str) -> list[Unit]:
+    """word2psy over each unit's caption_vlm table (frames source output)."""
     out = []
-    for p in _cneuromod_media(corpus):
-        native = _cneuromod_native(corpus, p)
+    for p in _video_media(corpus):
+        native = _video_native(corpus, p)
         d = ROOTS.durable / corpus / "features" / native
         out.append(Unit(
             id=native,
@@ -364,29 +387,31 @@ def build_sources() -> list[Source]:
         _nsd_caption_units,
         depends="inputs",
     ))
-    for corpus in ("movie10", "friends"):
+    for corpus in VIDEO_CORPORA:
+        what = ("Blender open movies (CC-BY, whole films)" if corpus == "blender"
+                else f"staged CNeuroMod {corpus} segments")
         S.append(Source(
             corpus, "frames", "viz2psy", "", V_MODELS + [CAPTION_VLM],
-            f"staged CNeuroMod {corpus} segments, frames every {GRID_HOP} s "
+            f"{what}, frames every {GRID_HOP} s "
             f"({CAPTION_VLM} only on {CAPTION_VLM_GPU or 'any GPU'})",
-            lambda c=corpus: _cneuromod_units(c),
+            lambda c=corpus: _video_units(c),
         ))
         S.append(Source(
             corpus, "vlmcap", "word2psy", "vlmcap_", L_MODELS,
             f"{CAPTION_VLM} frame captions of {corpus}, scored as text",
-            lambda c=corpus: _cneuromod_vlmcap_units(c),
+            lambda c=corpus: _video_vlmcap_units(c),
             depends=f"{corpus}/frames/{CAPTION_VLM}",
         ))
         S.append(Source(
             corpus, "audio", "aud2psy", "", _ordered_audio(),
             f"soundtracks of the same {corpus} segments, {GRID_HOP} s hop; "
             "diarize/transcribe run before the models that read their tables",
-            lambda c=corpus: _cneuromod_units(c),
+            lambda c=corpus: _video_units(c),
         ))
         S.append(Source(
             corpus, "transcript", "word2psy", "transcript_", L_MODELS,
             f"Whisper transcript segments of {corpus} (what is said), scored as text",
-            lambda c=corpus: _cneuromod_transcript_units(c),
+            lambda c=corpus: _video_transcript_units(c),
             depends=f"{corpus}/audio/transcribe",
         ))
     for corpus, what in {**STAGED_CURATED, **STAGED_WHISPER, **STAGED_MUSIC}.items():
@@ -575,8 +600,8 @@ def cmd_inputs(args: argparse.Namespace) -> int:
         print(f"nsd captions: {cap} missing (run fetch.py coco-captions + adapt_nsd_captions.py first)")
 
     # transcripts: from each unit's transcribe output (once it exists)
-    for corpus in ("movie10", "friends"):
-        n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _cneuromod_units(corpus))
+    for corpus in VIDEO_CORPORA:
+        n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _video_units(corpus))
         print(f"{corpus} transcripts: {n} input CSVs written")
     for corpus in STAGED_WHISPER:
         n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _staged_units(corpus))

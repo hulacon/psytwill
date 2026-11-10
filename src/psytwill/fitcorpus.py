@@ -119,7 +119,11 @@ CORPORA: dict[str, CorpusSpec] = {
             tier="a",
             serves="V<->A residual: the animated wedge (CC-BY open movies)",
             notes="Big Buck Bunny (2008) onward; Tears of Steel excluded as "
-                  "live action; ratified 2026-09-07",
+                  "live action; ratified 2026-09-07. 2026-11-09: only the "
+                  "films Blender serves as free official files (Big Buck "
+                  "Bunny, Sintel, Caminandes 2) plus Elephants Dream (2006, "
+                  "admitted for its dialogue); the rest need a Blender Studio "
+                  "login (fetch.py blender)",
         ),
         CorpusSpec(
             "clotho",

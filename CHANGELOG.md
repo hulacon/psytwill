@@ -3,6 +3,24 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.54.0 — 2026-11-09
+
+Minor bump: the blender fit corpus gets a fetch verb and an extraction path.
+
+### Added
+- **`fetch.py blender`** (`--media-root` / `$PSYTWILL_FITCORPUS_MEDIA`):
+  the Blender open movies that Blender serves as free official single files
+  (Big Buck Bunny, Sintel, Caminandes 2, Elephants Dream), one file per film
+  as `<media root>/blender/<native><ext>`, with a `MANIFEST.sha256`. Each
+  download is checked against its pinned size (a changed file is an error).
+  The files go to durable media, not scratch, because the framing table keys
+  on their paths.
+- **`extract.py`: blender runs like movie10 and friends**: `frames` (V +
+  `caption_vlm`), `audio` (A), `transcript` (Whisper) and `vlmcap`. Units are
+  one per film, with ids `ext-blender-<native>`. The three corpora share
+  `VIDEO_CORPORA`. The `_cneuromod_*` unit builders became `_video_*`;
+  `_cneuromod_media` is kept.
+
 ## 0.53.0 — 2026-11-09
 
 Minor bump: battery 0.3 admits viz2psy 0.18.0's `caption_vlm`; the fit-corpus
