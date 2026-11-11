@@ -239,3 +239,64 @@ def test_video_set_done_only_for_exactly_its_clips(tmp_path, monkeypatch):
                           "videos": [{"path": p} for p in listed]}}
         extract.sidecar_for(stem).write_text(json.dumps(side))
         assert extract.is_done(stem, src, unit) is want
+
+
+def _qc_corpus(tmp_path, monkeypatch, texts):
+    durable = tmp_path / "durable"
+    unit = extract.Unit(id="ep01", out_dir=durable / "friends" / "features" / "ep01",
+                        inputs=[str(durable / "friends" / "inputs" / "ep01_transcript.csv")])
+    Path(unit.inputs[0]).parent.mkdir(parents=True)
+    rows = ["stimulus_id,text,onset,offset"] + [f"ext-friends-ep01,{t},{i}.0,{i}.5" for i, t in enumerate(texts)]
+    Path(unit.inputs[0]).write_text("\n".join(rows) + "\n")
+    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=durable), raising=False)
+    monkeypatch.setattr(extract, "_whisper_transcript_units", lambda: {"friends": [unit], "blender": []})
+    return durable, unit
+
+
+def test_qc_then_exclusions_union_the_base_rows_with_loop_rows(tmp_path, monkeypatch):
+    import pandas as pd
+
+    durable, _ = _qc_corpus(tmp_path, monkeypatch, ["Hi."] + ["Airplane."] * 6)
+    assert extract.cmd_qc(argparse.Namespace(corpus=None, dry_run=False, allow_partial=False)) == 0
+    flags = pd.read_parquet(durable / "friends" / "qc" / "transcript_flags.parquet")
+    assert flags["loop_exclude"].sum() == 5 and (flags["unit"] == "ep01").all()
+
+    base = tmp_path / "base.parquet"
+    pd.DataFrame({"stimulus_id": ["ext-nsd-000001"], "chunk_idx": [0]}).to_parquet(base)
+    out = durable / "space" / "exclusions" / "L_test_exclude_rows.parquet"
+    args = argparse.Namespace(base_rows=str(base), base_reason="caption_draw", out=str(out), dry_run=False)
+    assert extract.cmd_exclusions(args) == 0
+    rows = pd.read_parquet(out)
+    assert rows["reason"].value_counts().to_dict() == {"transcript_loop": 5, "caption_draw": 1}
+    assert sorted(rows.loc[rows.reason == "transcript_loop", "chunk_idx"]) == [2, 3, 4, 5, 6]
+    assert extract.cmd_exclusions(args) == 0  # same rows again: a no-op
+
+
+def test_exclusions_refuse_flags_older_than_their_inputs(tmp_path, monkeypatch):
+    import pandas as pd
+    import pytest
+
+    durable, unit = _qc_corpus(tmp_path, monkeypatch, ["Hi."] * 5)
+    extract.cmd_qc(argparse.Namespace(corpus=None, dry_run=False, allow_partial=False))
+    with open(unit.inputs[0], "a") as f:
+        f.write("ext-friends-ep01,Bye.,9.0,9.5\n")  # transcript re-derived after the flags
+    base = tmp_path / "base.parquet"
+    pd.DataFrame({"stimulus_id": ["x"], "chunk_idx": [0]}).to_parquet(base)
+    args = argparse.Namespace(base_rows=str(base), base_reason="r", out=str(tmp_path / "o.parquet"), dry_run=False)
+    with pytest.raises(SystemExit, match="predate"):
+        extract.cmd_exclusions(args)
+
+
+def test_exclusions_refuse_to_overwrite_a_written_list(tmp_path, monkeypatch):
+    import pandas as pd
+    import pytest
+
+    _qc_corpus(tmp_path, monkeypatch, ["Hi."] * 5)
+    extract.cmd_qc(argparse.Namespace(corpus=None, dry_run=False, allow_partial=False))
+    base = tmp_path / "base.parquet"
+    pd.DataFrame({"stimulus_id": ["x"], "chunk_idx": [0]}).to_parquet(base)
+    out = tmp_path / "o.parquet"
+    extract.cmd_exclusions(argparse.Namespace(base_rows=str(base), base_reason="r", out=str(out), dry_run=False))
+    pd.DataFrame({"stimulus_id": ["y"], "chunk_idx": [0]}).to_parquet(base)
+    with pytest.raises(SystemExit, match="immutable"):
+        extract.cmd_exclusions(argparse.Namespace(base_rows=str(base), base_reason="r", out=str(out), dry_run=False))

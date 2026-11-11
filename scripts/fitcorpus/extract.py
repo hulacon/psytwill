@@ -26,6 +26,8 @@ Usage
     extract.py verify                      # re-check every written sidecar
     extract.py run --corpus librispeech --unit-index 3 --skip-model psychoacoustic   # GPU job
     extract.py run --corpus librispeech --unit-index 3 --model psychoacoustic        # CPU job
+    extract.py qc [--corpus C]             # transcript QC flags, <corpus>/qc/transcript_flags.parquet
+    extract.py exclusions --base-rows R --base-reason WHY --out space/exclusions/<name>_exclude_rows.parquet
 
 Short-file corpora (speech, music, words) are first packed into units by
 `stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
@@ -963,6 +965,150 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
     return 1 if n_fail else 0
 
 
+# ---------------------------------------------------------------------------
+# Transcript QC (L): flags per Whisper corpus, then one fit exclusion list
+# ---------------------------------------------------------------------------
+
+def _whisper_transcript_units() -> dict[str, list[Unit]]:
+    """corpus -> transcript units, for every corpus whose L text is Whisper output.
+    Curated text, VLM captions and human captions are not screened."""
+    out = {c: _video_transcript_units(c) for c in VIDEO_CORPORA}
+    out.update({c: _staged_transcript_units(c) for c in STAGED_WHISPER})
+    return out
+
+
+def qc_paths(corpus: str) -> tuple[Path, Path]:
+    d = ROOTS.durable / corpus / "qc"
+    return d / "transcript_flags.parquet", d / "transcript_flags.meta.json"
+
+
+def cmd_qc(args: argparse.Namespace) -> int:
+    """Write `<corpus>/qc/transcript_flags.parquet` for each Whisper corpus."""
+    import pandas as pd
+
+    import psytwill
+    from psytwill import transcript_qc as tq
+    from psytwill.relate import sha256_file
+
+    n_fail = 0
+    for corpus, units in _whisper_transcript_units().items():
+        if args.corpus and corpus != args.corpus:
+            continue
+        have = [u for u in units if Path(u.inputs[0]).exists()]
+        if not have:
+            print(f"{corpus}: no transcript inputs yet ({len(units)} unit(s) planned); nothing written")
+            continue
+        if len(have) < len(units) and not args.allow_partial:
+            missing = [u.id for u in units if u not in have]
+            print(f"INCOMPLETE {corpus}: {len(missing)} of {len(units)} unit(s) lack a transcript input "
+                  f"(first: {missing[:3]}); run `extract.py inputs` after transcribe, or pass --allow-partial")
+            n_fail += 1
+            continue
+        parts, shas = [], {}
+        for u in have:
+            p = Path(u.inputs[0])
+            f = tq.flag_chunks(pd.read_csv(p, dtype={"text": str}, keep_default_na=False))
+            asr = u.out_dir / "transcribe_transcript.csv"
+            if asr.exists():
+                f = tq.attach_asr(f, pd.read_csv(asr, dtype={"transcribe_text": str}, keep_default_na=False),
+                                  text_column="transcribe_text",
+                                  columns=("transcribe_asr_confidence", "transcribe_no_speech_prob"))
+            f.insert(0, "unit", u.id)
+            parts.append(f)
+            shas[u.id] = sha256_file(p)
+        flags = pd.concat(parts, ignore_index=True)
+        share = tq.style_share(flags)
+        flags["lower_style_share"] = flags["stimulus_id"].map(share)
+        n_ex = int(flags["loop_exclude"].sum())
+        print(f"{corpus}: {len(have)} unit(s), {len(flags)} chunk(s), {n_ex} loop-excluded, "
+              f"{int(flags['timing_compressed'].sum())} timing-flagged, {int(flags['lower_style'].sum())} lower-style")
+        if args.dry_run:
+            continue
+        out, meta = qc_paths(corpus)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        flags.to_parquet(out, index=False)
+        meta.write_text(json.dumps({
+            "what": "per-chunk transcript QC flags (psytwill.transcript_qc); key stimulus_id,chunk_idx "
+                    "= row order of each inputs/<unit>_transcript.csv",
+            "corpus": corpus, "rules": tq.rules(), "psytwill_version": psytwill.__version__,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "n_units": len(have), "n_units_planned": len(units), "n_chunks": len(flags),
+            "n_loop_excluded": n_ex, "sha256": sha256_file(out), "inputs_sha256": shas,
+        }, indent=1) + "\n")
+        print(f"       -> {out}")
+    return 1 if n_fail else 0
+
+
+def cmd_exclusions(args: argparse.Namespace) -> int:
+    """One L exclusion list: --base-rows ∪ every Whisper corpus's loop exclusions."""
+    import pandas as pd
+
+    import psytwill
+    from psytwill import transcript_qc as tq
+    from psytwill.relate import sha256_file
+
+    key = list(tq.KEY)
+    base = Path(args.base_rows)
+    b = pd.read_parquet(base) if base.suffix == ".parquet" else pd.read_csv(base)
+    if [k for k in key if k not in b.columns]:
+        sys.exit(f"ERROR: --base-rows {base} lacks {key}")
+    parts = [b[key].assign(reason=args.base_reason)]
+    corpora = {}
+    for corpus, units in _whisper_transcript_units().items():
+        flags_p, meta_p = qc_paths(corpus)
+        have = [u for u in units if Path(u.inputs[0]).exists()]
+        if not have:
+            print(f"{corpus}: no transcript inputs; not in the list")
+            continue
+        if not flags_p.exists():
+            sys.exit(f"ERROR: {corpus} has transcript inputs but no {flags_p}; run `extract.py qc --corpus {corpus}`")
+        meta = json.loads(meta_p.read_text())
+        if meta["rules"]["rules_version"] != tq.RULES_VERSION:
+            sys.exit(f"ERROR: {flags_p} was written under rules {meta['rules']['rules_version']}, "
+                     f"current is {tq.RULES_VERSION}; re-run `extract.py qc --corpus {corpus}`")
+        if meta["sha256"] != sha256_file(flags_p):
+            sys.exit(f"ERROR: {flags_p} changed since its sidecar was written; re-run `extract.py qc --corpus {corpus}`")
+        stale = [u.id for u in have if meta["inputs_sha256"].get(u.id) != sha256_file(Path(u.inputs[0]))]
+        if stale:
+            sys.exit(f"ERROR: {corpus} flags predate {len(stale)} transcript input(s) (first: {stale[:3]}); "
+                     f"re-run `extract.py qc --corpus {corpus}`")
+        ex = tq.exclusion_rows(pd.read_parquet(flags_p, columns=[*key, "loop_exclude"]))
+        parts.append(ex.assign(reason="transcript_loop"))
+        corpora[corpus] = {"flags": str(flags_p), "flags_sha256": meta["sha256"],
+                           "n_units": meta["n_units"], "n_units_planned": meta["n_units_planned"],
+                           "n_rows": len(ex)}
+        print(f"{corpus}: {len(ex)} loop row(s)")
+    rows = pd.concat(parts, ignore_index=True)
+    dup = rows.duplicated(key, keep=False)
+    if dup.any():
+        sys.exit(f"ERROR: {int(dup.sum())} row(s) appear under two reasons; the lists should not overlap")
+    print(f"total: {len(rows)} row(s) ({len(b)} {args.base_reason} + {len(rows) - len(b)} transcript_loop)")
+    out = Path(args.out)
+    if args.dry_run:
+        return 0
+    if out.exists():
+        tmp = out.with_name(out.name + ".new")
+        rows.to_parquet(tmp, index=False)
+        same = pd.read_parquet(out).equals(pd.read_parquet(tmp))
+        tmp.unlink()
+        if same:
+            print(f"unchanged: {out}")
+            return 0
+        sys.exit(f"ERROR: {out} exists with different rows; an exclusion list a fit pins is immutable, "
+                 "so name a new one")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rows.to_parquet(out, index=False)
+    out.with_name(out.stem + ".meta.json").write_text(json.dumps({
+        "what": "L fit exclusion rows (--exclude-rows); key stimulus_id,chunk_idx; reason names the source",
+        "rules": tq.rules(), "psytwill_version": psytwill.__version__,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "base": {"path": str(base), "sha256": sha256_file(base), "reason": args.base_reason, "n_rows": len(b)},
+        "transcript_loop": corpora, "n_rows": len(rows), "sha256": sha256_file(out),
+    }, indent=1) + "\n")
+    print(f"-> {out}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--durable-root")
@@ -996,6 +1142,17 @@ def main() -> int:
     p.add_argument("--fail-fast", action="store_true")
     p.add_argument("--allow-partial", action="store_true", help="write a group even if some units are not done")
     p.set_defaults(func=cmd_aggregate)
+    p = sub.add_parser("qc", help="transcript QC flags per Whisper corpus (<corpus>/qc/transcript_flags.parquet)")
+    p.add_argument("--corpus", choices=sorted(CORPORA))
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--allow-partial", action="store_true", help="flag a corpus some of whose units lack inputs")
+    p.set_defaults(func=cmd_qc)
+    p = sub.add_parser("exclusions", help="one L exclusion list: --base-rows plus every corpus's loop rows")
+    p.add_argument("--base-rows", required=True, help="existing rows to keep excluding (e.g. a caption draw)")
+    p.add_argument("--base-reason", required=True, help="the reason recorded for the base rows")
+    p.add_argument("--out", required=True, help="the list to write (immutable once written)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_exclusions)
 
     args = ap.parse_args()
     global ROOTS

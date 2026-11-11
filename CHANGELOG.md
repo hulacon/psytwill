@@ -3,6 +3,33 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.56.0 — 2026-11-10
+
+Minor bump: transcript QC flags for the Whisper fit corpora, and the L
+exclusion list built from them.
+
+### Added
+- **`psytwill.transcript_qc`**: flags on a transcript table keyed
+  `(stimulus_id, chunk_idx)`, where `chunk_idx` is row order within
+  `stimulus_id` (how word2psy numbers the chunks it scores).
+  - `loop_exclude`: chunks 2..n of a run of `N_LOOP` (5) or more consecutive
+    chunks with identical normalised text. The first chunk of the run is kept.
+    Shorter runs carry `run_len` and are kept.
+  - `timing_compressed`: duration < 0.1 s or > 15 words/s. Flag only.
+  - `lower_style`: lowercase, unpunctuated text, plus a per-stimulus share.
+    Flag only.
+  - `attach_asr` joins decoder confidences back on
+    `(stimulus_id, onset, offset, text)` and refuses an ambiguous decoder table.
+  - `RULES_VERSION` changes with any rule constant; written tables record it.
+- **`extract.py qc`**: writes `<corpus>/qc/transcript_flags.parquet` (+
+  `.meta.json` with the rules, and each input's sha256) for every corpus whose
+  L text is Whisper output (the video corpora and `STAGED_WHISPER`). A corpus
+  with some units lacking inputs is refused unless `--allow-partial`.
+- **`extract.py exclusions`**: one `--exclude-rows` file = `--base-rows` ∪
+  every Whisper corpus's loop rows, with a `reason` column and a sidecar. It
+  refuses flags older than their inputs or written under other rules, and
+  refuses to overwrite an existing list with different rows.
+
 ## 0.55.0 — 2026-11-10
 
 Minor bump: AVCaps V goes through viz2psy's video path, as viz2psy video sets.
