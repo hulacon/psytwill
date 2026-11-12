@@ -125,20 +125,24 @@ def test_frame_units_never_mix_sizes():
 # ---- LibriSpeech held-out splits ---------------------------------------------
 
 def _librispeech_split(tmp_path, split, speaker="1089", chapter="134686"):
-    import numpy as np
-    import soundfile as sf
-
+    """A one-chapter LibriSpeech tree. The .flac files are empty placeholders:
+    the adapter only lists them and asks media_duration (stubbed by the
+    tests), so no audio library is needed."""
     chap = tmp_path / "scratch" / "librispeech" / split / "LibriSpeech" / split / speaker / chapter
     chap.mkdir(parents=True)
     lines = []
     for k in range(2):
         uid = f"{speaker}-{chapter}-{k:04d}"
-        sf.write(chap / f"{uid}.flac", np.zeros(16000, dtype=np.float32), 16000)
+        (chap / f"{uid}.flac").write_bytes(b"")
         lines.append(f"{uid} HELLO WORLD {k}")
     (chap / f"{speaker}-{chapter}.trans.txt").write_text("\n".join(lines) + "\n")
 
 
 class TestLibrispeechSplits:
+    @pytest.fixture(autouse=True)
+    def _no_audio_io(self, monkeypatch):
+        monkeypatch.setattr(stage, "media_duration", lambda path: 1.0)
+
     def test_held_out_split_reads_its_own_tree(self, tmp_path):
         _librispeech_split(tmp_path, "test-clean")
         sr, plans, _ = stage.adapt_librispeech(_args(tmp_path, split="test-clean"))
