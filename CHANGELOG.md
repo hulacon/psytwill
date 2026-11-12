@@ -19,6 +19,11 @@ Minor bump: LibriSpeech held-out splits for a separate held-out root.
   train-clean-100, so their `ext-librispeech-spk<N>-<k>` ids cannot collide.
 - `fetch.py librispeech --subset test-other`.
 
+### Fixed
+- `battery.NOT_ADMITTED` lists aud2psy's `phonetics` (new in aud2psy
+  0.23.0), so the live-registry check passes again: the model exists, but it
+  is not a battery member unless its admission screen admits it.
+
 ## 0.56.0 — 2026-11-10
 
 Minor bump: transcript QC flags for the Whisper fit corpora, and the L

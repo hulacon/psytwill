@@ -237,6 +237,11 @@ NOT_ADMITTED: dict[str, dict[str, str]] = {
                  "psytwill-space member: admission would add it to V at the next fit, "
                  "where dinov2/clip/places/gist already cover it (Ben 2026-10-01).",
     },
+    "aud2psy": {
+        "phonetics": "candidate A member (articulatory features from a CTC phone "
+                     "recognizer, aud2psy 0.23.0). Extracted for its admission "
+                     "screen only; it joins the battery, with a bump, only if admitted.",
+    },
 }
 
 
