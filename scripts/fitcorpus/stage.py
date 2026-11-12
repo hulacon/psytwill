@@ -10,7 +10,7 @@ segments table saying where every original file sits. The extractors see
 one wav per unit and nothing else; downstream pooling recovers the files
 from the table.
 
-    stage.py librispeech      --scratch-root R --durable-root D
+    stage.py librispeech      --scratch-root R --durable-root D [--split train-clean-100]
     stage.py gigaspeech       ... [--budget-hours 40]
     stage.py fma              ... [--per-genre 250]
     stage.py musopen          ... [--budget-hours 8]
@@ -43,6 +43,14 @@ Writes (idempotent; a unit whose wav and tables exist is skipped unless
 `stimulus_id` is the unit's `ext-<corpus>-<unit>` id throughout: audio
 frames and transcript rows share it, and the segments table is the join
 to the original files.
+
+Held-out LibriSpeech (`--split test-clean` / `test-other`): staged exactly as
+the fit split, but only into a durable root that holds a `HELDOUT` marker file,
+and the fit split never into one. A held-out root is laid out like the fit
+store, so extract.py runs on it unchanged (point its --durable-root there),
+while no fit, which reads only the fit store, can see it. The splits are
+speaker-disjoint from train-clean-100 by LibriSpeech's design, so the
+`ext-librispeech-spk<N>-<k>` ids cannot collide with the fit units'.
 
 Roots as in extract.py (flags win over env; nothing is guessed):
     --durable-root / $PSYTWILL_FITCORPUS_DURABLE
@@ -142,10 +150,29 @@ def media_duration(path: Path) -> float:
 #   what the decoder needs ("path" or "bytes") plus the columns to record.
 # ---------------------------------------------------------------------------
 
+LIBRISPEECH_FIT_SPLIT = "train-clean-100"
+LIBRISPEECH_SPLITS = (LIBRISPEECH_FIT_SPLIT, "test-clean", "test-other")
+HELDOUT_MARKER = "HELDOUT"  # a file at a held-out durable root
+
+
+def check_heldout_root(corpus: str, split: str, durable_root: Path) -> None:
+    """A held-out split stages only into a marked root; the fit split never does."""
+    if corpus != "librispeech":
+        return
+    marked = (durable_root / HELDOUT_MARKER).is_file()
+    if split != LIBRISPEECH_FIT_SPLIT and not marked:
+        sys.exit(f"ERROR: librispeech {split} is held out; stage it into a separate durable root "
+                 f"holding a {HELDOUT_MARKER} file, never the fit store ({durable_root})")
+    if split == LIBRISPEECH_FIT_SPLIT and marked:
+        sys.exit(f"ERROR: {durable_root} is a held-out root ({HELDOUT_MARKER}); "
+                 f"the fit split {split} does not belong there")
+
+
 def adapt_librispeech(args) -> tuple[int, list[tuple[str, list]], object]:
-    root = args.scratch_root / "librispeech" / "train-clean-100" / "LibriSpeech" / "train-clean-100"
+    split = getattr(args, "split", LIBRISPEECH_FIT_SPLIT)
+    root = args.scratch_root / "librispeech" / split / "LibriSpeech" / split
     if not root.is_dir():
-        sys.exit(f"ERROR: {root} missing — fetch.py librispeech, then untar the archive in place")
+        sys.exit(f"ERROR: {root} missing — fetch.py librispeech --subset {split}, then untar the archive in place")
     plans = []
     for spk in sorted(root.iterdir(), key=lambda p: int(p.name)):
         groups = []
@@ -709,6 +736,9 @@ def main() -> int:
     ap.add_argument("--durable-root", default=os.environ.get("PSYTWILL_FITCORPUS_DURABLE"))
     ap.add_argument("--scratch-root", default=os.environ.get("PSYTWILL_FITCORPUS_SCRATCH"))
     ap.add_argument("--twp-root", default=None, help="<bids>/stimuli (twp-unpresented only)")
+    ap.add_argument("--split", choices=LIBRISPEECH_SPLITS, default=LIBRISPEECH_FIT_SPLIT,
+                    help="librispeech only: the subset to stage; a held-out split needs a durable "
+                         f"root holding a {HELDOUT_MARKER} file")
     ap.add_argument("--target-minutes", type=float, default=TARGET_MIN)
     ap.add_argument("--budget-hours", type=float, default=40.0, help="gigaspeech / musopen: hours of audio to take (whole episodes / works)")
     ap.add_argument("--per-genre", type=int, default=250, help="fma: clips per top genre (seeded draw)")
@@ -729,6 +759,9 @@ def main() -> int:
         setattr(args, name, Path(v))
     if args.twp_root:
         args.twp_root = Path(args.twp_root)
+    if args.split != LIBRISPEECH_FIT_SPLIT and args.corpus != "librispeech":
+        sys.exit("ERROR: --split applies to librispeech only")
+    check_heldout_root(args.corpus, args.split, args.durable_root)
     if args.frames:
         if args.corpus != "avcaps":
             sys.exit("ERROR: --frames is implemented for avcaps only")

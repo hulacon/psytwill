@@ -299,7 +299,7 @@ def _video_vlmcap_units(corpus: str) -> list[Unit]:
 # writes it); narratives has none in ds002345, so its L input is the unit's
 # Whisper output, as for CNeuroMod; music has no transcript source at all.
 STAGED_CURATED = {
-    "librispeech": "read audiobook speech (LibriSpeech train-clean-100), packed per speaker; curated transcripts",
+    "librispeech": "read audiobook speech (LibriSpeech; train-clean-100 in the fit store, a test split in a held-out root), packed per speaker; curated transcripts",
     "gigaspeech": "podcast speech (GigaSpeech S, podcast source only), whole episodes packed; curated transcripts",
     "twp-unpresented": "the never-presented twp recordings packed per voice; text = the word",
 }

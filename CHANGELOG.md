@@ -3,6 +3,27 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.57.0 — 2026-11-11
+
+Minor bump: LibriSpeech held-out splits for a separate held-out root.
+
+### Added
+- **`stage.py librispeech --split {train-clean-100,test-clean,test-other}`**
+  (default `train-clean-100`, the fit split). A test split is staged exactly
+  as the fit split, packed per speaker with curated transcripts.
+- **Held-out root guard:** a test split stages only into a durable root
+  holding a `HELDOUT` marker file, and the fit split is refused in one. A
+  held-out root is laid out like the fit store, so `extract.py` runs on it
+  unchanged via `--durable-root`, and no fit (which reads the fit store
+  only) can see it. The test splits are speaker-disjoint from
+  train-clean-100, so their `ext-librispeech-spk<N>-<k>` ids cannot collide.
+- `fetch.py librispeech --subset test-other`.
+
+### Fixed
+- `battery.NOT_ADMITTED` lists aud2psy's `phonetics` (new in aud2psy
+  0.23.0), so the live-registry check passes again: the model exists, but it
+  is not a battery member unless its admission screen admits it.
+
 ## 0.56.0 — 2026-11-10
 
 Minor bump: transcript QC flags for the Whisper fit corpora, and the L

@@ -120,3 +120,56 @@ def test_frame_units_never_mix_sizes():
         assert {size[n] for n in natives} == {uid.rsplit("-", 1)[0]}
     assert [u for u, _ in units] == ["480x640-000", "640x480-000", "640x480-001"]
     assert sorted(n for _, ns in units for n in ns) == list("abcde")
+
+
+# ---- LibriSpeech held-out splits ---------------------------------------------
+
+def _librispeech_split(tmp_path, split, speaker="1089", chapter="134686"):
+    """A one-chapter LibriSpeech tree. The .flac files are empty placeholders:
+    the adapter only lists them and asks media_duration (stubbed by the
+    tests), so no audio library is needed."""
+    chap = tmp_path / "scratch" / "librispeech" / split / "LibriSpeech" / split / speaker / chapter
+    chap.mkdir(parents=True)
+    lines = []
+    for k in range(2):
+        uid = f"{speaker}-{chapter}-{k:04d}"
+        (chap / f"{uid}.flac").write_bytes(b"")
+        lines.append(f"{uid} HELLO WORLD {k}")
+    (chap / f"{speaker}-{chapter}.trans.txt").write_text("\n".join(lines) + "\n")
+
+
+class TestLibrispeechSplits:
+    @pytest.fixture(autouse=True)
+    def _no_audio_io(self, monkeypatch):
+        monkeypatch.setattr(stage, "media_duration", lambda path: 1.0)
+
+    def test_held_out_split_reads_its_own_tree(self, tmp_path):
+        _librispeech_split(tmp_path, "test-clean")
+        sr, plans, _ = stage.adapt_librispeech(_args(tmp_path, split="test-clean"))
+        assert sr == 16000 and [p for p, _ in plans] == ["spk1089-"]
+        segs = plans[0][1][0][1]
+        assert [s.text for s in segs] == ["hello world 0", "hello world 1"]
+
+    def test_default_split_is_the_fit_split(self, tmp_path):
+        _librispeech_split(tmp_path, "train-clean-100", speaker="19", chapter="198")
+        _, plans, _ = stage.adapt_librispeech(_args(tmp_path))
+        assert [p for p, _ in plans] == ["spk19-"]
+
+    def test_held_out_split_refused_without_the_marker(self, tmp_path):
+        (tmp_path / "durable").mkdir()
+        with pytest.raises(SystemExit, match="held out"):
+            stage.check_heldout_root("librispeech", "test-clean", tmp_path / "durable")
+
+    def test_held_out_split_allowed_with_the_marker(self, tmp_path):
+        root = tmp_path / "durable"
+        root.mkdir()
+        (root / stage.HELDOUT_MARKER).write_text("")
+        stage.check_heldout_root("librispeech", "test-other", root)
+
+    def test_fit_split_refused_in_a_held_out_root(self, tmp_path):
+        root = tmp_path / "durable"
+        root.mkdir()
+        (root / stage.HELDOUT_MARKER).write_text("")
+        with pytest.raises(SystemExit, match="held-out root"):
+            stage.check_heldout_root("librispeech", "train-clean-100", root)
+        stage.check_heldout_root("gigaspeech", "train-clean-100", root)  # other corpora: no rule
