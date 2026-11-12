@@ -3,6 +3,17 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.57.1 — 2026-11-12
+
+Patch: account for viz2psy's new `context_affect` model.
+
+### Changed
+- `NOT_ADMITTED["viz2psy"]` lists `context_affect` (viz2psy 0.22.0): a
+  candidate V member, extracted for its admission screen only. Without the
+  entry, the live-registry cross-check (`test_live_registry_matches_clamp[viz2psy]`)
+  fails once viz2psy ships the model. Listing it before that release is
+  harmless: the check only subtracts names.
+
 ## 0.57.0 — 2026-11-11
 
 Minor bump: LibriSpeech held-out splits for a separate held-out root.
