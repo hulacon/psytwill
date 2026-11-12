@@ -3,6 +3,29 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.58.0 — 2026-11-12
+
+Minor bump: a readout of an opaque target through a battery's nameable
+members, each read against a matched random-subspace control.
+
+### Added
+- **`psytwill.readout.readout(battery, target, nameable=, strict=, groups=)`**:
+  how much of a target table (a network layer, another model, a brain
+  response, on the battery's rows) the nameable members recover.
+  - Two reads per member set: held-out grouped ridge R² (global) and k-NN
+    overlap against a block-permutation null (local), Euclidean on both
+    sides by default.
+  - The control: random subspaces of the whole battery matched to the set's
+    dimensionality and captured variance share
+    (`psytwill.subspace.matched_subspaces`), read through the same two
+    measures, reported as a percentile.
+  - `strict` (a subset of the nameable members) is read first with its own
+    control, so strict and full form a nested curve.
+  - Per member: R² alone, without, and unique (full minus without).
+  - Non-finite rows are dropped and counted, never filled. The record
+    (`Readout.to_dict()`) carries `schema` `1.0` and every parameter.
+  - No CLI verb yet, and no thresholds: what a share means is the caller's.
+
 ## 0.57.1 — 2026-11-12
 
 Patch: account for viz2psy's new `context_affect` model.
