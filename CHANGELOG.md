@@ -3,6 +3,15 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.58.1 — 2026-11-12
+
+Patch: undo 0.57.1's battery entry.
+
+### Removed
+- `NOT_ADMITTED["viz2psy"]["context_affect"]`. viz2psy 0.23.0 withdraws the
+  model, so there is nothing to account for. `vgg19` is the only viz2psy
+  entry again.
+
 ## 0.58.0 — 2026-11-12
 
 Minor bump: a readout of an opaque target through a battery's nameable
