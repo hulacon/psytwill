@@ -97,6 +97,7 @@ BLENDER_VIDEO_SUFFIXES = (".mov", ".mkv", ".mp4")
 LIBRISPEECH_SUBSETS = (
     "dev-clean",
     "test-clean",
+    "test-other",
     "train-clean-100",
     "train-clean-360",
 )
