@@ -300,3 +300,16 @@ def test_exclusions_refuse_to_overwrite_a_written_list(tmp_path, monkeypatch):
     pd.DataFrame({"stimulus_id": ["y"], "chunk_idx": [0]}).to_parquet(base)
     with pytest.raises(SystemExit, match="immutable"):
         extract.cmd_exclusions(argparse.Namespace(base_rows=str(base), base_reason="r", out=str(out), dry_run=False))
+
+
+def test_roots_resolve_the_nsd_brick(tmp_path, monkeypatch):
+    # Regression: 0.50.0 left this assignment after the return in framing_sha256, so
+    # Roots never had nsd_hdf5 and every nsd/image unit listing raised AttributeError.
+    monkeypatch.delenv("PSYTWILL_NSD_HDF5", raising=False)
+    assert _roots(tmp_path).nsd_hdf5 is None
+    monkeypatch.setenv("PSYTWILL_NSD_HDF5", str(tmp_path / "nsd.hdf5"))
+    roots = _roots(tmp_path)
+    assert roots.nsd_hdf5 == tmp_path / "nsd.hdf5"
+    monkeypatch.setattr(extract, "ROOTS", roots, raising=False)
+    units = extract._nsd_units()
+    assert units and units[0].inputs == [str(tmp_path / "nsd.hdf5")]

@@ -143,6 +143,7 @@ class Roots:
         self.framing_table = self._resolve(args.framing_table, "PSYTWILL_FRAMING_TABLE", "--framing-table",
                                            required=False)
         self._framing_sha: str | None = None
+        self.nsd_hdf5 = self._resolve(args.nsd_hdf5, "PSYTWILL_NSD_HDF5", "--nsd-hdf5", required=False)
 
     def framing_sha256(self) -> str:
         """The framing table's sha256, from its parameter record (viz2psy writes it)."""
@@ -155,7 +156,6 @@ class Roots:
                 sys.exit(f"ERROR: framing table {self.framing_table} has no parameter record {rec}")
             self._framing_sha = json.loads(rec.read_text())["sha256"]
         return self._framing_sha
-        self.nsd_hdf5 = self._resolve(args.nsd_hdf5, "PSYTWILL_NSD_HDF5", "--nsd-hdf5", required=False)
 
     @staticmethod
     def _resolve(flag: str | None, env: str, name: str, required: bool = True) -> Path | None:

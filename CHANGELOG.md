@@ -3,6 +3,17 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+
+## 0.58.1 — 2026-11-12
+
+Patch: `scripts/fitcorpus/extract.py` lists NSD units again.
+
+### Fixed
+- `Roots.__init__` sets `nsd_hdf5` (from `--nsd-hdf5` / `$PSYTWILL_NSD_HDF5`). Since
+  0.50.0 the assignment sat after the `return` in `framing_sha256()`, so it never
+  ran, and listing `nsd/image` units (`plan`, `run`, `aggregate`) raised
+  `AttributeError`. Regression test added.
+
 ## 0.58.0 — 2026-11-12
 
 Minor bump: a readout of an opaque target through a battery's nameable
