@@ -319,7 +319,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.18"
+        assert meta["space_schema_version"] == "1.19"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -708,7 +708,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.18"
+        assert meta["space_schema_version"] == "1.19"
 
 
 
