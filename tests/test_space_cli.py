@@ -252,7 +252,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.18"
+    assert manifest["space_schema_version"] == "1.19"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])
@@ -516,3 +516,43 @@ def test_like_can_add_per_corpus_scoring_to_a_pooled_source_at_its_k(two_corpora
     assert main(["space", "fit", "--like", str(out / "P.json"), "--per-corpus", "--k-schedule", "2,4",
                  "-o", str(out), "--stem", "nope"]) != 0
     assert "cannot choose k" in capsys.readouterr().err
+
+
+# --- targets from their own tables, never narrowing the block (schema 1.19) ---
+
+
+def test_target_features_with_like_keep_the_block_rows(two_corpora, tmp_path, capsys):
+    """A candidate extracted on one corpus of a two-corpus block: with --target-features
+    and --target-rows block it is scored on its own rows against the unchanged block."""
+    members, cand = [], tmp_path / "cand_features.parquet"
+    for path in two_corpora:
+        df = pd.read_parquet(path)
+        m = tmp_path / f"members_{path.name}"
+        df[df["model"] == "a"].to_parquet(m, index=False)
+        members.append(m)
+        if "librispeech" in path.name:
+            df[df["model"] == "b"].to_parquet(cand, index=False)
+    out = tmp_path / "space"
+    fit_args = [x for x in FIT_ARGS if x not in ("--members", "a,b")]
+    assert main(["space", "fit", "--features", *map(str, members), "--key", "stimulus_id,time",
+                 "--window", "0.5", "--groups-from-label", "--corpora-from-label", "--per-corpus",
+                 "--members", "a", "-o", str(out), "--stem", "P", *fit_args]) == 0
+    p = json.loads((out / "P.json").read_text())
+    assert p["n_rows"] == 2 * N_STIM * N_BINS
+    like = ["space", "fit", "--like", str(out / "P.json"), "--target-features", str(cand),
+            "--targets", "b", "-o", str(out)]
+    assert main([*like, "--target-rows", "block", "--stem", "P_b"]) == 0
+    got = json.loads((out / "P_b.json").read_text())
+    assert got["n_rows"] == p["n_rows"] and got["k"] == p["k"] and got["members"] == ["a"]
+    assert got["inputs"] == p["inputs"] and got["target_inputs"] == [str(cand)]
+    assert got["target_rows"] == {"mode": "block", "rows_absent": {"b": N_STIM * N_BINS}}
+    pt = got["per_target"]["b"]
+    assert pt["rows_present"] == N_STIM * N_BINS
+    assert np.allclose(got["block_eigenvalues"], p["block_eigenvalues"])
+    # the default narrows the fit to the candidate's corpus
+    assert main([*like, "--stem", "P_b_narrow"]) == 0
+    assert json.loads((out / "P_b_narrow.json").read_text())["n_rows"] == N_STIM * N_BINS
+    capsys.readouterr()
+    assert main(["space", "fit", "--like", str(out / "P.json"), "--target-features", str(cand),
+                 "-o", str(out)]) != 0
+    assert "name them with --targets" in capsys.readouterr().err

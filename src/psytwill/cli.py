@@ -667,11 +667,13 @@ def _space_load(args: argparse.Namespace, members: list[str] | None = None, *,
     key = tuple(args.key.split(","))
     rep = LoadReport()
     where: dict[str, list[str]] = {}
-    table_nulls = {str(path): group_nulls(path) for path in args.features}
+    # `space fit --target-features`: tables read for outside targets only
+    tables = list(args.features) + list(getattr(args, "target_features", None) or [])
+    table_nulls = {str(path): group_nulls(path) for path in tables}
     # labels and checkpoints matter only to a fit (projection uses the fit's columns)
-    table_labels = {str(path): group_labels(path) for path in args.features} if want_labels else {}
-    table_ckpts = {str(path): group_checkpoints(path) for path in args.features} if want_labels else {}
-    for path in args.features:
+    table_labels = {str(path): group_labels(path) for path in tables} if want_labels else {}
+    table_ckpts = {str(path): group_checkpoints(path) for path in tables} if want_labels else {}
+    for path in tables:
         for m in sorted(distinct_values(path, "model")):
             where.setdefault(m, []).append(str(path))
     if members is None:
@@ -867,6 +869,10 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     if args.leave_out and not args.like:
         raise SpaceError("--leave-out takes members out of a --like fit; without one, list --members")
     targets = _split(args.targets)
+    if args.target_features and not targets:
+        raise SpaceError("--target-features holds outside targets: name them with --targets")
+    if args.target_rows == "block" and not targets:
+        raise SpaceError("--target-rows block says how targets meet the block's rows: give --targets")
     if targets and not args.members:
         raise SpaceError("--targets needs the block's --members listed (or --like), so a target "
                          "can never be read as a member")
@@ -891,7 +897,9 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     if args.groups_from_label or args.corpora_from_label or args.per_corpus or args.corpus_weights:
         from psytwill.store import align_spaces
 
-        _, labels = align_spaces({m: spaces[m] for m in members + targets})
+        # block mode: the rows are the members' alone (targets never narrow them)
+        on_rows = members if args.target_rows == "block" else members + targets
+        _, labels = align_spaces({m: spaces[m] for m in on_rows})
         if args.groups_from_label:
             groups = [lab.split("|")[0] for lab in labels]
         if args.corpora_from_label or args.per_corpus or args.corpus_weights:
@@ -935,7 +943,8 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                     defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
                     member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
                     targets=targets, column_labels=rep.labels, checkpoints=rep.checkpoints,
-                    select=args.select, label_sources=rep.label_sources, absent=absent)
+                    select=args.select, label_sources=rep.label_sources, absent=absent,
+                    target_rows=args.target_rows)
     sel = fit.manifest["selection"]
     if sel:
         print(f"  selection {sel['expression']!r}"
@@ -975,6 +984,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
         lw = label_windows(pm.get("labels"), w)
         pm.update(lw if lw is not None else w)
     fit.manifest["inputs"] = [str(p) for p in args.features]
+    fit.manifest["target_inputs"] = [str(p) for p in (args.target_features or [])]
     fit.manifest["item_masks"] = item_record
     for m in members:
         if fit.manifest["per_member"][m].get("item_masked_rows"):
@@ -1858,6 +1868,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated OUTSIDE targets: spaces scored by the block like members at "
                         "every k it walks, but never part of it and never deciding k (needs --members "
                         "or --like); the admission screen's question, `per_target` in the manifest")
+    f.add_argument("--target-features", nargs="+", metavar="TABLE",
+                   help="`psytwill features` table(s) read for the --targets only (never for members), "
+                        "e.g. a candidate extracted outside the battery; allowed with --like. "
+                        "Recorded as `target_inputs`")
+    f.add_argument("--target-rows", choices=("narrow", "block"), default="narrow",
+                   help="narrow (default): the fit's rows are those every member AND target hold, so "
+                        "a target can narrow them. block: the members' rows alone; a target is absent "
+                        "(masked, never filled) from a row its tables lack or on which it is "
+                        "undefinable -- a candidate on part of a mix scored against the unchanged block")
     f.add_argument("--leave-out",
                    help="with --like: drop these members from the block and score each as an outside "
                         "target at the source's k (leave-one-member-out coverage)")

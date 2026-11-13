@@ -319,7 +319,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.18"
+        assert meta["space_schema_version"] == "1.19"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -708,7 +708,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.18"
+        assert meta["space_schema_version"] == "1.19"
 
 
 
@@ -1339,6 +1339,65 @@ def test_outside_target_is_scored_but_never_part_of_the_block(members):
     for r in fit.curve:
         if r["role"] == "member":
             assert r["r2"] == pytest.approx(want[key(r)], abs=1e-12)
+
+
+def _rows(space, keep):
+    keep = np.asarray(keep, dtype=bool)
+    return SpaceMatrix(name=space.name, labels=[lab for lab, k in zip(space.labels, keep) if k],
+                       X=space.X[keep], features=list(space.features))
+
+
+def test_block_target_rows_never_narrow_the_block(members):
+    """--target-rows block (schema 1.19): a target on part of the rows is absent from
+    the rest; the block's rows, map and member scores are those of the fit without it."""
+    spaces, _ = members
+    half = np.arange(N) < N // 2
+    spaces = dict(spaces, c=_rows(spaces["c"], half))
+    base = fit_block(spaces, ["a", "b"], random_state=0, **_fit_kwargs())
+    fit = fit_block(spaces, ["a", "b"], targets=["c"], target_rows="block", random_state=0,
+                    **_fit_kwargs())
+    narrow = fit_block(spaces, ["a", "b"], targets=["c"], random_state=0, **_fit_kwargs())
+    assert narrow.manifest["n_rows"] == N // 2  # the default still narrows (unchanged behaviour)
+    assert fit.manifest["n_rows"] == N and fit.k == base.k
+    np.testing.assert_allclose(fit.map.block_components, base.map.block_components, atol=1e-10)
+    key = lambda r: (r["member"], r["k"], r["fold"])
+    want = {key(r): r["r2"] for r in base.curve}
+    for r in fit.curve:
+        if r["role"] == "member":
+            assert r["r2"] == pytest.approx(want[key(r)], abs=1e-12)
+    tr = fit.manifest["target_rows"]
+    assert tr == {"mode": "block", "rows_absent": {"c": N - N // 2}}
+    pt = fit.manifest["per_target"]["c"]
+    assert pt["rows_present"] == N // 2 and pt["covered_at_k"] is True
+    assert narrow.manifest["target_rows"] == {"mode": "narrow", "rows_absent": None}
+
+
+def test_block_target_undefinable_rows_make_the_target_absent_not_the_row_dropped(members):
+    sp, _ = members
+    X = sp["c"].X.copy()
+    hole = np.arange(5, N, 7)
+    X[hole, :] = np.nan
+    sp = dict(sp, c=SpaceMatrix(name="c", labels=sp["c"].labels, X=X, features=sp["c"].features))
+    pos = {"means": "undefinable", "when": "test"}
+    nulls = {"a": {}, "b": {}, "c": {f: pos for f in sp["c"].features}}
+    fit = fit_block(sp, ["a", "b"], targets=["c"], target_rows="block", nulls=nulls,
+                    random_state=0, **_fit_kwargs())
+    assert fit.manifest["n_rows"] == N  # the block keeps every row
+    assert fit.manifest["target_rows"]["rows_absent"] == {"c": hole.size}
+    assert fit.manifest["per_target"]["c"]["rows_present"] == N - hole.size
+    narrow = fit_block(sp, ["a", "b"], targets=["c"], nulls=nulls, random_state=0, **_fit_kwargs())
+    assert narrow.manifest["n_rows"] == N - hole.size
+
+
+def test_block_target_rows_refusals(members):
+    spaces, _ = members
+    with pytest.raises(SpaceError, match="target_rows must be one of"):
+        fit_block(spaces, ["a", "b"], targets=["c"], target_rows="wide", **_fit_kwargs())
+    other = SpaceMatrix(name="c", labels=[f"x{i}" for i in range(N)], X=spaces["c"].X,
+                        features=spaces["c"].features)
+    with pytest.raises(SpaceError, match="holds none of the block's rows"):
+        fit_block(dict(spaces, c=other), ["a", "b"], targets=["c"], target_rows="block",
+                  **_fit_kwargs())
 
 
 def test_a_failing_target_never_moves_k(members):

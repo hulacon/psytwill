@@ -257,7 +257,14 @@ def split_members(models: Sequence[str]) -> list[str]:
 # segments_units_per_table: {table: n units | null}}); per member
 # `item_masked_rows`, the rows it is absent from because a column it kept read
 # a window across two items of a packed unit. Rows are never dropped for it.
-SPACE_SCHEMA_VERSION = "1.18"
+# 1.19: `target_rows` ({mode, rows_absent}). mode "narrow" (the default, as
+# before): the fit's rows are those every member AND target hold. mode
+# "block": the fit's rows are the members' alone; a target is absent from a
+# block row its tables do not hold, or on which it is undefinable, so a
+# candidate extracted on part of a mix is scored on its own rows against the
+# unchanged block (the admission screen's case). `rows_absent` counts both.
+SPACE_SCHEMA_VERSION = "1.19"
+TARGET_ROW_MODES = ("narrow", "block")
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
 #: `fold` of a curve row scored on every fold's test rows at once, each row
@@ -1386,6 +1393,7 @@ def fit_block(
     select: str | Sequence[str] | None = None,
     label_sources: dict[str, Sequence[str]] | None = None,
     absent: dict[str, dict[str, set]] | None = None,
+    target_rows: str = "narrow",
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
@@ -1397,6 +1405,10 @@ def fit_block(
     a candidate member scored this way asks whether the block already covers
     it (admission). The aligned rows are those every member AND target hold,
     so a target can narrow the fit's rows; ``n_rows`` records what remained.
+    With ``target_rows="block"`` the rows are the members' alone and never
+    narrow: a target is absent (masked, never filled) from a block row its
+    space does not hold, and from rows on which it is undefinable, instead
+    of the row being dropped for the block.
 
     ``defer`` names members that are fitted and scored but do not decide k:
     the walk stops at the first k where every OTHER member passes, and the
@@ -1481,6 +1493,8 @@ def fit_block(
         raise SpaceError(f"targets not in the loaded spaces: {missing}; have {sorted(spaces)}")
     if targets and not score:
         raise SpaceError("targets are scored by the criterion; drop them or score it")
+    if target_rows not in TARGET_ROW_MODES:
+        raise SpaceError(f"target_rows must be one of {TARGET_ROW_MODES}, not {target_rows!r}")
     # 0. Contract B 1.2 labels: bookkeeping out, then the column selection
     lp = apply_labels(spaces, members, targets, column_labels=column_labels, select=select,
                       label_sources=label_sources)
@@ -1489,7 +1503,20 @@ def fit_block(
     if defer and len(defer) == len(members):
         raise SpaceError("the selection leaves only deferred members, so nothing can choose k")
     every = members + targets
-    aligned, labels = align_spaces({m: spaces[m] for m in every})
+    # block mode: targets ride on their OWN rows (those the block also holds)
+    # through the checks and column drops below, and are reindexed onto the
+    # block's rows only before masking, so no step reads a row they lack
+    own = set(targets) if target_rows == "block" else set()
+    if own:
+        aligned, labels = align_spaces({m: spaces[m] for m in members})
+        on_block = set(labels)
+        for t in targets:
+            keep = np.array([lab in on_block for lab in spaces[t].labels], dtype=bool)
+            if not keep.any():
+                raise SpaceError(f"target {t!r} holds none of the block's rows")
+            aligned[t] = _take_rows(spaces[t], keep)
+    else:
+        aligned, labels = align_spaces({m: spaces[m] for m in every})
     nulls = nulls or {}
     kinds = {m: null_kinds(nulls.get(m)) for m in every}
     # 1. refuse any undeclared NaN (per member, on the table being fitted)
@@ -1515,20 +1542,32 @@ def fit_block(
         if corpora is None:
             raise SpaceError("corpus_weights needs one corpus label per row (`--corpora-from-label`)")
         corpus_row_weights(corpora[:1], corpus_weights)  # refuse an unknown scheme up front
-    # 2. drop rows any member declares undefinable
-    undef_rows = undefinable_rows(aligned, kinds)
+    # 2. drop rows any member declares undefinable (block mode: a target's
+    #    undefinable rows make the target absent there, the block keeps them)
+    undef_rows = undefinable_rows({m: aligned[m] for m in every if m not in own}, kinds)
     undefinable_dropped = {m: int(mask.sum()) for m, mask in undef_rows.items()}
+    for t, mask in undefinable_rows({t: aligned[t] for t in own}, kinds).items():
+        undefinable_dropped[t] = int(mask.sum())
+        if mask.any():
+            aligned[t] = _take_rows(aligned[t], ~mask)
     drop = np.zeros(len(labels), dtype=bool)
     for mask in undef_rows.values():
         drop |= mask
     if drop.any():
         keep = ~drop
-        aligned = {m: _take_rows(aligned[m], keep) for m in every}
+        aligned = {m: _take_rows(aligned[m], keep) if m not in own else aligned[m] for m in every}
         labels = [lab for lab, k in zip(labels, keep) if k]
         if groups is not None:
             groups = [x for x, k in zip(groups, keep) if k]
         if corpora is not None:
             corpora = [x for x, k in zip(corpora, keep) if k]
+    if own:
+        on_block = set(labels)
+        for t in own:
+            keep = np.array([lab in on_block for lab in aligned[t].labels], dtype=bool)
+            if not keep.all():
+                aligned[t] = _take_rows(aligned[t], keep)
+    row_corpus = dict(zip(labels, corpora)) if (own and corpora is not None) else None
     # never-null declarations and the gated-`missing` warning read the table
     # before any fill
     declared_never_null: dict[str, list[str]] = {}
@@ -1538,7 +1577,8 @@ def fit_block(
         has_nan = dict(zip(aligned[m].features, np.isnan(X).any(axis=0))) if X.size else {}
         declared_never_null[m] = sorted(c for c in kinds[m] if c in has_nan and not has_nan[c])
         if corpora is not None:
-            gated = detect_structural_columns(aligned[m], corpora, high=structural_null_high,
+            row_corpora = [row_corpus[lab] for lab in aligned[m].labels] if m in own else corpora
+            gated = detect_structural_columns(aligned[m], row_corpora, high=structural_null_high,
                                               low=structural_null_low)
             sus = [c for c in gated if kinds[m].get(c) == "missing"]
             if sus:
@@ -1561,6 +1601,19 @@ def fit_block(
         aligned[m], dropped = drop_low_support(aligned[m], min_support)
         if dropped:
             low_support[m] = dropped
+    # 3b'. block mode: each target onto the block's rows, absent (NaN) on any
+    #      row it does not hold; the NaN is a mask, never a value
+    target_rows_absent: dict[str, int] = {}
+    for t in own:
+        sp = aligned[t]
+        pos = {lab: i for i, lab in enumerate(labels)}
+        X = np.full((len(labels), len(sp.features)), np.nan)
+        idx = np.array([pos[lab] for lab in sp.labels], dtype=int)
+        X[idx] = np.asarray(sp.X, dtype=float)
+        aligned[t] = SpaceMatrix(name=sp.name, labels=list(labels), X=X, features=list(sp.features),
+                                 modality=sp.modality, extractor=sp.extractor,
+                                 n_replicates=sp.n_replicates)
+        target_rows_absent[t] = len(labels) - len(idx)
     # 3c. item masks (Contract B 1.4 windows; :mod:`psytwill.windows`): a member is
     #     absent from a row where a column it still has read a window across
     #     two items. Applied after the undefinable drop, so a mask never drops
@@ -1936,6 +1989,9 @@ def fit_block(
         "per_member": per_member,
         "outside_targets": targets,
         "per_target": per_target,
+        "target_rows": {"mode": target_rows,
+                        # rows the table lacks + rows the target is undefinable on
+                        "rows_absent": (dict(target_rows_absent) if own else None)},
         "labels_source": "contract-b-1.2 labels",
         "selection": None if not lp.clauses else {
             "expression": select_text(lp.clauses),
