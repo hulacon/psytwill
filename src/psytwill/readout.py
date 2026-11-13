@@ -34,6 +34,17 @@ coordinates along orthonormal directions of X (S's own columns are such
 coordinates along the coordinate axes), so they reach the ridge and the
 neighbour search in the same form.
 
+**One metric for all three reads.** The captured share, the k-NN graph and
+the ridge all see a set's columns in the caller's metric, as given. The
+ridge is not z-scored per column (``ridge_predictivity(scaling="set")``:
+one scale for the whole predictor, so the alpha grid applies). So each read
+depends on a set's span and metric, never on the axes it comes in. That
+matters twice. A control draw is an arbitrary orthonormal basis of its span,
+and its coordinates have unequal variances; a per-column z-score would
+undo the variance match the control was drawn for, and make its R² depend
+on which basis the draw returned. And a member's prior weight in the ridge
+is its variance in the caller's metric, not its column count.
+
 **Strict and full.** ``strict`` names a subset of the nameable members (for
 example, the formula-only ones by derivation label). It is read on its own
 with its own control, then the full nameable set, so the two form a nested
@@ -69,7 +80,7 @@ from psytwill.exceptions import SpaceError
 from psytwill.subspace import captured_share, matched_subspaces
 
 #: Bump when a field of :class:`Readout`'s dict form changes meaning or goes away.
-READOUT_SCHEMA = "1.0"
+READOUT_SCHEMA = "1.1"
 
 
 @dataclass
@@ -226,7 +237,8 @@ def readout(
     rng = np.random.RandomState(random_state)
 
     def _r2(P):
-        return ridge_predictivity(P, Y, groups=g, n_splits=n_splits, alphas=alphas, random_state=random_state)
+        return ridge_predictivity(P, Y, groups=g, n_splits=n_splits, alphas=alphas, random_state=random_state,
+                                  scaling="set")
 
     def read_set(label: str, members: list[str], control: bool) -> SetRead:
         idx = np.concatenate([cols[m] for m in members])
@@ -286,5 +298,6 @@ def readout(
         n_groups=None if g is None else int(len(np.unique(g))), target_dims=int(Y.shape[1]),
         params={"n_control": n_control, "n_pool": pool, "tol": tol, "knn": knn, "k_nn": k_nn,
                 "metric": metric, "n_perm": n_perm, "block_size": block_size, "n_splits": n_splits,
-                "alphas": [float(a) for a in alphas], "random_state": random_state},
+                "alphas": [float(a) for a in alphas], "random_state": random_state,
+                "ridge_scaling": "set"},
     )

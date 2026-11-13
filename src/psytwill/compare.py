@@ -175,6 +175,7 @@ def ridge_predictivity(
     n_splits: int = 5,
     alphas: Sequence[float] = DEFAULT_ALPHAS,
     random_state: int = 0,
+    scaling: Literal["column", "set"] = "column",
 ) -> RidgeResult:
     """Cross-validated R^2 predicting space ``Y`` from space ``X``.
 
@@ -185,7 +186,21 @@ def ridge_predictivity(
 
     Pass ``groups`` (e.g. one clip id per row) to split by group. On any
     temporally ordered grid this is not optional — see the module docstring.
+
+    ``scaling`` sets how ``X`` reaches the ridge, from each training fold:
+
+    - ``"column"`` (default): each column z-scored. Every column gets the
+      same prior weight, so a member's weight grows with its width, and the
+      read depends on the coordinate axes ``X`` comes in.
+    - ``"set"``: ``X`` divided by one number, the root mean column variance,
+      so the alpha grid sits where it does for z-scored columns. Relative
+      column scales are kept: the read sees ``X`` in the caller's metric and
+      depends only on its geometry, not its axes (a rotation of ``X``'s
+      columns leaves R^2 unchanged). Use it when another read of the same
+      ``X`` (a captured share, a Euclidean neighbour graph) is in that metric.
     """
+    if scaling not in ("column", "set"):
+        raise SpaceError(f"scaling must be 'column' or 'set'; got {scaling!r}")
     A, B, g, n_dropped = _align(X, Y, groups)
     n = A.shape[0]
     if n < 3:
@@ -210,10 +225,17 @@ def ridge_predictivity(
     per_fold: list[float] = []
     chosen: list[float] = []
     for train, test in splits:
-        scaler = StandardScaler().fit(A[train])
+        if scaling == "column":
+            scaler = StandardScaler().fit(A[train])
+            a_train, a_test = scaler.transform(A[train]), scaler.transform(A[test])
+        else:
+            mu = A[train].mean(0)
+            s = float(np.sqrt(((A[train] - mu) ** 2).mean(0).mean()))
+            s = s if s > 0 else 1.0
+            a_train, a_test = (A[train] - mu) / s, (A[test] - mu) / s
         model = RidgeCV(alphas=list(alphas), alpha_per_target=True)
-        model.fit(scaler.transform(A[train]), B[train])
-        pred = model.predict(scaler.transform(A[test]))
+        model.fit(a_train, B[train])
+        pred = model.predict(a_test)
         oof[test] = pred.reshape(len(test), -1)
         per_fold.append(
             float(r2_score(B[test], oof[test], multioutput="variance_weighted"))
