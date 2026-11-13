@@ -26,8 +26,8 @@ class TestPins:
         by = {}
         for m in BATTERY.values():
             by[m.extractor] = by.get(m.extractor, 0) + 1
-        assert by == {"viz2psy": 16, "aud2psy": 20, "word2psy": 13}
-        assert len(BATTERY) == 49
+        assert by == {"viz2psy": 18, "aud2psy": 20, "word2psy": 14}
+        assert len(BATTERY) == 52
 
     def test_every_learned_model_names_a_checkpoint(self):
         # §4.1: checkpoint REQUIRED for any model with learned weights. The
@@ -55,7 +55,7 @@ class TestPins:
 
     def test_prefixes_unique_and_nesting_documented(self):
         prefixes = [p for m in BATTERY.values() for p in m.prefixes]
-        assert len(prefixes) == len(set(prefixes)) == 50
+        assert len(prefixes) == len(set(prefixes)) == 53
         nested = {
             (c, p) for c in prefixes for p in prefixes
             if c != p and c.startswith(p + "_")
@@ -81,7 +81,7 @@ class TestPins:
 
     def test_records_export(self):
         rows = to_records()
-        assert len(rows) == 49
+        assert len(rows) == 52
         assert rows[0]["extractor"] == "viz2psy"
         assert all(r["battery_version"] == BATTERY_VERSION for r in rows)
         assert all(r["extractor_version"] == EXTRACTOR_VERSIONS[r["extractor"]] for r in rows)
@@ -185,7 +185,7 @@ class TestCli:
         assert "clip_text" in text and BATTERY_VERSION in text
         assert main(["battery", "--json"]) == 0
         rows = json.loads(capsys.readouterr().out)
-        assert len(rows) == 49
+        assert len(rows) == 52
 
     def test_check_files(self, tmp_path, capsys):
         good = tmp_path / "clip.meta.json"
@@ -205,3 +205,25 @@ class TestCli:
         assert main(["battery", "--check", str(good), "--require-all"]) == 1
         err = capsys.readouterr().err
         assert "never emitted" in err and "diarize" in err
+
+
+class TestAttached:
+    """Battery 0.4: attached models are pinned (group tables, sidecar checks) but in no block."""
+
+    def test_attached_models_pass_the_clamp(self):
+        for name, ckpt in (("context_affect", "ViT-L-14/openai+context_affect_v1"),
+                           ("experiential", "ViT-L-14/openai+experiential_v1")):
+            assert BATTERY[name].attached
+            assert check_sidecar(_sidecar(name, ckpt)) == []
+        assert not BATTERY["clip"].attached
+
+    def test_attached_models_are_never_default_or_listed_members(self):
+        import argparse
+
+        from psytwill.cli import _space_members
+        from psytwill.exceptions import SpaceError
+
+        args = argparse.Namespace(members=None, block="V")
+        assert _space_members(args, ["clip", "context_affect", "experiential"]) == ["clip"]
+        with pytest.raises(SpaceError, match="attached model"):
+            _space_members(argparse.Namespace(members="clip,experiential", block="V"), [])

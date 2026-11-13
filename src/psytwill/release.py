@@ -181,6 +181,11 @@ def resolve_attached(entries: Sequence[dict], *, root: str | Path | None = None,
         if name in seen:
             raise SpaceError(f"attached {name!r} given twice")
         seen.add(name)
+        from psytwill.battery import BATTERY
+
+        if model in BATTERY and not BATTERY[model].attached:
+            raise SpaceError(f"attached {name}: {model} is a battery member that is not marked attached "
+                             "(battery `attached=True`)")
         if model in set(block_members):
             raise SpaceError(f"attached {name}: {model} is a member of a released block; an attached "
                              "member is in no block")

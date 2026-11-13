@@ -26,7 +26,17 @@ Minor bump: releases carry **attached members** (release schema 1.5).
     with no sidecar, an undeclared column, and a model that is a member of a released
     block.
 - `release verify` / `load_release` refuse a release whose attached files changed or
-  went missing.
+  went missing, and `release write` refuses an attached entry naming a battery model
+  that is not marked attached.
+- **Battery 0.4 (clamped 2026-11-13): attached models.** `BatteryModel.attached`; three
+  models are pinned as attached: `context_affect` (viz2psy), `experiential` (viz2psy)
+  and `lexical_norms_experiential` (word2psy; the nested prefix is documented).
+  - An attached model passes `check_sidecar`, so its tables may sit in group tables.
+  - It is never a block member: `space fit` leaves it out of a block's default members
+    and refuses it in `--members`. It may still be an outside target.
+  - `vitl14` (the ViT-L-14 embedding cache the heads read) is listed NOT_ADMITTED,
+    and `context_affect` leaves NOT_ADMITTED. The live-registry clamp tests pass again.
+  - `battery --json` rows carry `attached`.
 
 ### Changed
 - `RELEASE_SCHEMA_VERSION` 1.4 → 1.5; release manifests always carry `attached` (a

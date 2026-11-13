@@ -260,6 +260,8 @@ def test_attached_entries_are_checked(fitted, store):
         build(_entry(bar="yes"))
     with pytest.raises(SpaceError, match="is a member of a released block"):
         build(_entry(model="p1"))  # the P stand-in block's member
+    with pytest.raises(SpaceError, match="not marked attached"):
+        build(_entry(model="clip"))
     with pytest.raises(SpaceError, match="give a root"):
         build_release(name="sp", version="0.2.0", blocks=[fitted["P"]], attached=[_entry()])
 

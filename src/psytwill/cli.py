@@ -561,13 +561,19 @@ def _run_battery(args: argparse.Namespace) -> None:
 def _space_members(args: argparse.Namespace, available: list[str]) -> list[str]:
     """Members from --members, else every available model whose battery pin
     has the block's modality and a numeric kind (embedding | profile)."""
-    if args.members:
-        return [m.strip() for m in args.members.split(",") if m.strip()]
     from psytwill.battery import BATTERY
+
+    if args.members:
+        members = [m.strip() for m in args.members.split(",") if m.strip()]
+        attached = [m for m in members if m in BATTERY and BATTERY[m].attached]
+        if attached:
+            raise SpaceError(f"{attached}: attached model(s) are in no block; read them as --targets, "
+                             "or ship them through a release's `attached` section")
+        return members
 
     modality = {"V": "visual", "A": "audio", "L": "text"}.get(args.block, args.block)
     want = {name for name, m in BATTERY.items()
-            if m.modality == modality and m.kind in ("embedding", "profile")}
+            if m.modality == modality and m.kind in ("embedding", "profile") and not m.attached}
     members = [name for name in available if name in want]
     if not members:
         raise SpaceError(
