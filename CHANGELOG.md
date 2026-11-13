@@ -4,6 +4,64 @@ Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
 
+## 0.60.0 — 2026-11-13
+
+Minor bump: the readout's R² read sees a set in the caller's metric, as its
+captured share and k-NN read already did (readout schema 1.1); and
+`psytwill.directions`, per-direction member energy, universality and
+split-half reliability of a fitted block.
+
+### Changed
+- **`psytwill.readout.readout`**: the ridge no longer z-scores each predictor
+  column. Before, the three reads of one set used two metrics: the captured
+  share and the Euclidean k-NN graph took the columns as given, the R² read
+  took them z-scored. Two consequences:
+  - A control draw is an arbitrary orthonormal basis of its span, with
+    unequal coordinate variances. Z-scoring undid the variance match the
+    control was drawn for, and its R² depended on which basis the draw came
+    in.
+  - A member's prior weight in the ridge grew with its column count, not
+    with its variance in the caller's metric.
+  R², `r2_per_fold`, `control_r2`, `r2_percentile` and the per-member R²
+  columns change for any battery whose columns are not already equal in
+  variance. Records carry `params.ridge_scaling = "set"`; `READOUT_SCHEMA`
+  is 1.1.
+
+### Added
+- **`psytwill.directions`**, per-direction properties of a fitted block
+  (`BlockMap`):
+  - `member_energy`: each direction's squared loading on each member's
+    whitened columns, normalised over members (long form, with member width).
+  - `universality`: u_d, the participation ratio of a direction's member
+    energies over the member count (1/M = one member, 1 = all equally).
+  - `direction_reliability(reference, half_a, half_b, align=)`: rho_d, the
+    correlation of each direction's scores between two half fits after
+    aligning both to the reference, by one orthogonal Procrustes rotation
+    (default) or by sign only (strict: a swap of near-equal eigenvalues
+    scores low).
+  - `direction_table`: `component, eigenvalue, u[, rho]`, one row per direction.
+  - `python -m psytwill.directions <manifest> --out <table> [--energy <long>]`.
+  - Disclosed: inside a degenerate eigenspace the PCA's basis is arbitrary,
+    and so is u. PR whitening gives every kept member direction unit variance,
+    so private directions of different members can sit at near-equal
+    eigenvalues.
+- `compare.ridge_predictivity(scaling=)`: `"column"` (default, unchanged:
+  per-column z-score) or `"set"` (centre, then divide by one number, the root
+  mean column variance from the training fold, so the alpha grid applies).
+  With `"set"` the read depends on X's geometry only: rotating X's columns
+  leaves R² unchanged. `space` and `geometry` keep `"column"`.
+
+### Tests
+- Rotating an anisotropic member's columns leaves every read unchanged:
+  share, k-NN overlap, R², and each per-member R². Before the fix, R² moved
+  (0.134 → 0.138 on the planted battery).
+- A control-shaped predictor (`X @ B`, `B` orthonormal) gives the same R² in
+  any basis of its span under `"set"`, and a different one under `"column"`.
+- `test_directions.py`: energies and u worked by hand; u bounds; on a fitted
+  block, a latent two members share has u = 2/3 of three and a private one 1/3;
+  u changes with the basis of a degenerate eigenspace; rho high for stable
+  directions and near 0 for noise; sign alignment is strict where Procrustes
+  absorbs a swap; refusals.
 ## 0.59.0 — 2026-11-13
 
 Minor bump: an outside target can come from its own tables and can be scored

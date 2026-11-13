@@ -117,7 +117,7 @@ def test_same_seed_same_result_and_the_record_is_json():
     a, b = readout(bat, T, **kw), readout(bat, T, **kw)
     assert a.to_dict() == b.to_dict()
     rec = json.loads(json.dumps(a.to_dict()))
-    assert rec["schema"] == "1.0" and rec["battery"] == ["named_a", "named_b", "embed"]
+    assert rec["schema"] == "1.1" and rec["battery"] == ["named_a", "named_b", "embed"]
 
 
 @pytest.mark.parametrize("kw, msg", [
@@ -139,3 +139,45 @@ def test_rows_must_agree():
         readout(bat, np.zeros((N - 1, 2)), nameable=["named_a"])
     with pytest.raises(SpaceError, match="groups has"):
         readout(bat, _target(bat["named_a"]), nameable=["named_a"], groups=np.arange(5))
+
+
+def test_every_read_sees_a_sets_span_in_the_callers_metric_not_its_axes():
+    # An anisotropic member, then the same member with its columns rotated: the same span and the same
+    # metric, on different coordinate axes. The share and the Euclidean k-NN read are blind to the axes,
+    # so the R^2 read must be too; z-scoring each column would re-weight the rotated directions. The
+    # control's draws are an arbitrary orthonormal basis of their span, so this is also what makes a
+    # control draw's R^2 independent of which basis it came in.
+    rng = np.random.default_rng(5)
+    bat = _battery()
+    bat["named_a"] = bat["named_a"] * np.array([3.0, 1.0, 0.1])
+    R, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    rot = dict(bat, named_a=bat["named_a"] @ R)
+    T = _target(bat["named_a"], bat["embed"][:, :3], noise=0.3)
+    kw = dict(nameable=["named_a", "named_b"], groups=_groups(), n_control=0, n_perm=50, k_nn=10)
+    a, b = readout(bat, T, **kw), readout(rot, T, **kw)
+    ra, rb = a.read("nameable"), b.read("nameable")
+    assert rb.share == pytest.approx(ra.share, abs=1e-12)
+    assert rb.knn_overlap == pytest.approx(ra.knn_overlap, abs=1e-12)
+    assert rb.r2 == pytest.approx(ra.r2, abs=1e-8)
+    for pa, pb in zip(a.per_member, b.per_member):
+        for key in ("r2_alone", "r2_without", "r2_unique"):
+            assert pb[key] == pytest.approx(pa[key], abs=1e-8)
+    assert a.params["ridge_scaling"] == "set"
+
+
+def test_a_control_draws_r2_does_not_depend_on_the_basis_it_came_in():
+    from psytwill.compare import ridge_predictivity
+    rng = np.random.default_rng(6)
+    bat = _battery()
+    X = np.hstack(list(bat.values()))
+    Xc = X - X.mean(0)
+    B, _ = np.linalg.qr(rng.normal(size=(X.shape[1], 4)))
+    R, _ = np.linalg.qr(rng.normal(size=(4, 4)))
+    T = _target(bat["embed"][:, :4])
+    one = ridge_predictivity(Xc @ B, T, groups=_groups(), scaling="set").r2
+    other = ridge_predictivity(Xc @ B @ R, T, groups=_groups(), scaling="set").r2
+    assert other == pytest.approx(one, abs=1e-8)
+    # the per-column z-score that space/geometry keep is not basis-free, which is the point of the option
+    zs = ridge_predictivity(Xc @ B, T, groups=_groups()).r2
+    zr = ridge_predictivity(Xc @ B @ R, T, groups=_groups()).r2
+    assert abs(zs - zr) > 1e-6
