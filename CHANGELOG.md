@@ -4,6 +4,24 @@ Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
 
+## 0.59.0 — 2026-11-13
+
+Minor bump: an outside target can come from its own tables and can be scored
+without narrowing the block's rows. Space schema 1.19.
+
+### Added
+- `space fit --target-features TABLE ...`: tables read for the `--targets` only,
+  never for members; allowed with `--like`, so a candidate extracted outside the
+  battery is scored against an existing fit's exact inputs, rows and folds.
+  Recorded as `target_inputs`.
+- `space fit --target-rows {narrow,block}` / `fit_block(target_rows=)`. `narrow`
+  (default) is the existing behaviour: the fit's rows are those every member and
+  target hold. `block`: the members' rows alone. A target is absent (masked, never
+  filled) from a block row its tables lack, and from rows on which it is
+  undefinable, where `narrow` would drop that row for the whole block. The
+  target's NaN refusal, column drops and support are decided on its own rows.
+- Manifest `target_rows` {`mode`, `rows_absent`}.
+
 ## 0.58.1 — 2026-11-12
 
 Patch: `scripts/fitcorpus/extract.py` lists NSD units again.
