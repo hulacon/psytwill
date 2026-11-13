@@ -864,8 +864,15 @@ def _split(arg: str | None) -> list[str]:
     return [x.strip() for x in (arg or "").split(",") if x.strip()]
 
 
-def _run_space_fit(args: argparse.Namespace) -> None:
-    from psytwill.space import DEFAULT_K_SCHEDULE, SPACE_SCHEMA_VERSION, fit_block, save_fit
+def _space_fit_setup(args: argparse.Namespace, *, curve_to_disk: bool = True) -> tuple[dict, list, dict, dict]:
+    """Everything `space fit` reads before it fits: ``(spaces, members, fit_block kwargs, context)``.
+
+    ``context`` carries what the save needs afterwards (``like``, ``windows``,
+    ``item_record``, ``rep``, ``n_excl``, ``partial``). With ``curve_to_disk``
+    False no partial curve file is made and the walk prints nothing (a caller
+    that fits without saving, e.g. `space subspaces`'s half fits).
+    """
+    from psytwill.space import DEFAULT_K_SCHEDULE, SPACE_SCHEMA_VERSION
 
     like = _apply_like(args) if args.like else None
     if not args.features or not args.block:
@@ -927,8 +934,9 @@ def _run_space_fit(args: argparse.Namespace) -> None:
 
     stem = args.stem or f"{args.block}_v{SPACE_SCHEMA_VERSION.split('.')[0]}"
     partial = Path(args.output) / f"{stem}_curve.partial.csv"
-    partial.parent.mkdir(parents=True, exist_ok=True)
-    partial.unlink(missing_ok=True)
+    if curve_to_disk:
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        partial.unlink(missing_ok=True)
 
     def on_row(row, _cols=[]):
         import csv
@@ -940,17 +948,30 @@ def _run_space_fit(args: argparse.Namespace) -> None:
                 w.writeheader()
             w.writerow(row)
 
-    fit = fit_block(spaces, members, block=args.block, k_schedule=schedule, n_splits=args.n_splits,
-                    groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
-                    n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
-                    random_state=args.seed, progress=progress, per_corpus=args.per_corpus,
-                    corpus_weights=args.corpus_weights,
-                    on_row=on_row,
-                    defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
-                    member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
-                    targets=targets, column_labels=rep.labels, checkpoints=rep.checkpoints,
-                    select=args.select, label_sources=rep.label_sources, absent=absent,
-                    target_rows=args.target_rows)
+    kw = dict(block=args.block, k_schedule=schedule, n_splits=args.n_splits,
+              groups=groups, corpora=corpora, nulls=rep.nulls, r2_min=args.r2_min, alpha=args.alpha, k_nn=args.k_nn,
+              n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
+              random_state=args.seed, progress=progress if curve_to_disk else None, per_corpus=args.per_corpus,
+              corpus_weights=args.corpus_weights,
+              on_row=on_row if curve_to_disk else None,
+              defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
+              member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
+              targets=targets, column_labels=rep.labels, checkpoints=rep.checkpoints,
+              select=args.select, label_sources=rep.label_sources, absent=absent,
+              target_rows=args.target_rows)
+    ctx = {"like": like, "windows": windows, "item_record": item_record, "rep": rep, "n_excl": n_excl,
+           "partial": partial}
+    return spaces, members, kw, ctx
+
+
+def _run_space_fit(args: argparse.Namespace) -> None:
+    from psytwill.space import fit_block, save_fit
+
+    spaces, members, kw, ctx = _space_fit_setup(args)
+    like, windows, item_record, rep, n_excl, partial = (ctx[k] for k in ("like", "windows", "item_record", "rep",
+                                                                           "n_excl", "partial"))
+    fit = fit_block(spaces, members, **kw)
+    targets = kw["targets"]
     sel = fit.manifest["selection"]
     if sel:
         print(f"  selection {sel['expression']!r}"
@@ -1122,6 +1143,130 @@ def _project_frame(fit, spaces: dict, key: str, view: str, k: int | None = None,
     for j, kname in enumerate(key.split(",")):
         df.insert(j, kname, [p[j] if j < len(p) else None for p in parts])
     return df
+
+
+def _run_space_subspaces(args: argparse.Namespace) -> None:
+    """Shared and unique subspaces of a frozen block, and their split-half gate (psytwill.shared_unique)."""
+    import hashlib
+    import json
+    import time
+
+    import numpy as np
+
+    from psytwill import shared_unique as su
+    from psytwill.space import _take_rows, fit_block, load_fit, select_features
+    from psytwill.store import align_spaces
+
+    t0 = time.time()
+    like = Path(args.like)
+    frozen = load_fit(like)
+    stem = args.stem or f"{frozen.block}_subspaces"
+
+    def say(msg):
+        print(f"  [{time.time() - t0:.0f} s] {msg}", flush=True)
+
+    # the frozen fit's own inputs and rows, exactly as `space fit --like` reads them
+    fit_args = build_parser().parse_args(["space", "fit", "--like", str(like), "--no-criterion",
+                                          "-o", str(args.output), "--stem", f"{stem}_refit"])
+    spaces, members, kw, _ = _space_fit_setup(fit_args, curve_to_disk=False)
+    if kw.get("targets"):
+        raise SpaceError(f"{like.name} has outside targets; subspaces read the block's members only")
+    full = fit_block(spaces, members, keep_rows=True, **kw)
+    if list(full.members) != list(frozen.members):
+        raise SpaceError(f"the refit keeps members {full.members}, the frozen fit {frozen.members}: the inputs "
+                         f"changed since {like.name} was fitted")
+    # a saved fit keeps no row labels: its row count and every member's kept columns stand in for them
+    n_frozen = int(frozen.manifest["n_rows"])
+    if len(full.labels) != n_frozen:
+        raise SpaceError(f"the refit has {len(full.labels)} rows, the frozen fit {n_frozen}: the inputs changed "
+                         f"since {like.name} was fitted")
+    moved = [m for m in frozen.members
+             if list(full.map.whiteners[m].features) != list(frozen.map.whiteners[m].features)]
+    if moved:
+        raise SpaceError(f"the refit keeps other columns than {like.name} for {', '.join(moved)}: the inputs "
+                         f"changed since it was fitted")
+    say(f"fit rows {len(full.labels)} over {len(full.members)} members (the frozen fit's count and columns)")
+
+    def concat_through(fit_map):
+        return fit_map.concat({m: select_features(full.rows[m], fit_map.whiteners[m].features)
+                               for m in fit_map.members})
+
+    W = concat_through(frozen.map)
+    weights = full.row_weights
+    objs, info = su.block_subspaces(frozen.map, W, c=args.shared_c, unique=args.unique,
+                                    max_absent=args.max_absent, weights=weights)
+    Sr, Ur = objs["S"].raw_scores(frozen.map, W), objs["U"].raw_scores(frozen.map, W)
+    ok = np.isfinite(Sr).all(axis=1) & np.isfinite(Ur).all(axis=1)
+    overlap = {**su.span_overlap(Sr[ok], Ur[ok]), "n_rows": int(ok.sum())}
+    k = int(frozen.k)
+    Fr, Rr = frozen.map.scores_from_concat(W, k), full.map.scores_from_concat(concat_through(full.map), k)
+    ok = np.isfinite(Fr).all(axis=1) & np.isfinite(Rr).all(axis=1)
+    refit = {**su.span_overlap(Fr[ok], Rr[ok]), "k": k, "n_rows": int(ok.sum())}
+    say(f"S {objs['S'].dim} dims; U {objs['U'].dim} dims over {len(info['read']) - len(info['shared_only'])} "
+        f"members; S/U msc {overlap['msc']}; refit vs frozen top-{k} msc {refit['msc']:.4f}")
+
+    gate = None
+    gate_meta = None
+    if not args.no_gate:
+        half = su.unit_halves(full.labels, args.half_seed)
+        _, aligned_labels = align_spaces({m: spaces[m] for m in members})
+        row_half = su.unit_halves(aligned_labels, args.half_seed)
+        read_cols = np.zeros(W.shape[1], dtype=bool)
+        for m in info["read"]:
+            read_cols[su.member_slices(frozen.map)[m]] = True
+        halves, half_info = [], []
+        for h in (0, 1):
+            sub = {m: _take_rows(sp, su.unit_halves(sp.labels, args.half_seed) == h) for m, sp in spaces.items()}
+            kh = dict(kw)
+            for key in ("groups", "corpora"):
+                if kh.get(key) is not None:
+                    kh[key] = [v for v, hh in zip(kh[key], row_half) if hh == h]
+            fh = fit_block(sub, members, **kh)
+            if list(fh.members) != list(frozen.members):
+                raise SpaceError(f"half {h} keeps members {fh.members}; the block has {frozen.members}")
+            Wh = concat_through(fh.map)
+            oh, ih = su.block_subspaces(fh.map, Wh, c=args.shared_c, unique=args.unique,
+                                        max_absent=args.max_absent, weights=weights, rows=half == h, basis=False)
+            halves.append((oh, fh.map, Wh))
+            half_info.append({"half": h, "n_fit_rows": int(fh.manifest["n_rows"]),
+                              "n_units": int(len({su.unit_of(x) for x in fh.labels})), **ih})
+            say(f"half {h}: {fh.manifest['n_rows']} rows; S {oh['S'].raw_dim} dims")
+        ref = W[:, read_cols]
+        gate = su.reproducibility(halves, ref[np.isfinite(ref).all(axis=1)], n_random=args.n_random,
+                                  seed=args.half_seed, msc_min=args.gate_msc, margin=args.gate_margin)
+        gate.insert(2, "dim", [objs[n].dim if n in objs else 0 for n in gate["object"]])
+        for n, p in zip(gate["object"], gate["passed"]):
+            if n in objs:
+                objs[n].detail["gate_passed"] = None if p is None or p != p else bool(p)
+        gate_meta = {"half_seed": args.half_seed, "n_random": args.n_random, "msc_min": args.gate_msc,
+                     "margin": args.gate_margin, "halves": half_info}
+    draws, draw_info = ({}, None) if not args.draws else su.draw_subspaces(
+        objs, frozen.map, W, n=args.draws, seed=args.draw_seed, weights=weights)
+    if draws:
+        say(f"draws: {args.draws} x (S, U, ref) at d {draw_info['d']}; per-member S draws "
+            f"{draw_info['per_member_dim']}")
+    raw = like.read_bytes()
+    meta = {"block": frozen.block, "fit_manifest": str(like.resolve()),
+            "fit_manifest_sha256": hashlib.sha256(raw).hexdigest(), "k": k, "members": list(frozen.members),
+            "shared_c": args.shared_c, "unique": args.unique, "max_absent": args.max_absent,
+            "n_fit_rows": len(full.labels), "row_weights": (json.loads(raw).get("corpus_weights") or {}).get("scheme"),
+            "unique_info": info, "overlap_S_U": overlap, "refit_vs_frozen": refit, "gate_settings": gate_meta,
+            "draws": draw_info,
+            "seconds": round(time.time() - t0)}
+    npz, js = su.save_subspaces({**objs, **draws}, meta, args.output, stem=stem, gate=gate)
+    print(f"psytwill space subspaces [{frozen.block}] -> {js}")
+    rows = {} if gate is None else {r["object"]: r for r in gate.to_dict("records")}
+    if draws:
+        print(f"  + {len(draws)} draws (d {draw_info['d']})")
+    for n, o in objs.items():
+        r = rows.get(n)
+        if r is None:
+            verdict = ""
+        elif r["n_rows"]:
+            verdict = f"  msc {r['msc']:.3f} vs random {r['random_msc']:.3f}: {'PASS' if r['passed'] else 'fail'}"
+        else:
+            verdict = f"  {r['reason']}"
+        print(f"  {n}: {o.dim} dims{verdict}")
 
 
 def _run_space_project(args: argparse.Namespace) -> None:
@@ -1943,6 +2088,35 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
     f.set_defaults(func=_run_space_fit)
+
+    sb = spsub.add_parser("subspaces", help="shared and unique subspaces of a frozen block, gated by split-half "
+                                            "reproducibility (psytwill.shared_unique)")
+    sb.add_argument("--like", required=True, metavar="MANIFEST",
+                    help="the frozen block fit (.json); its inputs and rows are re-read as `space fit --like` does, "
+                         "and the refit's rows must be the frozen fit's")
+    sb.add_argument("--shared-c", type=float, default=0.5,
+                    help="S = the leading block directions with eigenvalue >= 1 + c (default 0.5)")
+    sb.add_argument("--unique", type=float, default=0.5,
+                    help="a direction of a member is unique when >= this share of its variance is residual "
+                         "on every other member (default 0.5)")
+    sb.add_argument("--max-absent", type=float, default=0.5,
+                    help="a member absent from >= this share of the rows gets no unique subspace (default 0.5)")
+    sb.add_argument("--half-seed", type=int, default=0,
+                    help="halves = sha256 parity of '<seed>:<stimulus id>' (default 0)")
+    sb.add_argument("--n-random", type=int, default=20,
+                    help="random-span pairs per object for the gate's reference (default 20)")
+    sb.add_argument("--gate-msc", type=float, default=0.5, help="gate: halves' msc >= this (default 0.5)")
+    sb.add_argument("--gate-margin", type=float, default=0.25,
+                    help="gate: and >= the random pairs' mean msc + this (default 0.25)")
+    sb.add_argument("--no-gate", action="store_true", help="the frozen fit's objects only, no half fits")
+    sb.add_argument("--draws", type=int, default=20,
+                    help="random spans per kind for the brain read, saved with the objects: S@dNNN / U@dNNN at "
+                         "d = min(dim S, dim U), ref@dNNN, and S@<member>.dNNN at each unique subspace's dim "
+                         "(default 20; 0 = none)")
+    sb.add_argument("--draw-seed", type=int, default=0, help="seed of the draws (default 0)")
+    sb.add_argument("-o", "--output", required=True, help="output directory")
+    sb.add_argument("--stem", help="file stem (default <block>_subspaces)")
+    sb.set_defaults(func=_run_space_subspaces)
 
     pr = spsub.add_parser("project", help="apply a frozen block to a features table")
     _space_common(pr)
