@@ -22,6 +22,17 @@ Two write-time rules (DECIDED 2026-10-10, psytwill-space 0.2.0):
   carries every member's context window; a time-keyed block whose member has
   none declared, or a block keyed without time holding a windowed member, is
   refused. Older blocks predate the field and are recorded as such.
+
+**Attached members** (release schema 1.5). A screened candidate can ship beside
+the space without being in it: an opt-in producer feature, extracted on the
+release's stimuli, in no block, relation or refit. Each entry names the producer
+model, its ``basis``, the gap it explores and where its evidence is recorded,
+and the base feature columns it ships. ``basis`` is ``bar`` when the candidate
+met the pre-registered attached bar, and ``decided`` when a decision attached it
+without the bar. Keeping the two apart lets a reader tell "a gain at the
+uncorrected level" from "attached as an instrument". Every sidecar of the model
+under the entry's root, and every table of its family, is pinned by sha256, so
+``release verify`` refuses a release whose attached tables changed.
 """
 
 from __future__ import annotations
@@ -50,7 +61,12 @@ from psytwill.relate import RelationFit, load_relation, sha256_file
 #: (Contract B 1.4 window labels, space schema 1.17). A time-keyed block whose
 #: member is undeclared -- including a 1.14-1.16 manifest's registry entry with
 #: no pin, which those schemas recorded as "battery" with null -- is refused.
-RELEASE_SCHEMA_VERSION = "1.4"
+#: 1.5: `attached` -- a list of attached members ({name, package, model, basis,
+#: gap, evidence, root, columns, n_columns_declared, n_cells, extractor_versions,
+#: files {path: sha256}}); see the module docstring.
+RELEASE_SCHEMA_VERSION = "1.5"
+#: The `basis` of an attached member: met the pre-registered bar, or attached by decision.
+ATTACHED_BASES = ("bar", "decided")
 #: Block / relation manifest fields that name an exclusion file.
 EXCLUSION_FIELDS = ("exclude_ids_file", "exclude_rows_file")
 
@@ -124,16 +140,107 @@ def _exclusions(metas: Sequence[tuple[str, dict]], data_root: str | Path | None)
     return {f: sha256_file(f) for f in files}
 
 
+def _family_tables(sidecar: Path) -> list[Path]:
+    """The tables of a sidecar's family: ``<base>.csv`` and ``<base>_<table>.csv`` beside
+    ``<base>.meta.json`` (Contract B §4.1). A file is claimed by the longest sidecar base
+    in its directory it matches, so ``caption_x_chunks.csv`` belongs to ``caption_x``,
+    not to ``caption``."""
+    base = sidecar.name.removesuffix(".meta.json")
+    bases = [p.name.removesuffix(".meta.json") for p in sidecar.parent.glob("*.meta.json")]
+
+    def owner(name: str) -> str | None:
+        hits = [b for b in bases if name == b + ".csv" or name.startswith(b + "_")]
+        return max(hits, key=len) if hits else None
+
+    return sorted(p for p in sidecar.parent.glob(base + "*.csv") if owner(p.name) == base)
+
+
+def resolve_attached(entries: Sequence[dict], *, root: str | Path | None = None,
+                     block_members: Sequence[str] = ()) -> list[dict]:
+    """Check and pin each attached member (see the module docstring).
+
+    An entry is ``{model, basis, gap, evidence}``, with optional ``name`` (default: the
+    model), ``package``, ``root`` (default: ``root``), ``columns`` (base feature columns
+    to ship; default: every declared one) and ``note``.
+    """
+    out, seen = [], set()
+    for e in entries:
+        unknown = set(e) - {"name", "model", "package", "basis", "gap", "evidence", "root", "columns", "note"}
+        if unknown:
+            raise SpaceError(f"attached entry {e.get('model')!r}: unknown field(s) {sorted(unknown)}")
+        model = e.get("model")
+        if not model:
+            raise SpaceError(f"attached entry {e}: needs a `model` (the producer model name)")
+        name = e.get("name") or model
+        if e.get("basis") not in ATTACHED_BASES:
+            raise SpaceError(f"attached {name}: basis must be one of {ATTACHED_BASES}, not {e.get('basis')!r}")
+        for f in ("gap", "evidence"):
+            if not str(e.get(f) or "").strip():
+                raise SpaceError(f"attached {name}: needs `{f}` (the gap it explores / where its screen "
+                                 "numbers and the decision are recorded)")
+        if name in seen:
+            raise SpaceError(f"attached {name!r} given twice")
+        seen.add(name)
+        if model in set(block_members):
+            raise SpaceError(f"attached {name}: {model} is a member of a released block; an attached "
+                             "member is in no block")
+        r = e.get("root") or root
+        if r is None:
+            raise SpaceError(f"attached {name}: give a root (the stimulus feature store) to find its tables in")
+        r = Path(r).resolve()
+        sidecars = []
+        for p in sorted(r.rglob("*.meta.json")):
+            try:
+                meta = json.loads(p.read_text())
+            except (OSError, ValueError):
+                continue
+            if model in (meta.get("models") or {}) and (not e.get("package") or meta.get("extractor") == e["package"]):
+                sidecars.append((p, meta))
+        if not sidecars:
+            raise SpaceError(f"attached {name}: no sidecar under {r} records model {model!r}")
+        declared, files, versions, bad = None, {}, set(), []
+        for p, meta in sidecars:
+            cols = list(((meta["models"][model].get("features") or {}).get("columns")) or [])
+            if declared is None:
+                declared = cols
+            elif cols != declared:
+                bad.append(f"{p} declares other columns than {sidecars[0][0]}")
+            tables = _family_tables(p)
+            if not tables:
+                bad.append(f"{p} has no table beside it")
+            for f in [p, *tables]:
+                files[str(f)] = sha256_file(f)
+            versions.add(str(meta.get("extractor_version")))
+        if not declared:
+            bad.append(f"the sidecars declare no feature columns for {model}")
+        columns = list(e["columns"]) if e.get("columns") is not None else list(declared or [])
+        missing = [c for c in columns if c not in set(declared or [])]
+        if missing:
+            bad.append(f"{len(missing)} selected column(s) not declared by the producer, e.g. {missing[0]}")
+        if len(set(columns)) != len(columns) or not columns:
+            bad.append("the column selection is empty or repeats a column")
+        if bad:
+            raise SpaceError(f"attached {name}: " + "; ".join(bad))
+        out.append({"name": name, "package": sidecars[0][1].get("extractor"), "model": model,
+                    "basis": e["basis"], "gap": e["gap"].strip(), "evidence": e["evidence"].strip(),
+                    "note": e.get("note"), "root": str(r), "columns": columns,
+                    "n_columns_declared": len(declared), "n_cells": len(sidecars),
+                    "extractor_versions": sorted(versions), "files": files})
+    return out
+
+
 def build_release(*, name: str, version: str, blocks: Sequence[str | Path], relations: Sequence[str | Path] = (),
                   absent: Sequence[tuple[Sequence[str], str]] = (), note: str | None = None,
-                  model_prefix: str = "pspace", data_root: str | Path | None = None) -> dict:
+                  model_prefix: str = "pspace", data_root: str | Path | None = None,
+                  attached: Sequence[dict] = (), attached_root: str | Path | None = None) -> dict:
     if not model_prefix.isidentifier() or model_prefix != model_prefix.lower():
         raise SpaceError(f"model prefix {model_prefix!r} must be a lower-case identifier (it names store models)")
     out: dict = {"release_schema_version": RELEASE_SCHEMA_VERSION, "name": name, "version": version,
                  "model_prefix": model_prefix, "psytwill_version": __version__,
                  "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                  "note": note, "blocks": {}, "relations": {}, "absent": [],
-                 "data_root": None if data_root is None else str(Path(data_root).resolve()), "exclusions": {}}
+                 "data_root": None if data_root is None else str(Path(data_root).resolve()), "exclusions": {},
+                 "attached": []}
     by_sha: dict[str, str] = {}
     metas: list[tuple[str, dict]] = []
     for path in blocks:
@@ -177,6 +284,8 @@ def build_release(*, name: str, version: str, blocks: Sequence[str | Path], rela
             raise SpaceError(f"absent pair {list(pair)} also has a relation in this release")
         out["absent"].append({"pair": list(pair), "k": 0, "evidence": evidence})
     out["exclusions"] = _exclusions(metas, data_root)
+    out["attached"] = resolve_attached(attached, root=attached_root,
+                                       block_members=[m for b in out["blocks"].values() for m in b["members"]])
     return out
 
 
@@ -247,6 +356,13 @@ def load_release(path: str | Path) -> Release:
             bad.append(f"exclusion list {f} is missing")
         elif sha256_file(f) != sha:
             bad.append(f"exclusion list {Path(f).name} has changed since the release")
+    for a in meta.get("attached") or []:  # release schema >= 1.5
+        if a.get("basis") not in ATTACHED_BASES:
+            bad.append(f"attached {a.get('name')}: basis {a.get('basis')!r} is not one of {ATTACHED_BASES}")
+        changed = [f for f, sha in a.get("files", {}).items() if not Path(f).exists() or sha256_file(f) != sha]
+        if changed:
+            bad.append(f"attached {a.get('name')}: {len(changed)} pinned file(s) missing or changed, "
+                       f"e.g. {Path(changed[0]).name}")
     if bad:
         raise SpaceError(f"release {meta['name']} {meta['version']} does not match disk: " + "; ".join(bad)
                          + ". Restore the released files, or write a new release version.")

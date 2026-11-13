@@ -7,6 +7,7 @@ written is refused on load.
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -121,7 +122,7 @@ def test_member_windows_are_recorded_and_checked(tmp_path):
     ok = _new_block(tmp_path, "A", "stimulus_id,time",
                     {"clap": (10.0, "battery"), "pitch": ("grid", "battery"), "conv": ("event", "labels")})
     rel = build_release(name="sp", version="0.2.0", blocks=[ok])
-    assert rel["release_schema_version"] == "1.4"
+    assert rel["release_schema_version"] == "1.5"
     assert rel["blocks"]["A"]["member_windows"] == {"clap": 10.0, "pitch": "grid", "conv": "event"}
     bad = _new_block(tmp_path, "B", "stimulus_id,time", {"x": (None, "undeclared")})
     with pytest.raises(SpaceError, match="x: no window declared"):
@@ -189,3 +190,89 @@ def test_cli_write_takes_a_data_root(tmp_path, capsys):
     capsys.readouterr()
     assert main(["space", "release", "verify", str(tmp_path / "rel" / "sp_0.2.0.json")]) == 0
     assert "1 exclusion lists" in capsys.readouterr().out
+
+
+# --- attached members (release schema 1.5) ------------------------------------
+
+
+def _cell(d, base, model, cols, extractor="viz2psy", tables=("",)):
+    """A stand-in producer cell: `<base>.meta.json` naming `model`, plus its tables."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{base}.meta.json").write_text(json.dumps({
+        "extractor": extractor, "extractor_version": "9.9",
+        "models": {model: {"features": {"columns": list(cols), "count": len(cols)}}}}))
+    for t in tables:
+        pd.DataFrame({"stimulus_id": ["a", "b"], **{c: [0.1, 0.2] for c in cols}}).to_csv(
+            d / f"{base}{'_' + t if t else ''}.csv", index=False)
+
+
+@pytest.fixture
+def store(tmp_path):
+    root = tmp_path / "stimuli_features"
+    _cell(root / "images", "head", "head", ["head_x", "head_y"])
+    _cell(root / "films" / "f1", "head", "head", ["head_x", "head_y"])
+    # a longer sibling stem in the same dir must not be swept into `head`'s family
+    _cell(root / "films" / "f1", "head_other", "other", ["other_z"])
+    _cell(root / "text", "caption_norms", "norms", ["norms_a", "norms_b"], extractor="word2psy",
+          tables=("chunks", "words"))
+    return root
+
+
+def _entry(**kw):
+    return {"model": "head", "basis": "decided", "gap": "V affect", "evidence": "log 2026-11-13", **kw}
+
+
+def test_attached_members_are_pinned_and_verified(fitted, store):
+    rel = build_release(name="sp", version="0.2.0", blocks=[fitted["P"]], attached_root=store,
+                        attached=[_entry(), _entry(model="norms", basis="bar", columns=["norms_a"])])
+    assert rel["release_schema_version"] == "1.5"
+    head, norms = rel["attached"]
+    assert (head["n_cells"], head["columns"], head["package"]) == (2, ["head_x", "head_y"], "viz2psy")
+    assert sorted(Path(f).name for f in head["files"]) == ["head.csv", "head.csv", "head.meta.json", "head.meta.json"]
+    assert norms["columns"] == ["norms_a"] and norms["n_columns_declared"] == 2
+    assert sorted(Path(f).name for f in norms["files"]) == [
+        "caption_norms.meta.json", "caption_norms_chunks.csv", "caption_norms_words.csv"]
+    path = write_release(rel, fitted["tmp"] / "releases")
+    assert load_release(path).meta["attached"][0]["basis"] == "decided"
+    (store / "images" / "head.csv").write_text("stimulus_id,head_x,head_y\na,9,9\n")
+    with pytest.raises(SpaceError, match="attached head: 1 pinned file"):
+        load_release(path)
+
+
+def test_attached_entries_are_checked(fitted, store):
+    def build(*entries, blocks=(fitted["P"],)):
+        return build_release(name="sp", version="0.2.0", blocks=list(blocks), attached=list(entries),
+                             attached_root=store)
+
+    with pytest.raises(SpaceError, match="basis must be one of"):
+        build(_entry(basis="maybe"))
+    with pytest.raises(SpaceError, match="needs `gap`"):
+        build(_entry(gap="  "))
+    with pytest.raises(SpaceError, match="needs `evidence`"):
+        build(_entry(evidence=None))
+    with pytest.raises(SpaceError, match="given twice"):
+        build(_entry(), _entry())
+    with pytest.raises(SpaceError, match="no sidecar under"):
+        build(_entry(model="absent_model"))
+    with pytest.raises(SpaceError, match="not declared by the producer"):
+        build(_entry(columns=["head_q"]))
+    with pytest.raises(SpaceError, match="unknown field"):
+        build(_entry(bar="yes"))
+    with pytest.raises(SpaceError, match="is a member of a released block"):
+        build(_entry(model="p1"))  # the P stand-in block's member
+    with pytest.raises(SpaceError, match="give a root"):
+        build_release(name="sp", version="0.2.0", blocks=[fitted["P"]], attached=[_entry()])
+
+
+def test_cli_write_takes_an_attached_spec(fitted, store, capsys):
+    spec = fitted["tmp"] / "attached.json"
+    spec.write_text(json.dumps({"root": str(store), "attached": [_entry()]}))
+    out = fitted["tmp"] / "rel"
+    assert main(["space", "release", "write", "--name", "sp", "--version", "0.2.0", "--blocks", str(fitted["P"]),
+                 "--attached", str(spec), "-o", str(out)]) == 0
+    assert "attached head (decided, 2 col, 2 cells)" in capsys.readouterr().out
+    assert main(["space", "release", "verify", str(out / "sp_0.2.0.json")]) == 0
+    assert "1 attached" in capsys.readouterr().out
+    spec.write_text(json.dumps([_entry()]))
+    assert main(["space", "release", "write", "--name", "sp", "--version", "0.2.1", "--blocks", str(fitted["P"]),
+                 "--attached", str(spec), "-o", str(out)]) == 1

@@ -4,6 +4,34 @@ Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
 
+## 0.61.0 — 2026-11-13
+
+Minor bump: releases carry **attached members** (release schema 1.5).
+(Numbered after the open 0.59.0 / 0.60.0 branches.)
+
+### Added
+- **`space release write --attached SPEC.json`**: opt-in producer features shipped
+  beside the space and in no block, relation or refit. The spec is
+  `{"root": <stimulus feature store>, "attached": [{model, basis, gap, evidence,
+  columns?, name?, package?, root?, note?}, ...]}`.
+  - `basis` is `bar` (met the pre-registered attached bar) or `decided` (attached by a
+    decision without the bar), kept apart so a reader can tell the two.
+  - `gap` and `evidence` are required.
+  - `columns` selects base feature columns; each must be declared by every sidecar of
+    the model (default: all declared). Chunk aggregates follow their base column.
+  - Every sidecar under the root that records the model, and every table of its
+    Contract B §4.1 family, is pinned by sha256. A file is claimed by the longest
+    sidecar base it matches.
+  - Refused: an unknown basis or field, an empty gap or evidence, a duplicate, a model
+    with no sidecar, an undeclared column, and a model that is a member of a released
+    block.
+- `release verify` / `load_release` refuse a release whose attached files changed or
+  went missing.
+
+### Changed
+- `RELEASE_SCHEMA_VERSION` 1.4 → 1.5; release manifests always carry `attached` (a
+  list, possibly empty).
+
 ## 0.60.0 — 2026-11-13
 
 Minor bump: the readout's R² read sees a set in the caller's metric, as its

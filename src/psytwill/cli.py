@@ -1334,16 +1334,26 @@ def _run_space_labels(args: argparse.Namespace) -> None:
 def _run_release_write(args: argparse.Namespace) -> None:
     from psytwill.release import build_release, parse_absent, write_release
 
+    attached, attached_root = [], None
+    if args.attached:
+        spec = json.loads(Path(args.attached).read_text())
+        if not isinstance(spec, dict) or not isinstance(spec.get("attached"), list):
+            raise InputError(f"{args.attached}: write it as {{\"root\": <store>, \"attached\": [<entry>, ...]}}")
+        attached, attached_root = spec["attached"], spec.get("root")
     rel = build_release(name=args.name, version=args.version, blocks=args.blocks, relations=args.relations or [],
                         absent=[parse_absent(a) for a in (args.absent or [])], note=args.note,
-                        model_prefix=args.model_prefix, data_root=args.data_root)
+                        model_prefix=args.model_prefix, data_root=args.data_root,
+                        attached=attached, attached_root=attached_root)
     path = write_release(rel, args.output)
     if rel.get("labels"):
         print(f"  labels {path.parent / rel['labels']['table']}\n  columns {path.parent / rel['labels']['columns']}")
     b = ", ".join(f"{n} k={e['k']}" for n, e in rel["blocks"].items())
     r = ", ".join(f"{n} ({e['a']}<->{e['b']}) k={e['k']}" for n, e in rel["relations"].items()) or "none"
     a = ", ".join("<->".join(x["pair"]) for x in rel["absent"]) or "none"
-    print(f"psytwill space release {rel['name']} {rel['version']}: blocks {b}; relations {r}; absent {a}\n  {path}")
+    t = ", ".join(f"{x['name']} ({x['basis']}, {len(x['columns'])} col, {x['n_cells']} cells)"
+                  for x in rel["attached"]) or "none"
+    print(f"psytwill space release {rel['name']} {rel['version']}: blocks {b}; relations {r}; absent {a}; "
+          f"attached {t}\n  {path}")
 
 
 def _run_release_verify(args: argparse.Namespace) -> None:
@@ -1354,6 +1364,7 @@ def _run_release_verify(args: argparse.Namespace) -> None:
     print(f"psytwill space release {rel.label}: {len(m['blocks'])} blocks, {len(m['relations'])} relations, "
           f"{len(m['absent'])} absences"
           + (f", {len(m['exclusions'])} exclusion lists" if m.get("exclusions") else "")
+          + (f", {len(m['attached'])} attached" if m.get("attached") else "")
           + "; every pinned file matches")
 
 
@@ -2033,6 +2044,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "baseline release takes its own, e.g. b0")
     rw.add_argument("--data-root", help="the fit-corpora directory: every exclusion file a pinned fit names must "
                                         "lie under it (required when any does); each is pinned by sha256")
+    rw.add_argument("--attached", metavar="SPEC.json",
+                    help="attached members (opt-in producer features in no block): a JSON file "
+                         "{\"root\": <stimulus feature store>, \"attached\": [{model, basis: bar|decided, gap, "
+                         "evidence, columns?, name?, package?, root?, note?}, ...]}; every sidecar of each model "
+                         "under the root, and its tables, is pinned by sha256")
     rw.add_argument("-o", "--output", required=True, help="output directory (file: <name>_<version>.json)")
     rw.set_defaults(func=_run_release_write)
     rpj = rlsub.add_parser("project", help="place a stimulus set in a release, written as a Contract B family")
