@@ -29,6 +29,12 @@ sides — the stimfeat-campaign lesson):
   in both directions (nothing in the battery the package no longer ships,
   nothing shipped that the battery has not admitted or explicitly excluded)?
 
+**Attached models** (battery 0.4). A model with ``attached=True`` is pinned like
+any other, so its tables may sit in group tables and pass :func:`check_sidecar`.
+It is never a block member: ``space fit`` leaves it out of a block's default
+members and refuses it in ``--members`` (it may still be an outside target).
+It ships through a release's ``attached`` section.
+
 ``dim`` is the model's native feature count — per row of the table it writes
 (word-level for word2psy scalar profiles; chunk aggregates multiply that by
 the four ``_mean/_sd/_min/_max`` suffixes, a consumer-side fact).
@@ -47,8 +53,8 @@ from psytwill.exceptions import BatteryError
 #: checkpoint string. A fit founded on battery 0.1 saw 314 scene columns.
 #: 0.3 (2026-11-09): caption_vlm admitted (viz2psy 0.18.0), a text-kind
 #: producer like caption; no block basis changes (text never enters V).
-BATTERY_VERSION = "0.3"
-BATTERY_CLAMPED_ON = "2026-11-09"
+BATTERY_VERSION = "0.4"  # 0.4: attached models (context_affect, experiential, lexical_norms_experiential)
+BATTERY_CLAMPED_ON = "2026-11-13"
 
 #: Extractor versions the battery was clamped against. Outputs already in
 #: the mmmdata store span earlier versions of the same checkpoints (aud2psy
@@ -74,6 +80,7 @@ NESTED_PREFIX_EXCEPTIONS: frozenset[tuple[str, str]] = frozenset(
         ("speech_emotion", "speech"),
         ("speech_rate", "speech"),
         ("caption_vlm", "caption"),
+        ("lexical_norms_experiential", "lexical_norms"),
     }
 )
 
@@ -101,6 +108,7 @@ class BatteryModel:
     #: conversation, speech_rate) cannot be pinned here; their labels say.
     window_sec: float | str | None = None
     notes: str = field(default="")
+    attached: bool = False  # pinned, allowed in group tables, never a block member
 
     @property
     def prefixes(self) -> tuple[str, ...]:
@@ -135,6 +143,9 @@ BATTERY: dict[str, BatteryModel] = {
                  "the word2psy vlmcap_ source. Greedy bf16 captions differ across GPU "
                  "types: extract every cell on one (H100)"),
         _m("clip", "viz2psy", "visual", "embedding", 512, _CLIP),
+        _m("context_affect", "viz2psy", "visual", "profile", 2, "ViT-L-14/openai+context_affect_v1",
+           attached=True, notes="attached: VEATIC valence / arousal probe on CLIP ViT-L-14 "
+                                "(viz2psy >= 0.22.0)"),
         _m("depth", "viz2psy", "visual", "profile", 6,
            "depth-anything/Depth-Anything-V2-Small-hf",
            notes="relative depth, per-image normalized; stats only"),
@@ -144,6 +155,9 @@ BATTERY: dict[str, BatteryModel] = {
         _m("ebind", "viz2psy", "visual", "embedding", 1024, _EBIND),
         _m("emonet", "viz2psy", "visual", "profile", 20,
            "emonet-pytorch/osf-amdju"),
+        _m("experiential", "viz2psy", "visual", "profile", 59, "ViT-L-14/openai+experiential_v1",
+           attached=True, notes="attached: Binder experiential attributes, image probe on CLIP "
+                                "ViT-L-14 (viz2psy >= 0.23.0)"),
         _m("faces", "viz2psy", "visual", "profile", 5,
            "opencv_zoo/face_detection_yunet_2023mar",
            notes="presence-gated (NaN without a face); real-photo domain"),
@@ -214,6 +228,9 @@ BATTERY: dict[str, BatteryModel] = {
            f"{_FASTTEXT}+ridge",
            notes="unclipped ridge extrapolations anchored to rating scales; "
                  "animacy CV r2 .719"),
+        _m("lexical_norms_experiential", "word2psy", "text", "profile", 40, f"{_FASTTEXT}+experiential_v1",
+           attached=True, notes="attached: Binder experiential attributes, word probe on fastText "
+                                "(word2psy >= 0.14.0); chunk tables carry the four aggregates"),
         _m("minilm", "word2psy", "text", "embedding", 384,
            "sentence-transformers/all-MiniLM-L6-v2"),
         _m("readability", "word2psy", "text", "profile", 7, None),
@@ -236,9 +253,8 @@ NOT_ADMITTED: dict[str, dict[str, str]] = {
                  "(mmmdata-agents workbench functional-space, 2026-09-28). Not a "
                  "psytwill-space member: admission would add it to V at the next fit, "
                  "where dinov2/clip/places/gist already cover it (Ben 2026-10-01).",
-        "context_affect": "candidate V member (VEATIC valence / arousal probe on CLIP "
-                          "ViT-L-14, viz2psy 0.22.0). Extracted for its admission "
-                          "screen only; it joins the battery, with a bump, only if admitted.",
+        "vitl14": "the raw CLIP ViT-L-14 embedding the attached heads read (context_affect, "
+                  "experiential, aesthetics); an extraction cache, not a feature space of its own.",
     },
     "aud2psy": {
         "phonetics": "candidate A member (articulatory features from a CTC phone "
@@ -310,6 +326,7 @@ def to_records(battery: Mapping[str, BatteryModel] = BATTERY) -> list[dict[str, 
                 "prefixes": list(m.prefixes),
                 "window_sec": m.window_sec,
                 "notes": m.notes,
+                "attached": m.attached,
             }
         )
     return rows

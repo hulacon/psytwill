@@ -318,7 +318,7 @@ def test_release_write_emits_labels_beside_it(labelled_table, tmp_path):
             "--blocks", str(out / "V_rel.json"), "-o", str(rel_dir)]
     assert main(argv) == 0
     rel = json.loads((rel_dir / "demo_0.1.0.json").read_text())
-    assert rel["release_schema_version"] == "1.4"
+    assert rel["release_schema_version"] == "1.5"
     assert rel["labels"] == {"table": "demo_0.1.0_labels.csv", "columns": "demo_0.1.0_labels.columns.json"}
     table = pd.read_csv(rel_dir / rel["labels"]["table"])
     assert set(table["block"]) == {"V"}
