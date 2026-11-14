@@ -38,6 +38,18 @@ def test_item_mask_marks_rows_whose_window_reads_two_groups():
     assert item_masks(sp, {}, {"u00": SEG}, HOP) == {}  # no windowed column
 
 
+def test_per_item_units_need_no_mask():
+    """E5's "re-extract per item": the same two items, each its own unit, so even
+    A's widest window (10 s, clap) has no other group to read."""
+    sp = SpaceMatrix(name="a",
+                     labels=[f"{u}|{b * HOP}" for u, n in (("i1", 19), ("i2", 19)) for b in range(n)],
+                     X=np.zeros((38, 1)), features=["a_00"])
+    per_item = {"i1": pd.DataFrame({"onset": [0.0], "offset": [9.5], "group": ["g1"]}),
+                "i2": pd.DataFrame({"onset": [0.0], "offset": [9.5], "group": ["g2"]})}
+    for w in (2.0, 4.0, 10.0):
+        assert item_masks(sp, {"a_00": (w, "centred")}, per_item, HOP) == {}
+        assert item_masks(_space(), {"a_00": (w, "centred")}, {"u00": SEG}, HOP)  # packed: masked
+
 def test_a_trailing_window_masks_only_after_the_boundary():
     masks = item_masks(_space(), {"a_00": (4.0, "trailing")}, {"u00": SEG}, HOP)
     hit = [float(lab.split("|")[1]) for lab, h in zip(_space().labels, masks["a_00"]) if h]

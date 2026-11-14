@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -173,3 +174,131 @@ class TestLibrispeechSplits:
         with pytest.raises(SystemExit, match="held-out root"):
             stage.check_heldout_root("librispeech", "train-clean-100", root)
         stage.check_heldout_root("gigaspeech", "train-clean-100", root)  # other corpora: no rule
+
+
+# ---- per-item staging (E5 "re-extract per item", DECIDED 2026-11-13) -----------------------
+
+ITEM_SR = 22050
+
+
+def _tone(freqs, seconds, sr=ITEM_SR):
+    t = np.arange(int(round(seconds * sr))) / sr
+    return (0.2 * sum(np.sin(2 * np.pi * f * t) for f in freqs)).astype(np.float32)
+
+
+def _item_adapter(items):
+    """A fake corpus adapter: ``items`` = [(group, samples)], one file per group."""
+    def adapter(args):
+        groups = [(g, [stage.Segment(segment=g, group=g, duration=len(y) / ITEM_SR,
+                                     extra={"genre": "test"})]) for g, y in items]
+        ys = dict(items)
+        return ITEM_SR, [("x-", groups)], lambda seg, sr: ys[seg.group]
+    return adapter
+
+
+def _stage_args(root, per_item, max_groups=None, **kw):
+    return argparse.Namespace(scratch_root=root / "scratch", durable_root=root / "durable", dry_run=False,
+                              force=False, target_minutes=25.0, per_item=per_item, max_groups=max_groups, **kw)
+
+
+def _stage(monkeypatch, root, items, per_item):
+    monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter(items))
+    args = _stage_args(root, per_item)
+    rows = stage.stage_packed("fma", args)
+    stage.write_manifest("fma", rows, args)
+    return rows
+
+
+def _read_wav(path):
+    import soundfile as sf
+
+    y, sr = sf.read(str(path), dtype="float32")
+    assert sr == ITEM_SR
+    return y
+
+
+A_ITEM, B_ITEM, C_ITEM = _tone([261.6, 329.6, 392.0], 2.2), _tone([1000.0], 4.0), _tone([466.2, 587.3], 4.0)
+
+
+class TestPerItemStaging:
+    def test_one_wav_per_item_holding_only_that_item(self, tmp_path, monkeypatch):
+        rows = _stage(monkeypatch, tmp_path, [("a", A_ITEM), ("b", B_ITEM)], per_item=True)
+        assert [r["unit"] for r in rows] == ["x-a", "x-b"]
+        assert all(r["n_segments"] == 1 for r in rows)
+        for r, y in zip(rows, (A_ITEM, B_ITEM)):
+            assert Path(r["path"]).parent.name == "items"  # never beside packed units/
+            wav = _read_wav(r["path"])
+            assert len(wav) - len(y) < stage.HOP * ITEM_SR  # grid rounding only
+            np.testing.assert_allclose(wav[:len(y)], y, atol=1 / 32768)
+            assert not wav[len(y):].any()
+        inputs = tmp_path / "durable" / "fma" / "inputs"
+        segs = list(csv.DictReader(open(inputs / "x-a_segments.csv")))
+        assert len(segs) == 1 and float(segs[0]["onset"]) == 0.0 and segs[0]["group"] == "a"
+        assert segs[0]["genre"] == "test"  # per-corpus columns ride along as before
+        assert json.loads((inputs / stage.LAYOUT_FILE).read_text())["layout"] == "per-item"
+
+    def test_per_item_is_for_the_decided_corpora_only(self, tmp_path):
+        assert stage.PER_ITEM_CORPORA == ("twp-unpresented", "fma", "musopen")
+        with pytest.raises(SystemExit, match="per-item"):
+            stage.check_layout("librispeech", _stage_args(tmp_path, per_item=True))
+
+    @pytest.mark.parametrize("first,second", [(False, True), (True, False)])
+    def test_a_root_is_never_staged_in_both_layouts(self, tmp_path, monkeypatch, first, second):
+        _stage(monkeypatch, tmp_path, [("a", A_ITEM), ("b", B_ITEM)], per_item=first)
+        with pytest.raises(SystemExit, match="layout"):
+            _stage(monkeypatch, tmp_path, [("a", A_ITEM), ("b", B_ITEM)], per_item=second)
+
+    def test_max_groups_stages_a_pilot_subset_and_says_so(self, tmp_path, monkeypatch):
+        monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter([("a", A_ITEM), ("b", B_ITEM), ("c", C_ITEM)]))
+        args = _stage_args(tmp_path, per_item=True, max_groups=2)
+        assert [r["unit"] for r in stage.stage_packed("fma", args)] == ["x-a", "x-b"]
+        rec = json.loads((tmp_path / "durable" / "fma" / "inputs" / stage.LAYOUT_FILE).read_text())
+        assert rec["max_groups"] == 2  # a pilot root is never mistaken for a full one
+
+    def test_restaging_the_same_layout_is_idempotent(self, tmp_path, monkeypatch):
+        _stage(monkeypatch, tmp_path, [("a", A_ITEM)], per_item=True)
+        _stage(monkeypatch, tmp_path, [("a", A_ITEM)], per_item=True)
+
+
+def _centred_window_mean(y, sr, center, w):
+    """A windowed member as the producers compute it: a centred window clamped to the clip."""
+    dur = len(y) / sr
+    lo = 0.0 if dur <= w else min(max(center - w / 2, 0.0), dur - w)
+    hi = min(lo + w, dur)
+    return float(np.abs(y[int(lo * sr):int(hi * sr)]).mean())
+
+
+class TestWindowNearAnItemBoundary:
+    """A windowed member near an item's end reads only its own item once it is staged
+    per item; packed, the same window reads the neighbour (the control)."""
+
+    def _last_row(self, rows, unit_id):
+        wav = _read_wav(next(r["path"] for r in rows if r["unit"] == unit_id))
+        # the last grid row inside item a (2.2 s long): bin [1.5, 2.0), centre 1.75
+        return wav, 1.75
+
+    def test_synthetic_window(self, tmp_path, monkeypatch):
+        got = {}
+        for neighbour, y in (("b", B_ITEM), ("c", C_ITEM)):
+            for per_item in (True, False):
+                rows = _stage(monkeypatch, tmp_path / f"{neighbour}-{per_item}", [("a", A_ITEM), (neighbour, y)],
+                              per_item=per_item)
+                wav, c = self._last_row(rows, "x-a" if per_item else "x-000")
+                got[neighbour, per_item] = _centred_window_mean(wav, ITEM_SR, c, 3.0)
+        assert got["b", True] == got["c", True]  # per item: the neighbour is never read
+        assert got["b", False] != got["c", False]  # packed: it is
+
+    def test_real_windowed_member(self, tmp_path, monkeypatch):
+        """aud2psy's tonal (a 3 s centred chroma window) on the same layouts."""
+        pipeline = pytest.importorskip("aud2psy.pipeline")
+        got = {}
+        for neighbour, y in (("b", B_ITEM), ("c", C_ITEM)):
+            for per_item in (True, False):
+                rows = _stage(monkeypatch, tmp_path / f"{neighbour}-{per_item}", [("a", A_ITEM), (neighbour, y)],
+                              per_item=per_item)
+                path = next(r["path"] for r in rows if r["unit"] == ("x-a" if per_item else "x-000"))
+                frames = pipeline.score_audio(path, ["tonal"], hop=stage.HOP, show_progress=False).frames_df
+                got[neighbour, per_item] = frames[frames["time"] < 2.2].filter(like="tonal_").to_numpy(float)
+        np.testing.assert_array_equal(got["b", True], got["c", True])
+        assert not np.allclose(got["b", False], got["c", False], equal_nan=True)
+        assert not np.allclose(got["b", True], got["b", False], equal_nan=True)

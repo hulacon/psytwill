@@ -33,6 +33,16 @@ Short-file corpora (speech, music, words) are first packed into units by
 `stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
 reads, and `<unit>_segments.csv` beside it maps unit time back to files.
 
+Per-item corpora (`stage.py --per-item`; `<corpus>/inputs/layout.json` says
+so) are thousands of short units, one item each. Their aud2psy cells run
+batched: one `aud2psy --inputs-from` call per model per `--batch-items` units,
+each model loaded once, every unit still writing its own family and sidecar.
+Producers run first; a consumer's manifest row names its unit's stored
+diarize turns / transcribe words (aud2psy >= 0.24.0). `--unit-slice A:B`
+takes units [A, B) of a corpus, for array tasks over items:
+
+    extract.py run --corpus fma --source audio --unit-slice 0:500
+
 Roots (flags win over env; there are no defaults -- a site names them):
     --durable-root  / $PSYTWILL_FITCORPUS_DURABLE  feature store
     --scratch-root  / $PSYTWILL_FITCORPUS_SCRATCH  staged, derived media (packed audio units, PNG frames)
@@ -95,6 +105,22 @@ VIZ_BATCH = {CAPTION_VLM: 32}  # every other viz2psy model: 64
 # (aud2psy >= 0.20.0, where diarize is the default gate).
 _AUDIO_DEPS = {"conversation": "diarize", "egemaps": "diarize",
                "speech_emotion": "diarize", "speech_rate": "transcribe"}
+
+
+# One aud2psy call per model per this many per-item units (--batch-items).
+BATCH_ITEMS = 500
+
+
+def _per_item_layout(corpus: str) -> bool:
+    """True when stage.py staged ``corpus`` one unit per item (its ``inputs/layout.json``)."""
+    cache = _per_item_layout.cache  # type: ignore[attr-defined]
+    if corpus not in cache:
+        rec = ROOTS.durable / corpus / "inputs" / "layout.json"
+        cache[corpus] = rec.exists() and json.loads(rec.read_text()).get("layout") == "per-item"
+    return cache[corpus]
+
+
+_per_item_layout.cache = {}  # type: ignore[attr-defined]
 
 
 def _ordered_audio() -> list[str]:
@@ -575,6 +601,16 @@ def command_for(src: Source, unit: Unit, model: str) -> list[str]:
     raise ValueError(src.package)
 
 
+def _unit_slice(units: list[Unit], spec: str | None) -> list[Unit]:
+    """``units[A:B]`` for ``--unit-slice A:B`` (either end may be empty)."""
+    if not spec:
+        return units
+    a, sep, b = spec.partition(":")
+    if not sep:
+        sys.exit(f"ERROR: --unit-slice takes START:END, got {spec!r}")
+    return units[int(a or 0):int(b) if b else len(units)]
+
+
 def _filtered(args: argparse.Namespace) -> list[tuple[Source, Unit, str]]:
     cells = []
     for src in build_sources():
@@ -582,7 +618,7 @@ def _filtered(args: argparse.Namespace) -> list[tuple[Source, Unit, str]]:
             continue
         if args.source and src.source != args.source:
             continue
-        units = src.units()
+        units = _unit_slice(src.units(), getattr(args, "unit_slice", None))
         if args.unit_index is not None:
             if args.unit_index >= len(units):
                 continue
@@ -610,7 +646,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             continue
         if args.source and src.source != args.source:
             continue
-        units = src.units()
+        units = _unit_slice(src.units(), getattr(args, "unit_slice", None))
         if args.unit_index is not None:
             units = units[args.unit_index:args.unit_index + 1]
         if args.unit:
@@ -728,6 +764,90 @@ def caption_vlm_gpu_problem(models: set[str], names: list[str], want: str = CAPT
             f"--skip-model {CAPTION_VLM}, or set CAPTION_VLM_GPU to override.")
 
 
+def _batchable(src: Source, unit: Unit) -> bool:
+    """An aud2psy cell of a per-item corpus: run in a batch, not one call per cell."""
+    return src.package == "aud2psy" and len(unit.inputs) == 1 and _per_item_layout(src.corpus)
+
+
+def _producer_table(src: Source, unit: Unit, model: str) -> tuple[str, Path] | None:
+    """(manifest column, the unit's stored producer table) for a model that reads one."""
+    if _AUDIO_DEPS.get(model) == "diarize":
+        return "speakers", unit.out_dir / f"{src.prefix}diarize_speakers.csv"
+    if model == "speech_rate":
+        return "words", unit.out_dir / f"{src.prefix}transcribe_transcript_words.csv"
+    return None
+
+
+def _run_batches(src: Source, model: str, units: list[Unit], args: argparse.Namespace) -> tuple[int, int, list[str]]:
+    """One model over many per-item units, ``--batch-items`` units per aud2psy call.
+
+    Each unit keeps its own family + sidecar (the manifest's `output`), so
+    done-marking, verify and aggregate see ordinary cells.
+    """
+    features = ROOTS.durable / src.corpus / "features"
+    n_ok = n_fail = 0
+    failures: list[str] = []
+    ready: list[tuple[Unit, dict]] = []
+    for unit in units:
+        label = f"{src.key}/{model}[{unit.id}]"
+        stem = stem_for(src, unit, model)
+        row = {"path": unit.inputs[0], "stimulus_id": unit.extra[unit.extra.index("--stimulus-id") + 1],
+               "output": str(stem.relative_to(features))}
+        need = [Path(unit.inputs[0])]
+        dep = _producer_table(src, unit, model)
+        if dep:
+            row[dep[0]] = str(dep[1])
+            need.append(dep[1])
+        missing = [p for p in need if not p.exists()]
+        if missing and not args.dry_run:
+            print(f"  {label} SKIP: input missing: {missing[0]}")
+            n_fail += 1
+            failures.append(f"{label} (missing input)")
+            continue
+        ready.append((unit, row))
+    size = max(1, int(getattr(args, "batch_items", None) or BATCH_ITEMS))
+    for k in range(0, len(ready), size):
+        chunk = ready[k:k + size]
+        manifest = ROOTS.durable / src.corpus / "inputs" / "_batch" / f"{src.source}_{src.prefix}{model}_{chunk[0][0].id}.csv"
+        cmd = [PY, "-m", "aud2psy.cli", model, "--inputs-from", str(manifest), "-o", str(features),
+               "--hop", str(GRID_HOP)]
+        head = f"{src.key}/{model}[{chunk[0][0].id} .. {chunk[-1][0].id}]"
+        if args.dry_run:
+            print(f"  [batch] {head}: {len(chunk)} units in one call\n      {' '.join(cmd)}")
+            continue
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with open(manifest, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(chunk[0][1]))
+            w.writeheader()
+            w.writerows(r for _, r in chunk)
+        print(f"  [batch] {head}: {len(chunk)} units, one model load ...", flush=True)
+        t0 = time.time()
+        r = subprocess.run(cmd)
+        dt = time.time() - t0
+        ok_here = 0
+        for unit, _ in chunk:
+            label = f"{src.key}/{model}[{unit.id}]"
+            meta = sidecar_for(stem_for(src, unit, model))
+            if not meta.exists():
+                n_fail += 1
+                failures.append(label)
+                continue
+            bad = check_sidecar(json.loads(meta.read_text()), source=str(meta))
+            if bad:
+                for line in bad:
+                    print(f"      VIOLATION {line}")
+                n_fail += 1
+                failures.append(f"{label} (battery)")
+                continue
+            n_ok += 1
+            ok_here += 1
+        print(f"      {'ok' if ok_here == len(chunk) else 'PARTIAL'}  {dt:.1f}s, {dt / len(chunk):.2f}s/unit "
+              f"({ok_here}/{len(chunk)} done, rc={r.returncode})", flush=True)
+        if args.fail_fast and ok_here < len(chunk):
+            break
+    return n_ok, n_fail, failures
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cells = _filtered(args)
     todo = [(s, u, m) for s, u, m in cells if args.redo or not is_done(stem_for(s, u, m), s, u)]
@@ -739,6 +859,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
     n_ok = n_fail = 0
     failures: list[str] = []
+    # per-item corpora: one batch per (source, model), in the source's model order
+    # (producers before the models that read their tables)
+    groups: dict[tuple[str, str], tuple[Source, str, list[Unit]]] = {}
+    for src, unit, model in todo:
+        if _batchable(src, unit):
+            groups.setdefault((src.key, model), (src, model, []))[2].append(unit)
+    todo = [(s, u, m) for s, u, m in todo if not _batchable(s, u)]
+    for src, model, units in sorted(groups.values(), key=lambda g: (g[0].key, g[0].models.index(g[1]))):
+        ok, fail, names = _run_batches(src, model, units, args)
+        n_ok, n_fail = n_ok + ok, n_fail + fail
+        failures += names
+        if args.fail_fast and fail:
+            todo = []
+            break
     for i, (src, unit, model) in enumerate(todo, 1):
         stem = stem_for(src, unit, model)
         cmd = command_for(src, unit, model)
@@ -1127,6 +1261,8 @@ def main() -> int:
                             "psychoacoustic cells run on the compute partition)")
         p.add_argument("--unit")
         p.add_argument("--unit-index", type=int, help="position in the corpus's unit list (array tasks)")
+        p.add_argument("--unit-slice", metavar="START:END",
+                       help="units [START, END) of each matched source (array tasks over per-item corpora)")
 
     p = sub.add_parser("plan"); filters(p); p.set_defaults(func=cmd_plan)
     p = sub.add_parser("inputs"); p.add_argument("--force", action="store_true"); p.set_defaults(func=cmd_inputs)
@@ -1134,6 +1270,8 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--redo", action="store_true")
     p.add_argument("--fail-fast", action="store_true")
+    p.add_argument("--batch-items", type=int, default=BATCH_ITEMS,
+                   help=f"per-item corpora: units per aud2psy call (default {BATCH_ITEMS})")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("verify"); p.set_defaults(func=cmd_verify)
     p = sub.add_parser("aggregate", help="build one Contract B features parquet per (corpus, source, table) group"); filters(p)

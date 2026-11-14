@@ -313,3 +313,139 @@ def test_roots_resolve_the_nsd_brick(tmp_path, monkeypatch):
     monkeypatch.setattr(extract, "ROOTS", roots, raising=False)
     units = extract._nsd_units()
     assert units and units[0].inputs == [str(tmp_path / "nsd.hdf5")]
+
+
+# ---- per-item corpora: many short units, each model loaded once per batch ------------------
+
+def _per_item_corpus(tmp_path, monkeypatch, n=3, corpus="fma"):
+    durable = tmp_path / "durable"
+    inputs = durable / corpus / "inputs"
+    inputs.mkdir(parents=True)
+    rows = ["unit,stimulus_id,path,sr,duration_sec,n_segments,audio_sec"]
+    for i in range(n):
+        wav = tmp_path / "scratch" / corpus / "items" / f"x-{i}.wav"
+        wav.parent.mkdir(parents=True, exist_ok=True)
+        wav.write_bytes(b"")
+        rows.append(f"x-{i},ext-{corpus}-x-{i},{wav},44100,30.0,1,30.0")
+    (inputs / "units.csv").write_text("\n".join(rows) + "\n")
+    (inputs / "layout.json").write_text('{"layout": "per-item"}')
+    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=durable, scratch=tmp_path / "scratch",
+                                                                nsd_hdf5=None, media=None, framing_table=None),
+                        raising=False)
+    monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
+    monkeypatch.setattr(extract._per_item_layout, "cache", {}, raising=False)
+    monkeypatch.setattr(extract, "gpu_names", lambda: [])  # no nvidia-smi through the fake run
+    return durable
+
+
+class _FakeAud2psy:
+    """Stands in for `python -m aud2psy.cli MODEL --inputs-from M -o DIR`: writes each row's
+    family (and a producer's table), records the call. ``fail`` = {(model, stimulus_id)}."""
+
+    def __init__(self, fail=()):
+        self.calls, self.fail = [], set(fail)
+
+    def __call__(self, cmd, **kw):
+        import csv as _csv
+
+        model = cmd[3]
+        manifest = Path(cmd[cmd.index("--inputs-from") + 1])
+        out = Path(cmd[cmd.index("-o") + 1])
+        rows = list(_csv.DictReader(open(manifest)))
+        self.calls.append((model, rows))
+        for r in rows:
+            if (model, r["stimulus_id"]) in self.fail:
+                continue
+            stem = out / r["output"]
+            stem.parent.mkdir(parents=True, exist_ok=True)
+            base = stem.parent / stem.stem
+            Path(f"{base}.meta.json").write_text("{}")
+            Path(f"{base}_frames.csv").write_text(f"stimulus_id,time,{model}_x\n{r['stimulus_id']},0.25,1\n")
+            if model == "diarize":
+                Path(f"{base}_speakers.csv").write_text("speaker,onset,offset\n")
+            if model == "transcribe":
+                Path(f"{base}_transcript_words.csv").write_text("word,onset,offset\n")
+        return types.SimpleNamespace(returncode=0)
+
+
+def _run_args(**kw):
+    base = dict(corpus="fma", source="audio", model=None, skip_model=None, unit=None, unit_index=None,
+                unit_slice=None, dry_run=False, redo=False, fail_fast=False, batch_items=500)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_layout_is_read_from_the_staging_record(tmp_path, monkeypatch):
+    _per_item_corpus(tmp_path, monkeypatch)
+    assert extract._per_item_layout("fma") is True
+    assert extract._per_item_layout("musopen") is False  # nothing staged: the packed default
+
+
+def test_per_item_cells_run_one_call_per_model_with_producers_first(tmp_path, monkeypatch):
+    durable = _per_item_corpus(tmp_path, monkeypatch)
+    fake = _FakeAud2psy()
+    monkeypatch.setattr(extract.subprocess, "run", fake)
+    assert extract.cmd_run(_run_args()) == 0
+    models = [m for m, _ in fake.calls]
+    assert sorted(models) == sorted(extract._ordered_audio())  # each model once, for all 3 items
+    assert models.index("diarize") < min(models.index(m) for m in ("conversation", "egemaps", "speech_emotion"))
+    assert models.index("transcribe") < models.index("speech_rate")
+    feats = durable / "fma" / "features"
+    for model, rows in fake.calls:
+        assert [r["stimulus_id"] for r in rows] == [f"ext-fma-x-{i}" for i in range(3)]
+        assert [r["output"] for r in rows] == [f"x-{i}/{model}.csv" for i in range(3)]
+        if extract._AUDIO_DEPS.get(model) == "diarize":
+            assert [r["speakers"] for r in rows] == [str(feats / f"x-{i}" / "diarize_speakers.csv") for i in range(3)]
+        else:
+            assert "speakers" not in rows[0]
+        if model == "speech_rate":
+            assert [r["words"] for r in rows] == [str(feats / f"x-{i}" / "transcribe_transcript_words.csv")
+                                                  for i in range(3)]
+    # every cell is done, so a second run has nothing to do
+    fake.calls.clear()
+    assert extract.cmd_run(_run_args()) == 0 and fake.calls == []
+
+
+def test_batches_are_capped(tmp_path, monkeypatch):
+    _per_item_corpus(tmp_path, monkeypatch, n=5)
+    fake = _FakeAud2psy()
+    monkeypatch.setattr(extract.subprocess, "run", fake)
+    assert extract.cmd_run(_run_args(model="loudness", batch_items=2)) == 0
+    assert [len(rows) for _, rows in fake.calls] == [2, 2, 1]
+
+
+def test_unit_slice_selects_items_for_an_array_task(tmp_path, monkeypatch):
+    _per_item_corpus(tmp_path, monkeypatch, n=5)
+    fake = _FakeAud2psy()
+    monkeypatch.setattr(extract.subprocess, "run", fake)
+    assert extract.cmd_run(_run_args(model="loudness", unit_slice="1:3")) == 0
+    assert [r["stimulus_id"] for r in fake.calls[0][1]] == ["ext-fma-x-1", "ext-fma-x-2"]
+
+
+def test_a_consumer_skips_the_item_whose_producer_failed(tmp_path, monkeypatch, capsys):
+    _per_item_corpus(tmp_path, monkeypatch)
+    fake = _FakeAud2psy(fail={("diarize", "ext-fma-x-1")})
+    monkeypatch.setattr(extract.subprocess, "run", fake)
+    assert extract.cmd_run(_run_args(model=None, skip_model=None)) == 1
+    eg = next(rows for m, rows in fake.calls if m == "egemaps")
+    assert [r["stimulus_id"] for r in eg] == ["ext-fma-x-0", "ext-fma-x-2"]
+    out = capsys.readouterr().out
+    assert "FAILED fma/audio/diarize[x-1]" in out and "fma/audio/egemaps[x-1] (missing input)" in out
+
+
+def test_dry_run_writes_no_manifest(tmp_path, monkeypatch, capsys):
+    durable = _per_item_corpus(tmp_path, monkeypatch)
+    monkeypatch.setattr(extract.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    assert extract.cmd_run(_run_args(dry_run=True)) == 0
+    assert not (durable / "fma" / "inputs" / "_batch").exists()
+    assert "--inputs-from" in capsys.readouterr().out
+
+
+def test_packed_corpora_keep_one_call_per_cell(tmp_path, monkeypatch):
+    durable = _per_item_corpus(tmp_path, monkeypatch)
+    (durable / "fma" / "inputs" / "layout.json").unlink()
+    extract._per_item_layout.cache.clear()
+    calls = []
+    monkeypatch.setattr(extract.subprocess, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=1))
+    extract.cmd_run(_run_args(model="loudness"))
+    assert len(calls) == 3 and all("--inputs-from" not in c for c in calls)

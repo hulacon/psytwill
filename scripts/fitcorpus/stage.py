@@ -19,6 +19,7 @@ from the table.
     stage.py clotho           ...   (dev + eval clips; also writes captions.csv)
     stage.py avcaps           ...   (MP4 soundtracks; also writes captions.csv)
     stage.py avcaps --frames  ...   (V frames as PNG, viz2psy's own sampler; see below)
+    stage.py fma --per-item   ...   (one clip per item, no packing; twp-unpresented, fma, musopen)
 
 Writes (idempotent; a unit whose wav and tables exist is skipped unless
 --force):
@@ -43,6 +44,16 @@ Writes (idempotent; a unit whose wav and tables exist is skipped unless
 `stimulus_id` is the unit's `ext-<corpus>-<unit>` id throughout: audio
 frames and transcript rows share it, and the segments table is the join
 to the original files.
+
+Per item (`--per-item`; E5's "re-extract per item", DECIDED 2026-11-13 for
+twp-unpresented, fma and musopen): every group (a word in one voice, a track,
+a movement) is its own unit `<prefix><group>`, its wav under
+`<scratch>/<corpus>/items/`, so a windowed A member never reads across items
+and needs no item mask. Each unit still gets a one-row segments table (the
+per-corpus columns ride on it), and `<durable>/<corpus>/inputs/layout.json`
+records the layout; extract.py reads it to batch the many short units. A
+durable root holds one layout per corpus: stage per item into a fresh root,
+never over a packed one.
 
 Held-out LibriSpeech (`--split test-clean` / `test-other`): staged exactly as
 the fit split, but only into a durable root that holds a `HELDOUT` marker file,
@@ -76,6 +87,7 @@ from psytwill.fitcorpus import ext_id
 from psytwill.staging import (
     Segment,
     Unit,
+    item_units,
     layout_unit,
     normalize_gigaspeech_text,
     normalize_librispeech_text,
@@ -97,6 +109,33 @@ RATES = {"librispeech": 16000, "gigaspeech": 16000, "fma": 44100,
 # music_emotion), or edge windows hear the neighbouring clip and clip-pooled
 # A carries its neighbour's content (l-hub, DECIDED 2026-10-09).
 GAPS = {"clotho": 10.0, "avcaps": 10.0}
+
+# Packed short-item corpora that can be staged one clip per item (E5's
+# "re-extract per item", DECIDED 2026-11-13): a word, a track, a movement.
+PER_ITEM_CORPORA = ("twp-unpresented", "fma", "musopen")
+LAYOUT_FILE = "layout.json"  # in <durable>/<corpus>/inputs/; absent = packed
+
+
+def staged_layout(corpus: str, durable_root: Path) -> str | None:
+    """The layout a durable root already holds for ``corpus``: per-item, packed, or None."""
+    inputs = durable_root / corpus / "inputs"
+    rec = inputs / LAYOUT_FILE
+    if rec.exists():
+        return json.loads(rec.read_text())["layout"]
+    return "packed" if (inputs / "units.csv").exists() else None
+
+
+def check_layout(corpus: str, args) -> str:
+    """The layout to stage, refusing per-item for other corpora and a second layout in one root."""
+    want = "per-item" if getattr(args, "per_item", False) else "packed"
+    if want == "per-item" and corpus not in PER_ITEM_CORPORA:
+        sys.exit(f"ERROR: --per-item is for the packed short-item corpora {', '.join(PER_ITEM_CORPORA)} "
+                 f"(DECIDED 2026-11-13); {corpus} is staged packed")
+    have = staged_layout(corpus, args.durable_root)
+    if have is not None and have != want:
+        sys.exit(f"ERROR: {args.durable_root / corpus / 'inputs'} is staged {have}; a root holds one layout "
+                 f"per corpus. Stage {want} into a fresh --durable-root (and --scratch-root), never over it")
+    return want
 
 
 def slug(s: str) -> str:
@@ -628,7 +667,8 @@ def write_unit(corpus: str, unit: Unit, sr: int, decode, args) -> dict:
     import soundfile as sf
 
     sid = ext_id(corpus, unit.unit)
-    wav = args.scratch_root / corpus / "units" / f"{unit.unit}.wav"
+    media_dir = "items" if getattr(args, "per_item", False) else "units"  # never mix the two layouts' wavs
+    wav = args.scratch_root / corpus / media_dir / f"{unit.unit}.wav"
     inputs = args.durable_root / corpus / "inputs"
     seg_csv = inputs / f"{unit.unit}_segments.csv"
     tr_csv = inputs / f"{unit.unit}_transcript.csv"
@@ -667,18 +707,34 @@ def write_unit(corpus: str, unit: Unit, sr: int, decode, args) -> dict:
 
 
 def stage_packed(corpus: str, args) -> list[dict]:
+    layout = check_layout(corpus, args)
     sr, plans, decode = ADAPTERS[corpus](args)
     units: list[Unit] = []
+    max_groups = getattr(args, "max_groups", None)
     for prefix, groups in plans:
-        units.extend(pack_groups(groups, target=args.target_minutes * 60, hop=HOP,
-                                 gap=GAPS.get(corpus, GAP), unit_prefix=prefix))
+        if max_groups:  # a pilot: the first N groups of each plan (per voice / genre / ...)
+            groups = [g for g in groups if g[1]][:max_groups]
+        if layout == "per-item":
+            units.extend(item_units(groups, hop=HOP, gap=GAPS.get(corpus, GAP), unit_prefix=prefix))
+        else:
+            units.extend(pack_groups(groups, target=args.target_minutes * 60, hop=HOP,
+                                     gap=GAPS.get(corpus, GAP), unit_prefix=prefix))
     audio_h = sum(s.duration for u in units for s in u.segments) / 3600
-    print(f"{corpus}: {len(units)} units, {sum(len(u.segments) for u in units)} segments, "
-          f"{audio_h:.2f} h of audio, {sr} Hz, target {args.target_minutes:g} min/unit")
+    print(f"{corpus}: {len(units)} units ({layout}), {sum(len(u.segments) for u in units)} segments, "
+          f"{audio_h:.2f} h of audio, {sr} Hz"
+          + ("" if layout == "per-item" else f", target {args.target_minutes:g} min/unit"))
     if args.dry_run:
         for u in units[:5]:
             print(f"  {u.unit}: {len(u.segments)} segments, {u.duration / 60:.1f} min")
         return []
+    if layout == "per-item":
+        inputs = args.durable_root / corpus / "inputs"
+        inputs.mkdir(parents=True, exist_ok=True)
+        (inputs / LAYOUT_FILE).write_text(json.dumps({
+            "layout": "per-item", "hop": HOP, "gap_within_item": GAPS.get(corpus, GAP),
+            "trailing_gap": 0.0, "media_dir": str(args.scratch_root / corpus / "items"),
+            "max_groups": max_groups,
+            "decided": "E5 re-extract per item, psytwill-space-next 2026-11-13"}, indent=1) + "\n")
     rows = []
     for k, u in enumerate(units, 1):
         rows.append(write_unit(corpus, u, sr, decode, args))
@@ -744,6 +800,11 @@ def main() -> int:
     ap.add_argument("--per-genre", type=int, default=250, help="fma: clips per top genre (seeded draw)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--force", action="store_true", help="rewrite units that already exist")
+    ap.add_argument("--max-groups", type=int, default=None, metavar="N",
+                    help="pilot: stage only the first N groups of each plan (per voice, genre, ...)")
+    ap.add_argument("--per-item", action="store_true",
+                    help=f"one unit per item, no packing ({', '.join(PER_ITEM_CORPORA)}; E5 're-extract per "
+                         "item'); into a durable root not already staged packed")
     ap.add_argument("--dry-run", action="store_true", help="plan and report; write nothing")
     ap.add_argument("--frames", action="store_true",
                     help="avcaps: write V frames (PNG) + frame tables instead of audio units")

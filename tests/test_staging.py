@@ -4,6 +4,7 @@ import pytest
 
 from psytwill.staging import (
     Segment,
+    item_units,
     layout_unit,
     normalize_gigaspeech_text,
     normalize_librispeech_text,
@@ -68,6 +69,40 @@ class TestPackGroups:
 
     def test_empty_groups_skipped(self):
         assert pack_groups([("a", [])], target=5.0) == []
+
+
+class TestItemUnits:
+    """E5's "re-extract per item" (DECIDED 2026-11-13): one unit per item, no neighbour."""
+
+    def test_one_unit_per_group(self):
+        groups = [("w1", [seg(0, "w1", 0.6)]), ("w2", [seg(1, "w2", 0.7)]), ("w3", [seg(2, "w3", 1.2)])]
+        units = item_units(groups, unit_prefix="echo-")
+        assert [u.unit for u in units] == ["echo-w1", "echo-w2", "echo-w3"]
+        assert [[s.group for s in u.segments] for u in units] == [["w1"], ["w2"], ["w3"]]
+        assert all(u.onsets[0] == 0.0 for u in units)
+
+    def test_no_trailing_gap_only_grid_rounding(self):
+        # a packed unit ends one gap after the item (1.0 s here); an item unit
+        # ends on the first grid point at or after it, so < one hop of padding
+        u = item_units([("w", [seg(0, "w", 0.48)])], hop=0.5, gap=0.5)[0]
+        assert u.duration == 0.5
+        assert item_units([("w", [seg(0, "w", 1.0)])], hop=0.5)[0].duration == 1.0
+        assert layout_unit("u", [seg(0, "w", 0.48)], hop=0.5, gap=0.5).duration == 1.0  # unchanged
+
+    def test_a_multi_file_group_keeps_its_internal_gap(self):
+        u = item_units([("ch", [seg(0, "ch", 1.3), seg(1, "ch", 0.51)])], hop=0.5, gap=0.5)[0]
+        assert u.onsets == [0.0, 2.0] and u.duration == 3.0  # 2.0 + 0.51, up to the grid
+
+    def test_ids_are_native_ids_and_unique(self):
+        with pytest.raises(ValueError, match="native id"):
+            item_units([("Bad Key", [seg(0, "Bad Key", 1.0)])])
+        with pytest.raises(ValueError, match="twice"):
+            item_units([("a", [seg(0, "a", 1.0)]), ("a", [seg(1, "a", 1.0)])])
+
+    def test_group_mismatch_refused_and_empty_skipped(self):
+        with pytest.raises(ValueError, match="carries group"):
+            item_units([("a", [seg(0, "b", 1.0)])])
+        assert item_units([("a", [])]) == []
 
 
 class TestTextNormalisation:
