@@ -4,6 +4,60 @@ Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
 
+## 0.62.0 — 2026-11-13
+
+Minor bump: shared and unique subspaces of a fitted block, and their
+split-half reproducibility gate (`psytwill.shared_unique`, `space
+subspaces`). Numbered after 0.61.0 (`feat/attached`).
+
+### Added
+- **`psytwill.shared_unique`**: under `pr` member scaling the block PCA is
+  multi-set CCA, so a direction's eigenvalue is 1 + how much the members share
+  it. The module reads a block as subspaces:
+  - `S`, the leading block directions with eigenvalue >= 1 + c;
+  - `U:<m>`, member m's directions that keep >= `unique` of their variance
+    after regressing m on every other member;
+  - `U`, their union.
+  Every object is a linear read of the block's concatenated member
+  coordinates with an orthonormalising basis from the fit rows, so its scores
+  are uncorrelated and unit-variance there. `S` is placed by the block's own
+  least-squares route, so a row with an absent member still gets `S`. A member
+  absent from >= `max_absent` of the rows gets no unique subspace.
+  `reproducibility` compares each object's two half-fit estimates by mean
+  squared canonical correlation on common rows, against the mean of random
+  span pairs of the same dimension. `draw_subspaces` makes the random spans
+  a reader compares them with: paired d-dimensional draws inside `S` and `U`
+  (d = min of their dims), random d-dimensional reference spans of the
+  block's coordinates, and per-member draws inside `S` at each unique
+  subspace's dimension. Every draw is orthonormal on the fit rows.
+  `save_subspaces` / `load_subspaces` /
+  `project_subspaces` write, read and place rows (subspaces schema 1.0).
+- **`psytwill space subspaces --like <frozen manifest> -o DIR`**: re-reads the
+  frozen fit's inputs and rows as `space fit --like` does, and refuses them if
+  the row count or any member's columns changed. It estimates the objects on
+  the frozen map, refits the block on each half of the units (sha256 parity
+  of `<seed>:<stimulus id>`), and gates every object (defaults: c 0.5, unique
+  0.5, msc >= .5 and >= random + .25 over 20 pairs), and saves 20 draws of
+  each kind with the objects (`--draws`, `--draw-seed`). It writes
+  `<stem>.{json,npz}` and `<stem>_gate.csv`. The json records the S/U overlap
+  and how far the refit's top-k span is from the frozen one's.
+- **`space project --subspaces <json> [--objects a,b]`**: writes every
+  subspace object's (and draw's) orthonormal coordinates on a corpus's rows,
+  as `<object>__<jjj>` columns. Rows are loaded, aligned, masked and chunked
+  as for block scores; an object that cannot place a row leaves NaN there. It
+  refuses subspaces estimated on another fit (manifest sha256) and `--k` /
+  `--view`. The `.meta.json` lists each object's kind, dim, columns and gate
+  verdict.
+- **`fit_block(keep_rows=True)`** keeps the members' prepared rows and the
+  final map's row weights on the returned fit (`BlockFit.rows`,
+  `row_weights`; never saved). **`BlockFit.aligned`** is the alignment and
+  masking `BlockFit.project` uses, now callable on its own.
+
+### Changed
+- `cli._space_fit_setup` holds everything `space fit` reads before it fits;
+  `space fit` behaves as before.
+
+
 ## 0.61.0 — 2026-11-13
 
 Minor bump: releases carry **attached members** (release schema 1.5).

@@ -1196,6 +1196,34 @@ class BlockFit:
     labels: list[str]
     curve: list[dict]  # one row per (k, member, fold)
     manifest: dict = field(default_factory=dict)
+    #: the members' prepared rows the final map was fitted on (masked, never
+    #: filled), in ``labels`` order, and their row weights (None = unweighted).
+    #: Set only by ``fit_block(keep_rows=True)``; never saved
+    rows: dict | None = field(default=None, repr=False, compare=False)
+    row_weights: np.ndarray | None = field(default=None, repr=False, compare=False)
+
+    def aligned(self, spaces: dict[str, SpaceMatrix],
+                absent: dict[str, set] | None = None) -> tuple[dict[str, SpaceMatrix], list[str]]:
+        """The members on their common rows, as :meth:`project` reads them.
+
+        Each member is cut to its whitener's features; a row holding NaN in an
+        `undefinable` column is dropped; ``absent`` ({member: row labels})
+        masks a member on those rows (NaN, never filled). The returned spaces
+        are ready for ``self.map.concat``.
+        """
+        picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
+        aligned, labels = align_spaces(picked)
+        aligned, labels, _ = _drop_undefinable(self, aligned, labels, absent)
+        for m, rows in (absent or {}).items():
+            if m in aligned and rows:
+                hit = np.array([lab in rows for lab in labels])
+                if hit.any():
+                    X = np.array(aligned[m].X, dtype=float, copy=True)
+                    X[hit] = np.nan
+                    aligned[m] = SpaceMatrix(name=aligned[m].name, labels=list(aligned[m].labels), X=X,
+                                             features=list(aligned[m].features), modality=aligned[m].modality,
+                                             extractor=aligned[m].extractor, n_replicates=aligned[m].n_replicates)
+        return aligned, labels
 
     def project(self, spaces: dict[str, SpaceMatrix], view: str = "covariance",
                 k: int | None = None, absent: dict[str, set] | None = None) -> tuple[np.ndarray, list[str]]:
@@ -1220,18 +1248,7 @@ class BlockFit:
         (item masks and the causal shift, :mod:`psytwill.windows`); its NaN
         there never counts as an `undefinable` drop.
         """
-        picked = {m: select_features(spaces[m], self.map.whiteners[m].features) for m in self.members}
-        aligned, labels = align_spaces(picked)
-        aligned, labels, _ = _drop_undefinable(self, aligned, labels, absent)
-        for m, rows in (absent or {}).items():
-            if m in aligned and rows:
-                hit = np.array([lab in rows for lab in labels])
-                if hit.any():
-                    X = np.array(aligned[m].X, dtype=float, copy=True)
-                    X[hit] = np.nan
-                    aligned[m] = SpaceMatrix(name=aligned[m].name, labels=list(aligned[m].labels), X=X,
-                                             features=list(aligned[m].features), modality=aligned[m].modality,
-                                             extractor=aligned[m].extractor, n_replicates=aligned[m].n_replicates)
+        aligned, labels = self.aligned(spaces, absent)
         k = self.k if k is None else int(k)
         if not 1 <= k <= self.k:
             raise SpaceError(f"k {k} is outside this block's 1..{self.k}; a projection can only drop components")
@@ -1394,6 +1411,7 @@ def fit_block(
     label_sources: dict[str, Sequence[str]] | None = None,
     absent: dict[str, dict[str, set]] | None = None,
     target_rows: str = "narrow",
+    keep_rows: bool = False,
 ) -> BlockFit:
     """Fit one private block; see the module docstring for the pipeline.
 
@@ -1464,6 +1482,11 @@ def fit_block(
     unlabelled) drops bookkeeping columns and enables ``select`` (see
     :func:`apply_labels`); ``checkpoints`` (member -> checkpoint) feeds the
     ``circular_with`` flag. All three are recorded in the manifest.
+
+    ``keep_rows`` keeps the members' prepared rows (``BlockFit.rows``, in
+    ``labels`` order) and the final map's row weights (``row_weights``) on
+    the returned fit, for a reader of the block's coordinates on its own fit
+    rows (:mod:`psytwill.shared_unique`). Neither is saved.
     """
     if member_scaling not in MEMBER_SCALINGS:
         raise SpaceError(f"unknown member scaling {member_scaling!r}; use one of {MEMBER_SCALINGS}")
@@ -2000,8 +2023,14 @@ def fit_block(
             "dropped_members": lp.dropped_members,
         },
     }
-    return BlockFit(block=block, members=members, k=chosen, map=final, labels=labels,
-                    curve=curve, manifest=manifest)
+    fit = BlockFit(block=block, members=members, k=chosen, map=final, labels=labels,
+                   curve=curve, manifest=manifest)
+    if keep_rows:
+        # what a reader of the block's own coordinates needs on its fit rows
+        # (psytwill.shared_unique): the members exactly as the final map saw them
+        fit.rows = {m: aligned[m] for m in members}
+        fit.row_weights = _weights(np.arange(n))
+    return fit
 
 
 # --------------------------------------------------------------------------
