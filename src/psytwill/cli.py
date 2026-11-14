@@ -1156,11 +1156,10 @@ def _subspace_frame(fit, objs: dict, spaces: dict, key: str, absent: dict | None
     placed, labels = project_subspaces(objs, fit, spaces, absent=absent)
     blocks = [pd.DataFrame(np.asarray(v, dtype=float), columns=[f"{n}__{j:03d}" for j in range(v.shape[1])])
               for n, v in placed.items() if v.shape[1]]
-    df = pd.concat(blocks, axis=1) if blocks else pd.DataFrame(index=range(len(labels)))
     parts = [lab.split("|") for lab in labels]
-    for j, kname in enumerate(key.split(",")):
-        df.insert(j, kname, [p[j] if j < len(p) else None for p in parts])
-    return df
+    keys = pd.DataFrame({kname: [p[j] if j < len(p) else None for p in parts]
+                         for j, kname in enumerate(key.split(","))})
+    return pd.concat([keys, *blocks], axis=1)  # one concat: inserting 275 objects' keys fragments
 
 
 def _load_subspaces_for(args: argparse.Namespace, fit) -> tuple[dict, dict]:
