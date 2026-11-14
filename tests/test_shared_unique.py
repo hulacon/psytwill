@@ -291,3 +291,40 @@ def test_space_subspaces_refuses_a_frozen_fit_whose_inputs_changed(tmp_path, cap
     capsys.readouterr()
     assert main(["space", "subspaces", "--like", str(out / "T.json"), "--no-gate", "-o", str(tmp_path / "s")]) == 1
     assert "inputs changed" in capsys.readouterr().err
+
+
+def test_space_project_writes_subspace_coordinates_whole_or_chunked(tmp_path, capsys):
+    table = _frames_table(tmp_path / "librispeech_audio_frames_features.parquet", "librispeech", 0)
+    out, sub = tmp_path / "space", tmp_path / "sub"
+    key = ["--key", "stimulus_id,time", "--window", "0.5"]
+    assert main(["space", "fit", "--features", str(table), *key, "--members", "a,b,c", "--block", "T",
+                 "--fixed-k", "3", "--no-criterion", "-o", str(out), "--stem", "T"]) == 0
+    assert main(["space", "subspaces", "--like", str(out / "T.json"), "--no-gate", "--draws", "3",
+                 "-o", str(sub)]) == 0
+    proj = ["space", "project", "--features", str(table), *key, "--space", str(out / "T.json"),
+            "--subspaces", str(sub / "T_subspaces.json")]
+    assert main([*proj, "-o", str(tmp_path / "whole.parquet")]) == 0
+    assert main([*proj, "--chunk-size", "7", "-o", str(tmp_path / "chunked.parquet")]) == 0
+    whole, chunked = pd.read_parquet(tmp_path / "whole.parquet"), pd.read_parquet(tmp_path / "chunked.parquet")
+    pd.testing.assert_frame_equal(whole, chunked)
+    meta = json.loads((tmp_path / "whole.meta.json").read_text())
+    assert meta["subspaces"]["objects"]["S"]["dim"] == 2 and meta["subspaces"]["objects"]["U:b"]["dim"] == 0
+    assert meta["subspaces"]["objects"]["S@d001"]["draw_of"] == "S" and "k" not in meta
+    S = whole[["S__000", "S__001"]].to_numpy()
+    # the projected rows are the fit rows here, so the coordinates are orthonormal on them
+    np.testing.assert_allclose(np.cov(S, rowvar=False, bias=True), np.eye(2), atol=1e-8)
+    assert not any(c.startswith("U:b__") for c in whole.columns)
+    assert main([*proj, "--objects", "S,U", "-o", str(tmp_path / "two.parquet")]) == 0
+    two = pd.read_parquet(tmp_path / "two.parquet")
+    assert [c for c in two.columns if "__" in c] == ["S__000", "S__001", "U__000"]
+    capsys.readouterr()
+    assert main([*proj, "--objects", "nope", "-o", str(tmp_path / "x.parquet")]) == 1
+    assert "nope" in capsys.readouterr().err
+    assert main([*proj, "--k", "2", "-o", str(tmp_path / "x.parquet")]) == 1
+    # another fit of the same block is not the one the subspaces belong to
+    assert main(["space", "fit", "--features", str(table), *key, "--members", "a,b,c", "--block", "T",
+                 "--fixed-k", "2", "--no-criterion", "-o", str(out), "--stem", "T2"]) == 0
+    capsys.readouterr()
+    assert main(["space", "project", "--features", str(table), *key, "--space", str(out / "T2.json"),
+                 "--subspaces", str(sub / "T_subspaces.json"), "-o", str(tmp_path / "x.parquet")]) == 1
+    assert "not on" in capsys.readouterr().err

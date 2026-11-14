@@ -1145,6 +1145,45 @@ def _project_frame(fit, spaces: dict, key: str, view: str, k: int | None = None,
     return df
 
 
+def _subspace_frame(fit, objs: dict, spaces: dict, key: str, absent: dict | None = None):
+    """Every subspace object's orthonormal coordinates on the aligned rows: ``<object>__<jjj>``
+    columns (NaN where the object cannot place a row), keys first."""
+    import numpy as np
+    import pandas as pd
+
+    from psytwill.shared_unique import project_subspaces
+
+    placed, labels = project_subspaces(objs, fit, spaces, absent=absent)
+    blocks = [pd.DataFrame(np.asarray(v, dtype=float), columns=[f"{n}__{j:03d}" for j in range(v.shape[1])])
+              for n, v in placed.items() if v.shape[1]]
+    df = pd.concat(blocks, axis=1) if blocks else pd.DataFrame(index=range(len(labels)))
+    parts = [lab.split("|") for lab in labels]
+    for j, kname in enumerate(key.split(",")):
+        df.insert(j, kname, [p[j] if j < len(p) else None for p in parts])
+    return df
+
+
+def _load_subspaces_for(args: argparse.Namespace, fit) -> tuple[dict, dict]:
+    """``--subspaces`` read and checked against ``--space``; ``--objects`` keeps the named ones."""
+    import hashlib
+
+    from psytwill.shared_unique import load_subspaces
+
+    objs, doc = load_subspaces(args.subspaces)
+    sha = hashlib.sha256(Path(args.space).read_bytes()).hexdigest()
+    if doc.get("fit_manifest_sha256") != sha:
+        raise SpaceError(f"{args.subspaces} was estimated on {doc.get('fit_manifest')} "
+                         f"(sha256 {str(doc.get('fit_manifest_sha256'))[:12]}…), not on {args.space} "
+                         f"({sha[:12]}…): project through the fit the subspaces belong to")
+    if args.objects:
+        want = _split(args.objects)
+        missing = [n for n in want if n not in objs]
+        if missing:
+            raise SpaceError(f"--objects: {', '.join(missing)} not in {args.subspaces}")
+        objs = {n: objs[n] for n in want}
+    return objs, doc
+
+
 def _run_space_subspaces(args: argparse.Namespace) -> None:
     """Shared and unique subspaces of a frozen block, and their split-half gate (psytwill.shared_unique)."""
     import hashlib
@@ -1279,6 +1318,19 @@ def _run_space_project(args: argparse.Namespace) -> None:
     k = fit.k if args.k is None else args.k
     if not 1 <= k <= fit.k:
         raise SpaceError(f"--k {k} is outside {args.space}'s 1..{fit.k}; a projection can only drop components")
+    subs, sub_doc = (None, None)
+    if args.objects and not args.subspaces:
+        raise SpaceError("--objects names subspace objects: give --subspaces")
+    if args.subspaces:
+        if args.k is not None or args.view != "covariance":
+            raise SpaceError("--subspaces writes each object's own orthonormal coordinates: drop --k and --view")
+        subs, sub_doc = _load_subspaces_for(args, fit)
+
+    def frame(spaces, absent):
+        if subs is not None:
+            return _subspace_frame(fit, subs, spaces, args.key, absent)
+        return _project_frame(fit, spaces, args.key, args.view, k, absent)
+
     if args.causal:
         if not args.window or "time" not in args.key.split(","):
             raise SpaceError("--causal shifts windows along time: it needs a time key and --window")
@@ -1310,16 +1362,17 @@ def _run_space_project(args: argparse.Namespace) -> None:
                 acc["absent_rows"] += r["absent_rows"]
                 if "causal_shifts" in r:
                     acc["causal_shifts"] = r["causal_shifts"]
-            frames.append(_project_frame(fit, spaces, args.key, args.view, k, absent))
+            frames.append(frame(spaces, absent))
             del spaces
             print(f"  chunk {i + 1}/{len(chunks)}: {len(frames[-1])} rows", flush=True)
-        cols = args.key.split(",") + [f"{fit.block}_{j:03d}" for j in range(k)]
+        cols = args.key.split(",") + ([f"{n}__{j:03d}" for n, o in subs.items() for j in range(o.dim)]
+                                      if subs is not None else [f"{fit.block}_{j:03d}" for j in range(k)])
         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=cols)
         chunked = {"chunk_size": args.chunk_size, "chunks": len(chunks)}
     else:
         spaces, _, _, _ = _space_load(args, members=fit.members)
         spaces, absent, reads = _read_members(fit, spaces, segs, args.window, args.causal)
-        df = _project_frame(fit, spaces, args.key, args.view, k, absent)
+        df = frame(spaces, absent)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix == ".parquet":
@@ -1331,6 +1384,21 @@ def _run_space_project(args: argparse.Namespace) -> None:
             "inputs": [str(p) for p in args.features],
             "key": args.key, "window": args.window, "rows": int(len(df)), "view": args.view, **chunked,
             "causal": bool(args.causal), "segments_units_per_table": seg_tables, "window_reads": reads}
+    if subs is not None:
+        import hashlib
+
+        meta.pop("k")
+        meta["view"] = "subspace (each object's orthonormal coordinates on the fit rows)"
+        meta["subspaces"] = {"path": str(Path(args.subspaces).resolve()),
+                             "sha256": hashlib.sha256(Path(args.subspaces).read_bytes()).hexdigest(),
+                             "schema_version": sub_doc["schema_version"],
+                             "objects": {n: {"kind": o.kind, "dim": o.dim, "columns": f"{n}__000..{n}__{o.dim - 1:03d}"
+                                             if o.dim else None, "gate_passed": o.detail.get("gate_passed"),
+                                             **({"draw_of": o.detail["draw_of"]} if "draw_of" in o.detail else {})}
+                                         for n, o in subs.items()}}
+        (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
+        print(f"psytwill space project [{fit.block}, {len(subs)} subspace objects] -> {out}  ({len(df)} rows)")
+        return
     (out.parent / (out.name.removesuffix(out.suffix) + ".meta.json")).write_text(json.dumps(meta, indent=2))
     print(f"psytwill space project [{fit.block}, k={k}{f' of {fit.k}' if k != fit.k else ''}] -> {out}  ({len(df)} rows)")
 
@@ -2137,6 +2205,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "(Contract B 1.4 labels in the fit manifest), so a row's value reads only audio up to "
                          "the row's end. The first half-window of each clip has no value: the member is absent "
                          "there, never filled")
+    pr.add_argument("--subspaces", metavar="JSON",
+                    help="write these subspace objects' coordinates instead of block scores (`space subspaces` "
+                         "output for this --space): <object>__<jjj> columns, NaN where an object cannot place a "
+                         "row; rows are aligned and masked as for block scores")
+    pr.add_argument("--objects", help="with --subspaces: only these objects (comma-separated; default all)")
     pr.add_argument("-o", "--output", required=True, help="scores table (.parquet or .csv)")
     pr.set_defaults(func=_run_space_project)
 

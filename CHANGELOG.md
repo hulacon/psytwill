@@ -41,6 +41,13 @@ subspaces`). Numbered after 0.61.0 (`feat/attached`).
   each kind with the objects (`--draws`, `--draw-seed`). It writes
   `<stem>.{json,npz}` and `<stem>_gate.csv`. The json records the S/U overlap
   and how far the refit's top-k span is from the frozen one's.
+- **`space project --subspaces <json> [--objects a,b]`**: writes every
+  subspace object's (and draw's) orthonormal coordinates on a corpus's rows,
+  as `<object>__<jjj>` columns. Rows are loaded, aligned, masked and chunked
+  as for block scores; an object that cannot place a row leaves NaN there. It
+  refuses subspaces estimated on another fit (manifest sha256) and `--k` /
+  `--view`. The `.meta.json` lists each object's kind, dim, columns and gate
+  verdict.
 - **`fit_block(keep_rows=True)`** keeps the members' prepared rows and the
   final map's row weights on the returned fit (`BlockFit.rows`,
   `row_weights`; never saved). **`BlockFit.aligned`** is the alignment and
