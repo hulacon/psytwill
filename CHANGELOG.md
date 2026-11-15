@@ -3,6 +3,34 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.63.0 — 2026-11-14
+
+Minor bump: per-item staging and batched extraction for the packed short-item
+A corpora (E5's "re-extract per item"). Nothing
+already staged or extracted changes.
+
+### Added
+- **`psytwill.staging.item_units`**: one unit per group (a word in one voice,
+  a track, a movement), id `<prefix><group>`, no trailing gap (the unit ends on
+  the first grid point at or after its last file). A windowed A member computed
+  on such a unit reads only its own item, so E5's item masks find nothing to
+  mask. `layout_unit` gains `trailing_gap` (default: `gap`, as before).
+- **`stage.py --per-item`** for twp-unpresented, fma and musopen only. Wavs go
+  to `<scratch>/<corpus>/items/` (never beside packed `units/`); each unit keeps
+  a one-row segments table with the corpus's columns; `inputs/layout.json`
+  records the layout. A durable root holds one layout per corpus: staging the
+  other layout over it is refused.
+- **`extract.py run`, per-item corpora:** aud2psy cells run batched, one
+  `aud2psy --inputs-from` call per model per `--batch-items` units (default
+  500), each model loaded once and each unit writing its own family and
+  sidecar. Producers (diarize, transcribe) run first; a consumer's manifest
+  row names its unit's stored `diarize_speakers.csv` /
+  `transcribe_transcript_words.csv`, so the diarize speech gate, conversation
+  and speech_rate read each item's own tables (needs aud2psy >= 0.24.0). A
+  unit whose producer table is missing is skipped and reported.
+  `--unit-slice START:END` (plan and run) takes a slice of each source's
+  units, for array tasks over items.
+
 
 ## 0.62.0 — 2026-11-13
 

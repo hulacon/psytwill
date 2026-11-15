@@ -21,6 +21,12 @@ Invariants (tested):
 - packing is deterministic given the input order (no shuffling here —
   adapters that subsample do so with a seeded RNG *before* packing);
 - a unit exceeds ``target`` seconds only when a single group already does.
+
+**Per item** (:func:`item_units`; E5's "re-extract per item", DECIDED
+2026-11-13 for the packed short-item corpora): every group is its own unit,
+so no window can read another item and no item mask is needed. The unit ends
+on the first grid point at or after its last file (no trailing gap: there is
+no next item to keep apart).
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ from dataclasses import dataclass, field
 __all__ = [
     "Segment",
     "Unit",
+    "item_units",
     "pack_groups",
     "layout_unit",
     "normalize_gigaspeech_text",
@@ -70,24 +77,27 @@ def _grid_ceil(t: float, hop: float) -> float:
 
 
 def layout_unit(unit: str, segments: list[Segment], *, hop: float = 0.5,
-                gap: float = 0.5) -> Unit:
+                gap: float = 0.5, trailing_gap: float | None = None) -> Unit:
     """Assign grid-aligned onsets to ``segments`` in order.
 
     Segment ``k`` starts at the first grid point at or after
-    ``offset(k-1) + gap``; the unit ends one ``gap`` after the last
-    offset, rounded up to the grid so the unit length is a whole number
-    of frames.
+    ``offset(k-1) + gap``; the unit ends ``trailing_gap`` (default: ``gap``)
+    after the last offset, rounded up to the grid so the unit length is a
+    whole number of frames.
     """
-    if gap < 0 or hop <= 0:
-        raise ValueError(f"need gap >= 0 and hop > 0, got gap={gap}, hop={hop}")
+    trailing = gap if trailing_gap is None else trailing_gap
+    if gap < 0 or trailing < 0 or hop <= 0:
+        raise ValueError(f"need gap, trailing_gap >= 0 and hop > 0, got gap={gap}, "
+                         f"trailing_gap={trailing_gap}, hop={hop}")
     onsets: list[float] = []
     t = 0.0
     for seg in segments:
         onset = _grid_ceil(t, hop)
         onsets.append(onset)
         t = onset + seg.duration + gap
+    end = t - gap + trailing
     return Unit(unit=unit, segments=list(segments), onsets=onsets,
-                duration=_grid_ceil(t, hop) if segments else 0.0)
+                duration=_grid_ceil(end, hop) if segments else 0.0)
 
 
 def pack_groups(groups: list[tuple[str, list[Segment]]], *, target: float,
@@ -126,6 +136,38 @@ def pack_groups(groups: list[tuple[str, list[Segment]]], *, target: float,
             flush()
         current.extend(segs)
     flush()
+    return units
+
+
+_UNIT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def item_units(groups: list[tuple[str, list[Segment]]], *, hop: float = 0.5,
+               gap: float = 0.5, unit_prefix: str = "u") -> list[Unit]:
+    """One unit per group: E5's "re-extract per item" (DECIDED 2026-11-13).
+
+    A group (a word, a track, a movement) becomes its own unit
+    ``<unit_prefix><group>``, so a windowed member computed on the unit can
+    read nothing but that item. Files of one group keep ``gap`` between them;
+    the unit has no trailing gap and ends on the first grid point at or after
+    its last file. Ids must be native ids (``[a-z0-9-]``) and distinct.
+    """
+    units: list[Unit] = []
+    seen: set[str] = set()
+    for key, segs in groups:
+        if not segs:
+            continue
+        for s in segs:
+            if s.group != key:
+                raise ValueError(f"segment {s.segment!r} carries group {s.group!r}, listed under {key!r}")
+        uid = f"{unit_prefix}{key}"
+        if not _UNIT_ID_RE.match(uid):
+            raise ValueError(f"unit id {uid!r} is not a native id ([a-z0-9-]); slug the group key "
+                             "in the corpus adapter")
+        if uid in seen:
+            raise ValueError(f"unit id {uid!r} occurs twice; a group must be listed once per prefix")
+        seen.add(uid)
+        units.append(layout_unit(uid, list(segs), hop=hop, gap=gap, trailing_gap=0.0))
     return units
 
 
