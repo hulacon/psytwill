@@ -1024,6 +1024,7 @@ def _run_space_fit(args: argparse.Namespace) -> None:
     fit.manifest["exclude_rows_file"] = args.exclude_rows
     fit.manifest["n_excluded_rows"] = dict(rep.excluded_rows)
     fit.manifest["like"] = like
+    fit.manifest["declarations"] = [d.strip() for d in (args.declare or []) if d.strip()]
     npz, manifest, curve = save_fit(fit, args.output, stem=args.stem)
     partial.unlink(missing_ok=True)
     verdict = ("criterion not scored" if fit.manifest["subsumes_all_members"] is None else
@@ -2152,6 +2153,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "matching column is dropped; an unlabelled member is refused. Recorded as "
                         "`selection` in the manifest (copied by --like unless given). Bookkeeping "
                         "columns are always left out, with or without --select")
+    f.add_argument("--declare", action="append", metavar="TEXT",
+                   help="a declaration about the block's inputs or domain, recorded verbatim in the "
+                        "manifest's `declarations` (repeatable), e.g. a mismatch between the fit side and "
+                        "a projection side, or a register declared out of the block's domain. Not copied "
+                        "by --like: a variant repeats the declarations that still hold")
     f.add_argument("-o", "--output", required=True, help="output directory")
     f.add_argument("--stem", help="file stem (default <block>_v1)")
     f.set_defaults(func=_run_space_fit)

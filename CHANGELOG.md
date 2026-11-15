@@ -3,6 +3,29 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.64.0 — 2026-11-15
+
+Minor bump: the centre rule for per-item corpora, and block declarations.
+Space schema 1.20. Nothing already fitted or extracted changes.
+
+### Added
+- **`psytwill.windows.outside_items`** (the centre rule): a row is outside when
+  its centre (bin start + hop / 2) lies in no segment's `[onset, offset)` of its
+  unit. It drops the rows that belong to no item: a per-item clip's grid padding
+  (a 0.53 s word fills a 1.0 s clip) and the silence between packed items.
+  Units with no segments table keep every row.
+- **`extract.py centre-rule --corpus C | --table PATH --out <list>`**: one row
+  exclusion list (`stimulus_id,time` on the binned grid, `reason =
+  centre_outside_item`) over the named corpora's frames tables, per-item or
+  packed, for `space fit` / `space project --exclude-rows`. `--table` reads a
+  table in another root. It refuses no named corpus, a corpus named twice, a
+  per-item unit holding more than one item, a table without recorded segments,
+  and overwriting a written list with different rows. The sidecar pins each
+  frames table by sha256 with its layout and its unit, row and excluded counts.
+- **`space fit --declare TEXT`** (repeatable): statements about the block's
+  inputs or domain, recorded verbatim as `declarations` in the manifest (space
+  schema 1.20). They are not copied by `--like`.
+
 ## 0.63.0 — 2026-11-14
 
 Minor bump: per-item staging and batched extraction for the packed short-item

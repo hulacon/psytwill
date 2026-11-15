@@ -263,7 +263,10 @@ def split_members(models: Sequence[str]) -> list[str]:
 # block row its tables do not hold, or on which it is undefinable, so a
 # candidate extracted on part of a mix is scored on its own rows against the
 # unchanged block (the admission screen's case). `rows_absent` counts both.
-SPACE_SCHEMA_VERSION = "1.19"
+# 1.20: `declarations` (list of strings, `space fit --declare`): statements about
+# the block's inputs or domain recorded verbatim (a fit-vs-projection mismatch, a
+# register out of the block's domain). Empty when none; older manifests lack it.
+SPACE_SCHEMA_VERSION = "1.20"
 TARGET_ROW_MODES = ("narrow", "block")
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
