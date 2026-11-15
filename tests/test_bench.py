@@ -591,3 +591,152 @@ def test_next_window_pairs_by_time_across_dropped_bins():
     items, _ = next_window(sm, horizon=1, predictors=["persistence"], n_boot=10, window=0.5)
     lag = items["target_time"] - items["time"]
     assert np.allclose(lag, 0.5)  # 1.0 s -> 3.0 s across the gap is not one bin ahead
+
+
+# ------------------------------------------------------- rdm and rating
+
+
+def _judged(rng, n=30, n_part=6, noise=0.5, dim=5):
+    """Items with a latent geometry; each participant's RDM is that geometry plus private noise."""
+    from scipy.spatial.distance import pdist
+
+    ids = [f"i{k:02d}" for k in range(n)]
+    Z = rng.normal(size=(n, dim))
+    base = pdist(Z, "cosine")
+    ii, jj = np.triu_indices(n, k=1)
+    rows = []
+    for p in range(n_part):
+        d = base + noise * base.std() * rng.normal(size=base.size)
+        rows += [(f"p{p}", ids[a], ids[b], v) for a, b, v in zip(ii, jj, d)]
+    return ids, Z, pd.DataFrame(rows, columns=["participant", "image_a", "image_b", "dissimilarity"])
+
+
+def test_rdm_scores_planted_geometry_and_not_noise():
+    from psytwill.bench.rdm import rdm
+
+    rng = np.random.default_rng(20)
+    ids, Z, pairs = _judged(rng)
+    _, good = rdm(_sm("g", ids, Z), pairs, n_boot=100)
+    _, bad = rdm(_sm("b", ids, rng.normal(size=Z.shape)), pairs, n_boot=100)
+    assert good["rho"]["mean"] > 0.5 and good["rho"]["lo"] > 0.3
+    assert abs(bad["rho"]["mean"]) < 0.15
+    # a model that is the latent geometry beats the participants' agreement with each other
+    assert good["rho"]["mean"] > good["ceiling_lower"]["mean"]
+    assert good["ceiling_lower"]["mean"] < good["ceiling_upper"]["mean"]
+
+
+def test_rdm_ceiling_lower_is_leave_one_out_spearman():
+    from scipy.stats import spearmanr
+
+    from psytwill.bench.rdm import rdm
+
+    rng = np.random.default_rng(21)
+    ids, Z, pairs = _judged(rng, n=12, n_part=4, noise=2.0)
+    _, s = rdm(_sm("g", ids, Z), pairs, n_boot=20)
+    w = pairs.pivot_table(index=["image_a", "image_b"], columns="participant", values="dissimilarity")
+    loo = [spearmanr(w[c], w.drop(columns=c).mean(axis=1))[0] for c in w.columns]
+    up = [spearmanr(w[c], w.mean(axis=1))[0] for c in w.columns]
+    assert s["ceiling_lower"]["mean"] == pytest.approx(np.mean(loo))
+    assert s["ceiling_upper"]["mean"] == pytest.approx(np.mean(up))
+    assert s["per_participant"]["p0"]["ceiling_lower"] == pytest.approx(loo[0])
+
+
+def test_rdm_item_draws_drop_duplicate_self_pairs():
+    from psytwill.bench.rdm import _pair_index
+
+    a, b = _pair_index(np.array([0, 0, 1, 2]))
+    assert len(a) == 5 and not np.any(a == b)  # 6 pairs among 4 draws, one is item 0 with its duplicate
+
+
+def test_rdm_refuses_self_pairs_repeats_and_unembedded_items():
+    from psytwill.bench.rdm import rdm
+
+    emb = _sm("e", ["a", "b", "c"], np.eye(3))
+    base = {"participant": "p", "dissimilarity": 1.0}
+    with pytest.raises(BenchError, match="with itself"):
+        rdm(emb, pd.DataFrame([base | {"image_a": "a", "image_b": "a"}]))
+    with pytest.raises(BenchError, match="judged twice"):
+        rdm(emb, pd.DataFrame([base | {"image_a": "a", "image_b": "b"}, base | {"image_a": "b", "image_b": "a"}]))
+    with pytest.raises(BenchError, match="no embedding"):
+        rdm(emb, pd.DataFrame([base | {"image_a": "a", "image_b": "z"}]))
+
+
+def test_compare_rdm_self_is_zero_and_better_model_wins():
+    from psytwill.bench.rdm import compare_rdm, rdm
+
+    rng = np.random.default_rng(22)
+    ids, Z, pairs = _judged(rng)
+    good, _ = rdm(_sm("g", ids, Z), pairs, n_boot=10)
+    worse, _ = rdm(_sm("w", ids, Z + 1.5 * rng.normal(size=Z.shape)), pairs, n_boot=10)
+    _, same = compare_rdm(good, good, n_boot=100)
+    assert same["rho"]["diff"]["mean"] == 0 and same["rho"]["diff"]["lo"] == 0
+    assert same["rho"]["ratio"]["mean"] == pytest.approx(1.0) and same["rho"]["ratio_defined"]
+    _, s = compare_rdm(good, worse, n_boot=200)
+    assert s["rho"]["verdict"] == "win" and s["rho"]["ratio"]["lo"] > 1
+
+
+def test_rating_predicts_planted_scalar_and_reliability_bounds():
+    from psytwill.bench.rating import rating, split_half_reliability
+
+    rng = np.random.default_rng(23)
+    n, n_part = 80, 8
+    ids = [f"i{k:02d}" for k in range(n)]
+    X = rng.normal(size=(n, 6))
+    truth = X @ rng.normal(size=6)
+    rows = []
+    for p in range(n_part):
+        v = truth + 0.5 * rng.normal(size=n)
+        a = rng.normal(size=n)
+        for k in range(n):
+            rows.append((f"p{p}", ids[k], v[k] if (k + p) % 4 else np.nan, a[k]))
+    R = pd.DataFrame(rows, columns=["participant", "stimulus_id", "valence", "arousal"])
+    items, s = rating(_sm("x", ids, X), R, ["valence", "arousal"], n_boot=100, n_reliability_splits=20)
+    assert s["valence"]["r"]["mean"] > 0.8 and abs(s["arousal"]["r"]["mean"]) < 0.3
+    assert s["valence"]["ceiling"]["reliability"] > 0.8
+    assert s["arousal"]["ceiling"]["reliability"] < 0.5
+    assert set(items["fold"]) == set(range(5)) and items["prediction"].notna().all()
+    assert (items.loc[items["dimension"] == "valence", "n_raters"] == 6).all()
+    perfect = np.tile(truth, (8, 1))
+    assert split_half_reliability(perfect, n_splits=5)["reliability"] == pytest.approx(1.0)
+
+
+def test_cli_rdm_rating_and_compare(tmp_path):
+    pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(24)
+    ids, Z, pairs = _judged(rng, n=20, n_part=4)
+    fp = tmp_path / "set_features.parquet"
+    noisy = _sm("n", ids, Z + 1.5 * rng.normal(size=Z.shape))
+    pd.concat([_long(_sm("g", ids, Z), "v"), _long(noisy, "v")]).drop(columns="chunk_idx").to_parquet(fp)
+    pp = tmp_path / "pairs.csv"
+    pairs.to_csv(pp, index=False)
+    out = tmp_path / "out"
+    for m in ("g", "n"):
+        assert main(["bench", "rdm", "--features", str(fp), "--model", m, "--pairs", str(pp), "-o", str(out),
+                     "--tag", m, "--n-boot", "50"]) == 0
+    side = json.loads((out / "rdm__g.json").read_text())
+    from psytwill.bench.rdm import summarize
+
+    again = summarize(pd.read_csv(out / side["items_file"]), n_boot=50, seed=0)
+    assert again["rho"]["mean"] == pytest.approx(side["summary"]["rho"]["mean"])
+    assert again["rho"]["lo"] == pytest.approx(side["summary"]["rho"]["lo"])
+    assert main(["bench", "compare", str(out / "rdm__g.json"), str(out / "rdm__n.json"), "-o", str(out),
+                 "--tag", "g-n", "--n-boot", "50"]) == 0
+    cmp_ = json.loads((out / "compare_rdm__g-n.json").read_text())
+    assert cmp_["summary"]["rho"]["a"] == pytest.approx(side["summary"]["rho"]["mean"])
+    fit = tmp_path / "fit.txt"
+    fit.write_text(f"{ids[0]}\n")
+    assert main(["bench", "rdm", "--features", str(fp), "--model", "g", "--pairs", str(pp), "-o", str(out),
+                 "--tag", "leak", "--fit-ids", str(fit)]) == 1
+    rt = pd.DataFrame([(f"p{p}", s, float(Z[k, 0] + rng.normal()), float(rng.normal()))
+                       for p in range(4) for k, s in enumerate(ids)],
+                      columns=["participant", "stimulus_id", "valence", "arousal"])
+    rp = tmp_path / "ratings.csv"
+    rt.to_csv(rp, index=False)
+    for m in ("g", "n"):
+        assert main(["bench", "rating", "--features", str(fp), "--model", m, "--ratings", str(rp), "--outcomes",
+                     "valence,arousal", "-o", str(out), "--tag", m, "--n-boot", "50",
+                     "--n-reliability-splits", "10"]) == 0
+    assert main(["bench", "compare", str(out / "rating__g.json"), str(out / "rating__n.json"), "-o", str(out),
+                 "--tag", "g-n", "--n-boot", "50"]) == 0
+    s = json.loads((out / "compare_rating__g-n.json").read_text())["summary"]
+    assert set(s) >= {"valence", "arousal"}

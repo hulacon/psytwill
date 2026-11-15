@@ -215,6 +215,62 @@ def _run_congruence(args) -> None:
         print(f"  {oc}: mean within-subject rho {s['mean_rho']:+.4f} [{s['lo']:+.4f}, {s['hi']:+.4f}]")
 
 
+def _run_rdm(args) -> None:
+    from .core import refuse_overlap, write_run
+    from .rdm import rdm
+
+    drop = _ids(args.drop_ids)
+    emb, n_nan = _load(args.features, args.model, args.key, drop=drop)
+    pairs = _read_table(args.pairs)
+    n_all = len(pairs)
+    if drop:
+        pairs = pairs[~(pairs["image_a"].astype(str).isin(drop) | pairs["image_b"].astype(str).isin(drop))]
+        if pairs.empty:
+            raise BenchError(f"--drop-ids {args.drop_ids} leaves no pairs")
+    ids = set(pairs["image_a"].astype(str)) | set(pairs["image_b"].astype(str))
+    guard = refuse_overlap(ids, args.fit_ids, what="judged")
+    items, summary = rdm(emb, pairs, metric=args.metric, n_boot=args.n_boot, seed=args.seed)
+    summary["leak_guard"] = guard
+    summary["concatenated"] = _concat_record(args.model)
+    summary["n_pairs_before_drop_ids"] = n_all
+    params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": n_nan}
+    side = write_run(args.output, "rdm", args.tag, items, summary, params=params, inputs=[*args.features, args.pairs])
+    print(f"psytwill bench rdm [{args.tag}, {args.metric}]: {summary['n_items']} items, "
+          f"{summary['n_participants']} participants")
+    print(f"  {side}")
+    for k in ("rho", "ceiling_lower", "ceiling_upper", "share_of_ceiling_lower"):
+        v = summary[k]
+        print(f"  {k}: {v['mean']:.4f} [{v['lo']:.4f}, {v['hi']:.4f}]")
+
+
+def _run_rating(args) -> None:
+    from .core import refuse_overlap, write_run
+    from .rating import rating
+
+    drop = _ids(args.drop_ids)
+    emb, n_nan = _load(args.features, args.model, args.key, drop=drop)
+    ratings = _read_table(args.ratings)
+    if drop:
+        ratings = ratings[~ratings["stimulus_id"].astype(str).isin(drop)]
+        if ratings.empty:
+            raise BenchError(f"--drop-ids {args.drop_ids} leaves no ratings")
+    guard = refuse_overlap(set(ratings["stimulus_id"].astype(str)), args.fit_ids, what="rated")
+    dims = args.outcomes.split(",")
+    items, summary = rating(emb, ratings, dims, n_splits=args.n_splits, n_boot=args.n_boot, seed=args.seed,
+                            n_reliability_splits=args.n_reliability_splits)
+    summary["leak_guard"] = guard
+    summary["concatenated"] = _concat_record(args.model)
+    params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": n_nan}
+    side = write_run(args.output, "rating", args.tag, items, summary, params=params,
+                     inputs=[*args.features, args.ratings])
+    print(f"psytwill bench rating [{args.tag}, mapped]: {', '.join(dims)}")
+    print(f"  {side}")
+    for d in dims:
+        v, c = summary[d]["r"], summary[d]["ceiling"]
+        print(f"  {d}: r {v['mean']:.4f} [{v['lo']:.4f}, {v['hi']:.4f}] over {v['n_units']} items; "
+              f"split-half reliability {c['reliability']:.3f} (r ceiling {c['r_ceiling']:.3f})")
+
+
 def _run_ceiling(args) -> None:
     import pandas as pd
 
@@ -324,6 +380,16 @@ def _run_compare(args) -> None:
     elif task == "oddoneout":
         joined, summary = C.compare_oddoneout(*items, n_boot=args.n_boot, seed=args.seed)
         stats = ["accuracy"]
+    elif task == "rdm":
+        from .rdm import compare_rdm
+
+        joined, summary = compare_rdm(*items, n_boot=args.n_boot, seed=args.seed)
+        stats = ["rho"]
+    elif task == "rating":
+        from .rating import compare_rating
+
+        joined, summary = compare_rating(*items, n_boot=args.n_boot, seed=args.seed)
+        stats = [d for d in sides[0]["params"]["outcomes"].split(",")]
     else:
         outcomes = (args.outcomes or sides[0]["params"]["outcomes"]).split(",")
         joined, summary = C.compare_congruence(*items, outcomes, n_boot=args.n_boot, seed=args.seed)
@@ -339,11 +405,15 @@ def _run_compare(args) -> None:
         d = summary[st]["diff"]
         print(f"  {st}: a {summary[st]['a']:.4f}, b {summary[st]['b']:.4f}, a - b {d['mean']:+.4f} "
               f"[{d['lo']:+.4f}, {d['hi']:+.4f}] -> {summary[st]['verdict']}")
+        if "ratio" in summary[st]:
+            q = summary[st]["ratio"]
+            print(f"    a / b {q['mean']:.4f} [{q['lo']:.4f}, {q['hi']:.4f}]"
+                  + ("" if summary[st]["ratio_defined"] else " (undefined: b's interval reaches 0)"))
 
 
 def register(sub) -> None:
     b = sub.add_parser("bench", help="Score embeddings on benchmark tasks: retrieval | oddoneout | nextwindow | "
-                                     "congruence; compare two runs")
+                                     "congruence | rdm | rating; compare two runs")
     bsub = b.add_subparsers(dest="bench_task", required=True)
 
     r = bsub.add_parser("retrieval", help="cross-modal identification between two keyed sets")
@@ -409,6 +479,28 @@ def register(sub) -> None:
     c.add_argument("--n-splits", type=int, default=5)
     _common(c)
     c.set_defaults(func=_run_congruence)
+
+    s = bsub.add_parser("rdm", help="model item distances vs human dissimilarity judgements (RSA, item bootstrap)")
+    s.add_argument("--features", nargs="+", required=True)
+    s.add_argument("--model", required=True)
+    s.add_argument("--key", default="stimulus_id")
+    s.add_argument("--pairs", required=True, help="table with participant, image_a, image_b, dissimilarity")
+    s.add_argument("--metric", choices=["cosine", "correlation"], default="cosine",
+                   help="model dissimilarity = 1 - this similarity")
+    _common(s)
+    s.set_defaults(func=_run_rdm)
+
+    g = bsub.add_parser("rating", help="mapped ridge from coordinates to each item's mean human rating")
+    g.add_argument("--features", nargs="+", required=True)
+    g.add_argument("--model", required=True)
+    g.add_argument("--key", default="stimulus_id")
+    g.add_argument("--ratings", required=True,
+                   help="table with participant, stimulus_id and one column per rated dimension")
+    g.add_argument("--outcomes", required=True, help="comma-separated rated dimensions, e.g. valence,arousal")
+    g.add_argument("--n-splits", type=int, default=5, help="item folds for the ridge")
+    g.add_argument("--n-reliability-splits", type=int, default=100, help="random participant halves")
+    _common(g)
+    g.set_defaults(func=_run_rating)
 
     rc = bsub.add_parser("reconstruct", help="rebuild a member from a space's block scores (arm R)")
     rc.add_argument("--scores", required=True, help="block scores on the block's fit rows (`space project` parquet)")
