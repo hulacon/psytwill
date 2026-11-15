@@ -612,6 +612,20 @@ def _unit_slice(units: list[Unit], spec: str | None) -> list[Unit]:
     return units[int(a or 0):int(b) if b else len(units)]
 
 
+#: Attached models (battery ``attached=True``) ship beside the space, extracted on
+#: the release's stimuli only: they are in no block, so the fit corpora never need
+#: them. `run` / `plan` leave them out unless `--with-attached` or `--model` names one.
+ATTACHED = frozenset(m for m, b in BATTERY.items() if b.attached)
+
+
+def _wanted(model: str, args: argparse.Namespace) -> bool:
+    if args.model:
+        return model == args.model
+    if model in (args.skip_model or ()):
+        return False
+    return model not in ATTACHED or bool(getattr(args, "with_attached", False))
+
+
 def _filtered(args: argparse.Namespace) -> list[tuple[Source, Unit, str]]:
     cells = []
     for src in build_sources():
@@ -628,11 +642,8 @@ def _filtered(args: argparse.Namespace) -> list[tuple[Source, Unit, str]]:
             if args.unit and unit.id != args.unit:
                 continue
             for model in src.models:
-                if args.model and model != args.model:
-                    continue
-                if model in (args.skip_model or ()):
-                    continue
-                cells.append((src, unit, model))
+                if _wanted(model, args):
+                    cells.append((src, unit, model))
     return cells
 
 
@@ -652,8 +663,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             units = units[args.unit_index:args.unit_index + 1]
         if args.unit:
             units = [u for u in units if u.id == args.unit]
-        models = [m for m in src.models if (not args.model or m == args.model)
-                  and m not in (args.skip_model or ())]
+        models = [m for m in src.models if _wanted(m, args)]
         n = len(units) * len(models)
         done = sum(is_done(stem_for(src, u, m), src, u) for u in units for m in models)
         rows.append((src.key, src.package, len(units), len(models), n, done, src.what, src.depends))
@@ -1364,6 +1374,9 @@ def main() -> int:
         p.add_argument("--unit-index", type=int, help="position in the corpus's unit list (array tasks)")
         p.add_argument("--unit-slice", metavar="START:END",
                        help="units [START, END) of each matched source (array tasks over per-item corpora)")
+        p.add_argument("--with-attached", action="store_true",
+                       help=f"include the attached models ({', '.join(sorted(ATTACHED))}); they are in no "
+                            "block, so the fit corpora skip them by default")
 
     p = sub.add_parser("plan"); filters(p); p.set_defaults(func=cmd_plan)
     p = sub.add_parser("inputs"); p.add_argument("--force", action="store_true"); p.set_defaults(func=cmd_inputs)

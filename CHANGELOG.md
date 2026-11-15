@@ -3,6 +3,18 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.65.0 — 2026-11-15
+
+Minor bump: the fit-corpus driver leaves attached models out by default.
+
+### Changed
+- **`extract.py run` / `plan` / `aggregate` skip attached models** (battery
+  `attached=True`: `context_affect`, `experiential`,
+  `lexical_norms_experiential`). They ship beside the space and are in no
+  block, so the fit corpora never need them. `--with-attached` brings them
+  back, and `--model <attached>` still runs that one model. Screen drivers that
+  call `build_sources` directly are unaffected.
+
 ## 0.64.0 — 2026-11-15
 
 Minor bump: the centre rule for per-item corpora, and block declarations.
