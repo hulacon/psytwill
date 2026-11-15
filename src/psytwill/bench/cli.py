@@ -77,34 +77,53 @@ def _report(side: Path, summary: dict, keys) -> None:
             print(f"  {k}: {v['mean']:.4f} [{v['lo']:.4f}, {v['hi']:.4f}] (n={v['n']}, units={v['n_units']})")
 
 
+def _load_side(features, model, key, segments, window, drop, side):
+    """One retrieval side: a keyed table, or a time grid mean-pooled into segments."""
+    if not segments:
+        sm, n_nan = _load(features, model, key, drop=drop)
+        return sm, n_nan, None
+    from .core import pool_segments
+
+    if window is None:
+        raise BenchError(f"--{side}-segments pools a time grid; give its --{side}-window (seconds)")
+    sm, n_nan = _load(features, model, "stimulus_id,time", window=window, drop=drop)
+    sm, pooling = pool_segments(sm, _read_table(segments))
+    print(f"  pooled {model} into {pooling['n_segments']} segments "
+          f"(min {pooling['grid_rows_per_segment_min']} grid rows each)", flush=True)
+    return sm, n_nan, pooling
+
+
 def _run_retrieval(args) -> None:
-    from .core import refuse_overlap, write_run
-    from .retrieval import retrieval
+    from .core import in_subset, parse_subsets, refuse_overlap, write_run
+    from .retrieval import retrieval, summarize
 
     drop = _ids(args.drop_ids)
-    q, qn = _load(args.query_features, args.query_model, args.query_key, drop=drop)
-    pooling = None
-    if args.target_segments:
-        from .core import pool_segments
-
-        if args.target_window is None:
-            raise BenchError("--target-segments pools a time grid; give its --target-window (seconds)")
-        t, tn = _load(args.target_features, args.target_model, "stimulus_id,time", window=args.target_window,
-                      drop=drop)
-        t, pooling = pool_segments(t, _read_table(args.target_segments))
-        print(f"  pooled {args.target_model} into {pooling['n_segments']} segments "
-              f"(min {pooling['grid_rows_per_segment_min']} grid rows each)", flush=True)
-    else:
-        t, tn = _load(args.target_features, args.target_model, args.target_key, drop=drop)
+    subsets = parse_subsets(args.subset)
+    q, qn, q_pool = _load_side(args.query_features, args.query_model, args.query_key, args.query_segments,
+                               args.query_window, drop, "query")
+    t, tn, t_pool = _load_side(args.target_features, args.target_model, args.target_key, args.target_segments,
+                               args.target_window, drop, "target")
     guard = refuse_overlap({lab.split("|")[0] for lab in q.labels}, args.fit_ids, what="retrieval")
     items, summary = retrieval(q, t, mode=args.mode, metric=args.metric, n_splits=args.n_splits, seed=args.seed,
                                n_boot=args.n_boot, within_stimulus=args.within_stimulus)
     summary["leak_guard"] = guard
     summary["concatenated"] = _concat_record(args.query_model, args.target_model)
-    if pooling:
-        summary["target_pooling"] = pooling
+    if q_pool:
+        summary["query_pooling"] = q_pool
+    if t_pool:
+        summary["target_pooling"] = t_pool
+    if subsets:
+        summary["subsets"] = {}
+        for name, ids in subsets.items():
+            keep = in_subset(items["stimulus_id"], ids)
+            if not keep.any():
+                raise BenchError(f"subset {name!r} matches no scored item")
+            summary["subsets"][name] = summarize(items[keep], within_stimulus=args.within_stimulus,
+                                                 n_boot=args.n_boot, seed=args.seed)
     params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": {"query": qn, "target": tn}}
-    inputs = [*args.query_features, *args.target_features, *([args.target_segments] if args.target_segments else [])]
+    inputs = [*args.query_features, *args.target_features,
+              *[x for x in (args.query_segments, args.target_segments) if x],
+              *[sp.partition("=")[2] for sp in (args.subset or [])]]
     side = write_run(args.output, "retrieval", args.tag, items, summary, params=params, inputs=inputs)
     print(f"psytwill bench retrieval [{args.tag}, {args.mode}]: {summary['n_items']} items")
     print(f"  {side}")
@@ -115,6 +134,10 @@ def _run_retrieval(args) -> None:
     s = summary["both_directions"]["pct_beaten"]
     print(f"  both directions: pct_beaten {s['mean']:.4f} [{s['lo']:.4f}, {s['hi']:.4f}] "
           f"(CI unit: {summary['ci_unit']}, n={s['n_units']})")
+    for name, sub in summary.get("subsets", {}).items():
+        s = sub["both_directions"]["pct_beaten"]
+        print(f"  subset {name}: pct_beaten {s['mean']:.4f} [{s['lo']:.4f}, {s['hi']:.4f}] "
+              f"({sub['n_items_scored']} items, n={s['n_units']})")
 
 
 def _run_oddoneout(args) -> None:
@@ -375,7 +398,10 @@ def _run_compare(args) -> None:
     items = [pd.read_csv(Path(p).parent / s["items_file"]) for p, s in zip((args.a, args.b), sides)]
     if task == "retrieval":
         within = bool(sides[0]["params"].get("within_stimulus"))
-        joined, summary = C.compare_retrieval(*items, within_stimulus=within, n_boot=args.n_boot, seed=args.seed)
+        from .core import parse_subsets
+
+        joined, summary = C.compare_retrieval(*items, within_stimulus=within, n_boot=args.n_boot, seed=args.seed,
+                                              subsets=parse_subsets(args.subset))
         stats = ["pct_beaten", "top1"]
     elif task == "oddoneout":
         joined, summary = C.compare_oddoneout(*items, n_boot=args.n_boot, seed=args.seed)
@@ -405,10 +431,22 @@ def _run_compare(args) -> None:
         d = summary[st]["diff"]
         print(f"  {st}: a {summary[st]['a']:.4f}, b {summary[st]['b']:.4f}, a - b {d['mean']:+.4f} "
               f"[{d['lo']:+.4f}, {d['hi']:+.4f}] -> {summary[st]['verdict']}")
+        if "retention" in summary[st]:
+            q = summary[st]["retention"]
+            print(f"    retention (a - {summary[st]['retention_chance']}) / (b - {summary[st]['retention_chance']}) "
+                  f"{q['mean']:.4f} [{q['lo']:.4f}, {q['hi']:.4f}]"
+                  + ("" if summary[st]["retention_defined"] else " (undefined: b's interval reaches chance)"))
         if "ratio" in summary[st]:
             q = summary[st]["ratio"]
             print(f"    a / b {q['mean']:.4f} [{q['lo']:.4f}, {q['hi']:.4f}]"
                   + ("" if summary[st]["ratio_defined"] else " (undefined: b's interval reaches 0)"))
+    for name, sub in summary.get("subsets", {}).items():
+        d = sub["pct_beaten"]["diff"]
+        line = (f"  subset {name} ({sub['n_items']} items): pct_beaten a {sub['pct_beaten']['a']:.4f}, "
+                f"b {sub['pct_beaten']['b']:.4f}, a - b {d['mean']:+.4f} [{d['lo']:+.4f}, {d['hi']:+.4f}]")
+        q = sub["pct_beaten"]["retention"]
+        print(line + f"; retention {q['mean']:.4f} [{q['lo']:.4f}, {q['hi']:.4f}]"
+              + ("" if sub["pct_beaten"]["retention_defined"] else " (undefined)"))
 
 
 def register(sub) -> None:
@@ -435,6 +473,13 @@ def register(sub) -> None:
                    help="table of stimulus_id, chunk_idx, onset, offset: the target is a time grid, mean-pooled "
                         "into these segments (needs --target-window)")
     r.add_argument("--target-window", type=float, help="the target grid's bin width in seconds")
+    r.add_argument("--query-segments",
+                   help="as --target-segments, for the query side (both sides may be pooled grids, e.g. a film's "
+                        "sound and picture over the same segments; needs --query-window)")
+    r.add_argument("--query-window", type=float, help="the query grid's bin width in seconds")
+    r.add_argument("--subset", action="append", metavar="NAME=FILE",
+                   help="also report the statistics over the items whose stimulus or label is listed in FILE "
+                        "(maps and candidates stay those of the full run); repeatable")
     _common(r)
     r.set_defaults(func=_run_retrieval)
 
@@ -545,6 +590,8 @@ def register(sub) -> None:
     k.add_argument("a", help="sidecar JSON of run a")
     k.add_argument("b", help="sidecar JSON of run b; the difference is a - b")
     k.add_argument("--outcomes", help="congruence: outcome columns to compare (default: run a's)")
+    k.add_argument("--subset", action="append", metavar="NAME=FILE",
+                   help="retrieval: also compare over the items whose stimulus or label is listed in FILE; repeatable")
     k.add_argument("-o", "--output", required=True, help="output directory")
     k.add_argument("--tag", required=True, help="run name in the output filenames, e.g. pspace_v-vs-pca")
     k.add_argument("--seed", type=int, default=0)

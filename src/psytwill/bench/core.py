@@ -324,6 +324,72 @@ def bootstrap_mean(values, groups=None, *, n_boot: int = 2000, seed: int = 0, le
             "n": int(v.size), "n_units": int(n_units)}
 
 
+def paired_bootstrap(a, b, groups=None, *, chance: float | None = None, n_boot: int = 2000, seed: int = 0,
+                     level: float = 0.95) -> dict:
+    """``a - b`` and, given a chance level, retention ``(a - chance) / (b - chance)``, on shared draws.
+
+    Each draw resamples whole groups (or rows) once and takes both arms' means
+    over that draw, so the difference and the ratio are paired. The ratio is
+    computed within each draw, never from two separate intervals. It is
+    reported but flagged ``retention_defined: false`` when b's own interval
+    reaches chance: a ratio over a reference that may be at chance has no
+    meaningful interval, and the raw difference is the number to read.
+    """
+    va, vb = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    ok = ~(np.isnan(va) | np.isnan(vb))
+    va, vb = va[ok], vb[ok]
+    if va.size == 0:
+        raise BenchError("no item carries a score in both arms")
+    rng = np.random.default_rng(seed)
+    if groups is None:
+        pick = rng.integers(0, va.size, size=(n_boot, va.size))
+        ma, mb = va[pick].mean(1), vb[pick].mean(1)
+        n_units = va.size
+    else:
+        g = np.asarray(groups)[ok]
+        uniq, inv = np.unique(g, return_inverse=True)
+        cnt = np.bincount(inv).astype(float)
+        sa, sb = np.bincount(inv, weights=va), np.bincount(inv, weights=vb)
+        pick = rng.integers(0, len(uniq), size=(n_boot, len(uniq)))
+        den = cnt[pick].sum(1)
+        ma, mb = sa[pick].sum(1) / den, sb[pick].sum(1) / den
+        n_units = len(uniq)
+    q = (1 - level) / 2
+
+    def iv(point, draws):
+        return {"mean": float(point), "lo": float(np.nanquantile(draws, q)),
+                "hi": float(np.nanquantile(draws, 1 - q)), "n": int(va.size), "n_units": int(n_units)}
+
+    out = {"a": iv(va.mean(), ma), "b": iv(vb.mean(), mb), "diff": iv(va.mean() - vb.mean(), ma - mb)}
+    if chance is not None:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out["retention"] = iv((va.mean() - chance) / (vb.mean() - chance), (ma - chance) / (mb - chance))
+        out["retention_chance"] = chance
+        out["retention_defined"] = bool(out["b"]["lo"] > chance)
+    return out
+
+
+def parse_subsets(specs) -> dict[str, set[str]]:
+    """``NAME=FILE`` pairs -> {name: ids}. An id names a stimulus or one item label (``stimulus|part``)."""
+    out: dict[str, set[str]] = {}
+    for spec in specs or []:
+        name, sep, path = spec.partition("=")
+        if not sep or not name or not path:
+            raise BenchError(f"--subset {spec!r}: expected NAME=FILE")
+        if name in out:
+            raise BenchError(f"--subset names {name!r} twice")
+        ids = {ln.strip() for ln in Path(path).read_text().splitlines() if ln.strip()}
+        if not ids:
+            raise BenchError(f"--subset {name}: {path} lists no id")
+        out[name] = ids
+    return out
+
+
+def in_subset(labels, ids: set[str]) -> np.ndarray:
+    """Bool per item label: the label itself, or its stimulus, is in ``ids``."""
+    return np.array([str(lab) in ids or stimulus_of(str(lab)) in ids for lab in labels], dtype=bool)
+
+
 # ---------------------------------------------------------------------------
 # Leak guard
 # ---------------------------------------------------------------------------

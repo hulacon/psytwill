@@ -30,7 +30,7 @@ import pandas as pd
 
 from psytwill.exceptions import BenchError
 
-from .core import bootstrap_mean, stimulus_of
+from .core import bootstrap_mean, in_subset, paired_bootstrap, stimulus_of
 
 # Parameters two runs must share for their items to be comparable. Mode and
 # metric may differ (a zero-shot arm against a mapped one is a legitimate
@@ -73,20 +73,44 @@ def _joined(a: pd.DataFrame, b: pd.DataFrame, key: Sequence[str], cols: Sequence
     return m
 
 
+def _retrieval_stats(m: pd.DataFrame, within_stimulus: bool, n_boot: int, seed: int) -> dict:
+    unit = m["stimulus_id"].map(stimulus_of).to_numpy() if within_stimulus else None
+    out: dict = {"n_items": int(len(m))}
+    for stat in ("pct_beaten", "top1"):
+        # pct_beaten's chance is 0.5 whatever the candidate count; top1's varies per item, so no retention
+        pb = paired_bootstrap(m[f"{stat}_a"], m[f"{stat}_b"], unit, chance=0.5 if stat == "pct_beaten" else None,
+                              n_boot=n_boot, seed=seed)
+        out[stat] = {"a": pb["a"]["mean"], "b": pb["b"]["mean"], "diff": pb["diff"], "verdict": verdict(pb["diff"]),
+                     "a_interval": pb["a"], "b_interval": pb["b"]}
+        if "retention" in pb:
+            out[stat] |= {"retention": pb["retention"], "retention_chance": pb["retention_chance"],
+                          "retention_defined": pb["retention_defined"]}
+    return out
+
+
 def compare_retrieval(a: pd.DataFrame, b: pd.DataFrame, *, within_stimulus: bool, n_boot: int = 2000,
-                      seed: int = 0) -> tuple[pd.DataFrame, dict]:
+                      seed: int = 0, subsets: dict[str, set[str]] | None = None) -> tuple[pd.DataFrame, dict]:
+    """Paired a - b per item (both directions averaged), and retention against b for ``pct_beaten``.
+
+    ``subsets`` ({name: ids}) repeats the comparison on the items whose label
+    or stimulus is listed, each with its own resampling over its own units.
+    """
     def per_item(d):
         return d.assign(top1=d["top1"].astype(float)).groupby("stimulus_id", as_index=False)[
             ["pct_beaten", "top1"]].mean()
 
     m = _joined(per_item(a), per_item(b), ["stimulus_id"], ["pct_beaten", "top1"])
-    unit = m["stimulus_id"].map(stimulus_of) if within_stimulus else None
-    summary = {"n_items": int(len(m)), "ci_unit": "stimulus" if within_stimulus else "item"}
     for stat in ("pct_beaten", "top1"):
         m[f"{stat}_diff"] = m[f"{stat}_a"] - m[f"{stat}_b"]
-        ci = bootstrap_mean(m[f"{stat}_diff"], unit, n_boot=n_boot, seed=seed)
-        summary[stat] = {"a": float(m[f"{stat}_a"].mean()), "b": float(m[f"{stat}_b"].mean()), "diff": ci,
-                         "verdict": verdict(ci)}
+    summary = {"ci_unit": "stimulus" if within_stimulus else "item"}
+    summary |= _retrieval_stats(m, within_stimulus, n_boot, seed)
+    if subsets:
+        summary["subsets"] = {}
+        for name, ids in subsets.items():
+            keep = in_subset(m["stimulus_id"], ids)
+            if not keep.any():
+                raise BenchError(f"subset {name!r} matches no compared item")
+            summary["subsets"][name] = _retrieval_stats(m[keep], within_stimulus, n_boot, seed)
     return m, summary
 
 
