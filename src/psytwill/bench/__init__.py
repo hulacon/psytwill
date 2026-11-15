@@ -18,6 +18,8 @@ a CI is always recomputable from the output alone):
 - ``rdm``         — model item distances against human dissimilarity
   judgements (RSA), with item-bootstrap CIs and noise-ceiling bounds
 - ``rating``      — mapped prediction of each item's mean human rating
+- ``boundary``    — a film grid's change (and slow-feature prediction error)
+  at annotated event boundaries against cut-matched controls
 
 Every task has a ``zero-shot`` mode (raw cosine; only meaningful when both
 sides share one trained space, e.g. EBind image vs EBind text) and a

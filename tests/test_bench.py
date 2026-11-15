@@ -842,3 +842,99 @@ def test_cli_retrieval_pools_both_sides_and_reports_subsets(tmp_path):
     c = json.loads((out / "compare_retrieval__av-noise.json").read_text())["summary"]
     assert c["pct_beaten"]["diff"]["lo"] > 0 and "retention" in c["pct_beaten"]
     assert c["subsets"]["held"]["n_items"] == 18
+
+
+# --------------------------------------------------------------------- boundary
+
+
+def _films_with_events(rng, n_films=8, n_bins=200, d=6, jump=3.0, annotators=("a1", "a2")):
+    """Each film drifts slowly and jumps at its boundaries; cuts sit at random times."""
+    labels, X, brows, crows, drows = [], [], [], [], []
+    for k in range(n_films):
+        sid = f"film{k}"
+        b = np.sort(rng.choice(np.arange(20, n_bins - 20), size=6, replace=False)) * 0.5
+        x = rng.normal(size=d) * 5
+        for i in range(n_bins):
+            t = i * 0.5
+            x = x + 0.05 * rng.normal(size=d) + (jump * rng.normal(size=d) if np.any(np.isclose(b, t)) else 0)
+            labels.append(f"{sid}|{t}")
+            X.append(x.copy())
+        for j, t in enumerate(b):
+            brows.append((sid, "C", float(t), annotators[k % len(annotators)]))
+        for t in rng.uniform(0, n_bins * 0.5, size=10):
+            crows.append((sid, float(t)))
+        drows.append((sid, n_bins * 0.5))
+    sm = SpaceMatrix(name="g", labels=labels, X=np.array(X), features=[f"g_{j:03d}" for j in range(d)])
+    return (sm, pd.DataFrame(brows, columns=["stimulus_id", "level", "onset", "annotator"]),
+            pd.DataFrame(crows, columns=["stimulus_id", "time"]), pd.DataFrame(drows, columns=["stimulus_id", "duration"]))
+
+
+def test_boundary_finds_planted_jumps_and_not_shuffled_ones():
+    from psytwill.bench.boundary import boundary
+
+    rng = np.random.default_rng(40)
+    sm, bd, cuts, dur = _films_with_events(rng)
+    items, s = boundary(sm, bd, cuts, dur, level="C", window=0.5, n_perm=500, n_boot=200)
+    assert s["change"]["film_sd"]["mean"] > 0.5 and s["change"]["film_sd"]["p_sign_flip"] < 0.01
+    assert s["change"]["film_sd"]["lo"] > 0
+    fake = bd.assign(onset=rng.uniform(10, 90, size=len(bd)).round(1))
+    _, s0 = boundary(sm, fake, cuts, dur, level="C", window=0.5, n_perm=500, n_boot=200)
+    assert s0["change"]["film_sd"]["p_sign_flip"] > 0.01
+    assert set(items["stat"]) == {"change"}
+
+
+def test_boundary_sfa_kernel_and_duration_cap():
+    from psytwill.bench.boundary import boundary
+
+    rng = np.random.default_rng(41)
+    sm, bd, cuts, dur = _films_with_events(rng)
+    W, lam = np.eye(6), np.full(6, 0.1)
+    items, s = boundary(sm, bd, cuts, dur.assign(duration=60.0), level="C", window=0.5, kernel=(W, lam),
+                        n_perm=200, n_boot=100)
+    assert {"change", "pe_sfa"} <= set(s) and s["pe_sfa"]["film_sd"]["mean"] > 0
+    assert items["time"].max() <= 60.0  # boundaries past the scored span are not scored
+    with pytest.raises(BenchError, match="kernel W"):
+        boundary(sm, bd, cuts, dur, level="C", window=0.5, kernel=(np.eye(5), np.ones(5)))
+
+
+def test_film_test_statistic_is_mean_of_annotator_means():
+    from psytwill.bench.boundary import film_test
+
+    df = pd.DataFrame({"stimulus_id": ["f1", "f1", "f2", "f3"], "annotator": ["a", "a", "a", "b"],
+                       "delta": [1.0, 3.0, 4.0, -1.0]})
+    r = film_test(df, "delta", n_perm=100, n_boot=100)
+    assert r["mean"] == pytest.approx(((2.0 + 4.0) / 2 + -1.0) / 2)
+    assert r["per_annotator"] == {"a": 3.0, "b": -1.0} and r["n_annotators_positive"] == 1
+
+
+def test_cli_boundary_joint_blocks(tmp_path):
+    pytest.importorskip("pyarrow")
+    rng = np.random.default_rng(42)
+    sm, bd, cuts, dur = _films_with_events(rng, n_films=6)
+    other = SpaceMatrix(name="h", labels=sm.labels, X=rng.normal(size=(sm.n, 3)), features=["h_0", "h_1", "h_2"])
+    fp = tmp_path / "grid_frames_features.parquet"
+    pd.concat([_long_grid(sm, "x"), _long_grid(other, "x")]).to_parquet(fp, index=False)
+    paths = {}
+    for name, df in (("b", bd), ("c", cuts), ("d", dur)):
+        paths[name] = tmp_path / f"{name}.csv"
+        df.to_csv(paths[name], index=False)
+    out = tmp_path / "out"
+    assert main(["bench", "boundary", "--features", str(fp), "--model", "g,h", "--window", "0.5", "--boundaries",
+                 str(paths["b"]), "--level", "C", "--cuts", str(paths["c"]), "--durations", str(paths["d"]), "-o",
+                 str(out), "--tag", "joint", "--n-boot", "50", "--n-perm", "100"]) == 0
+    side = json.loads((out / "boundary__joint.json").read_text())
+    assert side["summary"]["n_films"] == 6 and side["summary"]["change"]["n_boundaries"] == 36
+
+
+def test_compare_boundary_paired_on_shared_film_draws():
+    from psytwill.bench.boundary import boundary, compare_boundary
+
+    rng = np.random.default_rng(43)
+    sm, bd, cuts, dur = _films_with_events(rng)
+    a, _ = boundary(sm, bd, cuts, dur, level="C", window=0.5, n_perm=100, n_boot=50)
+    weak = SpaceMatrix(name="w", labels=sm.labels, X=sm.X + 3 * rng.normal(size=sm.X.shape), features=sm.features)
+    b, _ = boundary(weak, bd, cuts, dur, level="C", window=0.5, n_perm=100, n_boot=50)
+    _, same = compare_boundary(a, a, n_boot=100)
+    assert same["change"]["diff"]["mean"] == 0 and same["change"]["ratio"]["lo"] == pytest.approx(1.0)
+    _, s = compare_boundary(a, b, n_boot=300)
+    assert s["change"]["diff"]["lo"] > 0 and s["change"]["ratio"]["mean"] > 1
