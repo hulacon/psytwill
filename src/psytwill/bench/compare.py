@@ -17,6 +17,9 @@ bootstraps the difference ``a - b``:
   the RDMs rebuilt per draw, the same draws for both arms (``rdm.compare_rdm``).
 - ``rating``: per dimension, out-of-fold r, a - b and a / b; items resampled
   (``rating.compare_rating``).
+- ``boundary``: per statistic, the film-SD effect, a - b and a / b on the
+  boundaries both runs kept; films resampled within annotator
+  (``boundary.compare_boundary``).
 
 Verdict: ``win`` when the CI lies above 0, ``loss`` below, ``tie`` otherwise.
 """
@@ -42,6 +45,7 @@ MUST_MATCH = {
     "congruence": ("pairs", "n_splits", "seed"),
     "rdm": ("pairs", "seed", "drop_ids"),
     "rating": ("ratings", "outcomes", "n_splits", "seed", "drop_ids"),
+    "boundary": ("boundaries", "cuts", "durations", "level", "window", "tol", "exclude", "seed", "drop_ids"),
 }
 
 

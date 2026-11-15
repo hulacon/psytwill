@@ -294,6 +294,62 @@ def _run_rating(args) -> None:
               f"split-half reliability {c['reliability']:.3f} (r ceiling {c['r_ceiling']:.3f})")
 
 
+def _run_boundary(args) -> None:
+    import numpy as np
+
+    from psytwill.store import SpaceMatrix
+
+    from .boundary import boundary
+    from .core import refuse_overlap, write_run
+
+    drop = _ids(args.drop_ids)
+    parts, n_nan = [], {}
+    for m in args.model.split(","):
+        sm, n_nan[m] = _load(args.features, m, "stimulus_id,time", window=args.window, drop=drop)
+        parts.append(sm)
+    if len(parts) == 1:
+        sm = parts[0]
+    else:
+        # the blocks side by side in their own units (no rescaling), on the bins every block has
+        common = sorted(set.intersection(*(set(p.labels) for p in parts)))
+        if not common:
+            raise BenchError(f"models {args.model} share no grid row")
+        cols, X = [], []
+        for p in parts:
+            pos = {lab: i for i, lab in enumerate(p.labels)}
+            X.append(p.X[[pos[lab] for lab in common]])
+            cols += [f"{p.name}:{f}" for f in p.features]
+        sm = SpaceMatrix(name="+".join(p.name for p in parts), labels=common, X=np.hstack(X), features=cols)
+        print(f"  joined {len(parts)} blocks: {sm.n} common rows x {sm.dim}", flush=True)
+    kernel = None
+    if args.sfa_kernel:
+        z = np.load(args.sfa_kernel)
+        need = [f"{args.sfa_prefix}W", f"{args.sfa_prefix}lam"]
+        miss = [k for k in need if k not in z.files]
+        if miss:
+            raise BenchError(f"{args.sfa_kernel} lacks {miss} (has {z.files[:6]}...)")
+        kernel = (z[need[0]], z[need[1]])
+    guard = refuse_overlap({lab.split("|")[0] for lab in sm.labels}, args.fit_ids, what="film")
+    items, summary = boundary(sm, _read_table(args.boundaries), _read_table(args.cuts), _read_table(args.durations),
+                              level=args.level, window=args.window, kernel=kernel, tol=args.tol, exclude=args.exclude,
+                              n_perm=args.n_perm, n_boot=args.n_boot, seed=args.seed)
+    summary["leak_guard"] = guard
+    params = {k: v for k, v in vars(args).items() if k != "func"} | {"nan_rows_dropped": n_nan}
+    inputs = [*args.features, args.boundaries, args.cuts, args.durations, *([args.sfa_kernel] if args.sfa_kernel else [])]
+    side = write_run(args.output, "boundary", args.tag, items, summary, params=params, inputs=inputs)
+    print(f"psytwill bench boundary [{args.tag}, level {args.level}]: {summary['n_films']} films")
+    print(f"  {side}")
+    for st in ("change", "pe_sfa"):
+        if st not in summary:
+            continue
+        c = summary[st]
+        f, r, far = c["film_sd"], c["raw"], c["far_from_cut_film_sd"]
+        print(f"  {st}: {f['mean']:+.4f} film-SD [{f['lo']:+.4f}, {f['hi']:+.4f}], p {f['p_sign_flip']:.4g} "
+              f"({f['n_annotators_positive']}/{f['n_annotators']} annotators > 0); raw {r['mean']:+.5f} "
+              f"p {r['p_sign_flip']:.4g}; {c['n_boundaries']} boundaries, {c['n_dropped']} dropped; "
+              f"> {args.tol:g} s from a cut {far['mean']:+.4f} film-SD")
+
+
 def _run_ceiling(args) -> None:
     import pandas as pd
 
@@ -411,6 +467,11 @@ def _run_compare(args) -> None:
 
         joined, summary = compare_rdm(*items, n_boot=args.n_boot, seed=args.seed)
         stats = ["rho"]
+    elif task == "boundary":
+        from .boundary import compare_boundary
+
+        joined, summary = compare_boundary(*items, n_boot=args.n_boot, seed=args.seed)
+        stats = [k for k in ("change", "pe_sfa") if k in summary]
     elif task == "rating":
         from .rating import compare_rating
 
@@ -451,7 +512,7 @@ def _run_compare(args) -> None:
 
 def register(sub) -> None:
     b = sub.add_parser("bench", help="Score embeddings on benchmark tasks: retrieval | oddoneout | nextwindow | "
-                                     "congruence | rdm | rating; compare two runs")
+                                     "congruence | rdm | rating | boundary; compare two runs")
     bsub = b.add_subparsers(dest="bench_task", required=True)
 
     r = bsub.add_parser("retrieval", help="cross-modal identification between two keyed sets")
@@ -546,6 +607,25 @@ def register(sub) -> None:
     g.add_argument("--n-reliability-splits", type=int, default=100, help="random participant halves")
     _common(g)
     g.set_defaults(func=_run_rating)
+
+    bd = bsub.add_parser("boundary", help="film change / prediction error at annotated event boundaries vs "
+                                           "cut-matched controls")
+    bd.add_argument("--features", nargs="+", required=True)
+    bd.add_argument("--model", required=True, help="a grid model; comma-separated models are joined side by side "
+                                                   "(raw units) on their common bins")
+    bd.add_argument("--window", type=float, required=True, help="grid bin width in seconds")
+    bd.add_argument("--boundaries", required=True, help="table with stimulus_id, level, onset, annotator")
+    bd.add_argument("--level", required=True, help="the level scored; every level's onsets are kept from the controls")
+    bd.add_argument("--cuts", required=True, help="table with stimulus_id, time (the shot cuts matched on)")
+    bd.add_argument("--durations", required=True,
+                    help="table with stimulus_id, duration: each film's scored span, from 0")
+    bd.add_argument("--sfa-kernel", help="npz holding <prefix>W (d, k) and <prefix>lam (k,): adds pe_sfa")
+    bd.add_argument("--sfa-prefix", default="", help="array-name prefix in --sfa-kernel")
+    bd.add_argument("--tol", type=float, default=1.0, help="half-width of a boundary's window, seconds")
+    bd.add_argument("--exclude", type=float, default=2.0, help="controls lie further than this from any boundary")
+    bd.add_argument("--n-perm", type=int, default=10_000, help="sign-flip draws")
+    _common(bd)
+    bd.set_defaults(func=_run_boundary)
 
     rc = bsub.add_parser("reconstruct", help="rebuild a member from a space's block scores (arm R)")
     rc.add_argument("--scores", required=True, help="block scores on the block's fit rows (`space project` parquet)")

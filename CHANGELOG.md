@@ -3,6 +3,32 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.68.0 — 2026-11-15
+
+Minor bump: an event-boundary task.
+
+### Added
+- **`psytwill bench boundary`** (`bench/boundary.py`): does a film grid move more
+  at annotated event boundaries than at cut-matched non-boundary bins?
+  - Inputs: a grid model (comma-separated models are joined side by side in raw
+    units on their common bins), `--boundaries` (`stimulus_id, level, onset,
+    annotator`), `--cuts` (`stimulus_id, time`), and `--durations`
+    (`stimulus_id, duration`, each film's scored span).
+  - Statistics per bin: `change` (cosine distance between consecutive rows, with
+    rows centred on the mean over all films) and, given `--sfa-kernel` (`W`,
+    `lam`), `pe_sfa` (AR(1) prediction error of the slow features, `rho = 1 -
+    lam / 2`, per-film centring).
+  - A boundary's window is ±`--tol` s. Controls lie further than `--exclude` s
+    from every boundary at every level and are matched on distance to the
+    nearest cut (calipers .25 / .5 s, at least 3 controls, otherwise the
+    boundary is dropped). Deltas are in raw and film-SD units.
+  - Film effect: the mean over annotators of film means, with an
+    annotator-stratified sign-flip p (one-sided) and an annotator-stratified film
+    bootstrap CI, also for boundaries within and beyond `--tol` of a cut.
+- **`bench compare`** for boundary runs: paired `a - b` and `a / b` per
+  statistic, in film-SD units, on the boundaries both runs kept, with films
+  resampled within annotator on shared draws.
+
 ## 0.67.0 — 2026-11-15
 
 Minor bump: both retrieval sides can be pooled grids; subsets and retention in
