@@ -202,6 +202,7 @@ def _stage_args(root, per_item, max_groups=None, **kw):
 
 
 def _stage(monkeypatch, root, items, per_item):
+    pytest.importorskip("soundfile")  # stage.write_unit writes wavs; CI installs psytwill's deps only
     monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter(items))
     args = _stage_args(root, per_item)
     rows = stage.stage_packed("fma", args)
@@ -249,6 +250,7 @@ class TestPerItemStaging:
             _stage(monkeypatch, tmp_path, [("a", A_ITEM), ("b", B_ITEM)], per_item=second)
 
     def test_max_groups_stages_a_pilot_subset_and_says_so(self, tmp_path, monkeypatch):
+        pytest.importorskip("soundfile")
         monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter([("a", A_ITEM), ("b", B_ITEM), ("c", C_ITEM)]))
         args = _stage_args(tmp_path, per_item=True, max_groups=2)
         assert [r["unit"] for r in stage.stage_packed("fma", args)] == ["x-a", "x-b"]
