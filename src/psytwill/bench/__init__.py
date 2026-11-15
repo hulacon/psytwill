@@ -15,6 +15,9 @@ a CI is always recomputable from the output alone):
 - ``nextwindow``  — identify a film's next window among its other windows
 - ``congruence``  — per-pair cross-modal similarity scored against
   per-pair human outcomes (ratings, memory)
+- ``rdm``         — model item distances against human dissimilarity
+  judgements (RSA), with item-bootstrap CIs and noise-ceiling bounds
+- ``rating``      — mapped prediction of each item's mean human rating
 
 Every task has a ``zero-shot`` mode (raw cosine; only meaningful when both
 sides share one trained space, e.g. EBind image vs EBind text) and a

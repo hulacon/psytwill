@@ -13,6 +13,10 @@ bootstraps the difference ``a - b``:
 - ``congruence``: per outcome, the within-subject Spearman of each arm,
   differenced per subject and averaged over subjects; pairs resampled within
   subject with the same draw for both arms, subjects fixed.
+- ``rdm``: mean participant Spearman, a - b and a / b; items resampled with
+  the RDMs rebuilt per draw, the same draws for both arms (``rdm.compare_rdm``).
+- ``rating``: per dimension, out-of-fold r, a - b and a / b; items resampled
+  (``rating.compare_rating``).
 
 Verdict: ``win`` when the CI lies above 0, ``loss`` below, ``tie`` otherwise.
 """
@@ -36,6 +40,8 @@ MUST_MATCH = {
     "retrieval": ("n_splits", "seed", "within_stimulus", "target_segments", "target_window"),
     "oddoneout": ("triplets", "split", "only_ids"),
     "congruence": ("pairs", "n_splits", "seed"),
+    "rdm": ("pairs", "seed", "drop_ids"),
+    "rating": ("ratings", "outcomes", "n_splits", "seed", "drop_ids"),
 }
 
 

@@ -3,6 +3,32 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.66.0 — 2026-11-15
+
+Minor bump: two bench tasks for human judgements on items.
+
+### Added
+- **`psytwill bench rdm`** (`bench/rdm.py`): a model's item distances
+  (`1 - cosine` of item prototypes) against human dissimilarity judgements, from a
+  pairs table `participant, image_a, image_b, dissimilarity`. The score is the mean
+  over participants of Spearman(model, participant), with both noise-ceiling bounds
+  (lower: leave one participant out; upper: against the mean of all) and the score
+  as a share of each. The CI resamples **items**: each draw rebuilds every RDM from
+  the drawn items and drops pairs of an item with its own duplicate, because pairs
+  share items and a pair bootstrap is too narrow. Participants are fixed and
+  reported one by one. Draws depend only on the seed and the item set, so runs
+  share them. Refuses self-pairs, a pair judged twice by one participant (in
+  either order) and judged items with no embedding.
+- **`psytwill bench rating`** (`bench/rating.py`): a mapped ridge from a model's
+  coordinates to each item's mean rating (ratings table `participant,
+  stimulus_id, <dimension>...`), item folds, scored by Pearson r of the
+  out-of-fold predictions over items, with an item-bootstrap CI. Each dimension
+  carries a split-half reliability between participants (random halves,
+  Spearman-Brown, mean over splits) and `r_ceiling = sqrt(reliability)`.
+- **`bench compare`** for both: the paired `a - b` and the ratio `a / b` on the same
+  item draws. The ratio is retention against a reference with chance 0; it is
+  flagged `ratio_defined: false` when the reference's own interval reaches 0.
+
 ## 0.65.0 — 2026-11-15
 
 Minor bump: the fit-corpus driver leaves attached models out by default.
