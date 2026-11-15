@@ -28,7 +28,7 @@ Usage
     extract.py run --corpus librispeech --unit-index 3 --model psychoacoustic        # CPU job
     extract.py qc [--corpus C]             # transcript QC flags, <corpus>/qc/transcript_flags.parquet
     extract.py exclusions --base-rows R --base-reason WHY --out space/exclusions/<name>_exclude_rows.parquet
-    extract.py centre-rule --out space/exclusions/<name>_exclude_rows.parquet   # per-item corpora's padding rows
+    extract.py centre-rule --corpus C [--table T] --out space/exclusions/<name>_exclude_rows.parquet   # rows outside every item
 
 Short-file corpora (speech, music, words) are first packed into units by
 `stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
@@ -1244,16 +1244,23 @@ def cmd_exclusions(args: argparse.Namespace) -> int:
     return 0
 
 
-CENTRE_RULE = ("a row of a per-item corpus is kept only if its centre (bin start + hop / 2) falls inside "
-               "its item's [onset, offset); the rows past each item's end (grid padding) are excluded")
+CENTRE_RULE = ("a row of a staged short-file corpus is kept only if its centre (bin start + hop / 2) falls "
+               "inside an item's [onset, offset); rows past an item's end (grid padding of a per-item clip) "
+               "and rows in the silence between packed items are excluded")
 
 
-def _per_item_corpora() -> list[str]:
-    return sorted(c for c in CORPORA if _per_item_layout(c))
+def _frames_table(corpus: str) -> Path:
+    return ROOTS.durable / corpus / "groups" / f"{corpus}_audio_frames_features.parquet"
+
+
+def _table_layout(table: Path) -> str:
+    """``per-item`` or ``packed``: the staging record beside the table's corpus (absent = packed)."""
+    rec = table.parent.parent / "inputs" / "layout.json"
+    return json.loads(rec.read_text()).get("layout", "packed") if rec.exists() else "packed"
 
 
 def cmd_centre_rule(args: argparse.Namespace) -> int:
-    """One A exclusion list: the rows of per-item corpora whose centre lies outside their item."""
+    """One A exclusion list: the rows of staged corpora whose centre lies outside every item."""
     import numpy as np
     import pandas as pd
     import pyarrow.parquet as pq
@@ -1263,20 +1270,21 @@ def cmd_centre_rule(args: argparse.Namespace) -> int:
     from psytwill.relate import sha256_file
     from psytwill.windows import outside_items, table_segments
 
-    _per_item_layout.cache = {}  # type: ignore[attr-defined]
-    corpora = list(args.corpus or _per_item_corpora())
-    if not corpora:
-        sys.exit(f"ERROR: no corpus under {ROOTS.durable} is staged per item (inputs/layout.json); "
-                 "stage one with `stage.py <corpus> --per-item`, or name --corpus")
+    tables = [(c, _frames_table(c)) for c in (args.corpus or [])]
+    tables += [(Path(t).resolve().parent.parent.name, Path(t).resolve()) for t in (getattr(args, "table", None) or [])]
+    if not tables:
+        sys.exit("ERROR: name the corpora: --corpus C (under --durable-root) and/or --table PATH "
+                 "(a `<corpus>_audio_frames_features.parquet`, e.g. one in another root)")
+    names = [c for c, _ in tables]
+    if len(set(names)) != len(names):
+        sys.exit(f"ERROR: a corpus is named twice ({sorted({c for c in names if names.count(c) > 1})}); "
+                 "its rows would be listed twice")
     key, hop = ["stimulus_id", "time"], GRID_HOP
     parts, record = [], {}
-    for corpus in corpora:
-        if not _per_item_layout(corpus):
-            sys.exit(f"ERROR: {corpus} is not staged per item under {ROOTS.durable} (no per-item "
-                     "inputs/layout.json); the centre rule is for per-item corpora only")
-        table = ROOTS.durable / corpus / "groups" / f"{corpus}_audio_frames_features.parquet"
+    for corpus, table in tables:
         if not table.exists():
             sys.exit(f"ERROR: {table} does not exist; run `extract.py aggregate --corpus {corpus}` first")
+        layout = _table_layout(table)
         try:
             segs = table_segments(table)
         except InputError as exc:
@@ -1285,13 +1293,17 @@ def cmd_centre_rule(args: argparse.Namespace) -> int:
             sys.exit(f"ERROR: {table} records no segments; re-run `extract.py aggregate --corpus {corpus} "
                      "--redo`, or `psytwill features --refresh-segments <inputs dir>`")
         many = {sid: s["group"].nunique() for sid, s in segs.items() if s["group"].nunique() > 1}
-        if many:
+        if layout == "per-item" and many:
             sid, n = next(iter(many.items()))
             sys.exit(f"ERROR: {corpus}: {len(many)} unit(s) hold more than one item (e.g. {sid}: {n} groups); "
                      "a per-item unit holds one")
-        df = pq.read_table(table, columns=key).to_pandas().drop_duplicates()
-        df["time"] = np.floor(df["time"].to_numpy(float) / hop + 1e-9) * hop  # as `space fit --window`
-        df = df.drop_duplicates().sort_values(key, kind="stable").reset_index(drop=True)
+        seen = []  # the table is long (a row per feature): de-duplicate the key batch by batch
+        for batch in pq.ParquetFile(table).iter_batches(columns=key, batch_size=1 << 22):
+            d = batch.to_pandas()
+            d["time"] = np.floor(d["time"].to_numpy(float) / hop + 1e-9) * hop  # as `space fit --window`
+            seen.append(d.drop_duplicates())
+        df = (pd.concat(seen, ignore_index=True).drop_duplicates()
+              .sort_values(key, kind="stable").reset_index(drop=True))
         missing = sorted(set(df["stimulus_id"]) - set(segs))
         if missing:
             sys.exit(f"ERROR: {corpus}: {len(missing)} unit(s) in {table.name} have no segments table "
@@ -1299,10 +1311,11 @@ def cmd_centre_rule(args: argparse.Namespace) -> int:
         labels = [f"{s}|{t}" for s, t in zip(df["stimulus_id"], df["time"])]
         hit = outside_items(labels, segs, hop)
         parts.append(df.loc[hit, key].assign(reason="centre_outside_item"))
-        record[corpus] = {"table": str(table), "table_sha256": sha256_file(table),
+        record[corpus] = {"table": str(table), "table_sha256": sha256_file(table), "layout": layout,
                           "n_units": int(df["stimulus_id"].nunique()), "n_rows": len(df),
                           "n_excluded": int(hit.sum())}
-        print(f"{corpus}: {record[corpus]['n_units']} unit(s), {len(df)} row(s), {int(hit.sum())} outside their item")
+        print(f"{corpus} ({layout}): {record[corpus]['n_units']} unit(s), {len(df)} row(s), "
+              f"{int(hit.sum())} outside every item")
     rows = pd.concat(parts, ignore_index=True)
     print(f"total: {len(rows)} row(s) excluded")
     out = Path(args.out)
@@ -1321,8 +1334,8 @@ def cmd_centre_rule(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     rows.to_parquet(out, index=False)
     out.with_name(out.stem + ".meta.json").write_text(json.dumps({
-        "what": "A fit exclusion rows (--exclude-rows, with --window 0.5); key stimulus_id,time on the binned "
-                "grid; reason centre_outside_item",
+        "what": "A fit exclusion rows (--exclude-rows / space project, with --window 0.5); key stimulus_id,time "
+                "on the binned grid; reason centre_outside_item",
         "rule": CENTRE_RULE, "hop": hop, "key": key, "psytwill_version": psytwill.__version__,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "corpora": record, "n_rows": len(rows), "sha256": sha256_file(out),
@@ -1380,9 +1393,12 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_exclusions)
     p = sub.add_parser("centre-rule",
-                       help="one A exclusion list: per-item corpora's rows whose centre lies outside their item")
+                       help="one A exclusion list: staged corpora's rows whose centre lies outside every item")
     p.add_argument("--corpus", action="append", choices=sorted(CORPORA),
-                   help="a per-item corpus (repeatable; default every per-item corpus in the root)")
+                   help="a staged corpus under --durable-root, per-item or packed (repeatable)")
+    p.add_argument("--table", action="append", metavar="PATH",
+                   help="a `<corpus>_audio_frames_features.parquet` named by path, e.g. in another root "
+                        "(repeatable; the corpus is its directory's name)")
     p.add_argument("--out", required=True, help="the list to write (immutable once written)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_centre_rule)

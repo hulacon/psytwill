@@ -11,16 +11,17 @@ Space schema 1.20. Nothing already fitted or extracted changes.
 ### Added
 - **`psytwill.windows.outside_items`** (the centre rule): a row is outside when
   its centre (bin start + hop / 2) lies in no segment's `[onset, offset)` of its
-  unit. A per-item clip is rounded up to the grid, so a 0.53 s word fills a
-  1.0 s clip and its second row is padding; the rule drops it. Units with no
-  segments table keep every row.
-- **`extract.py centre-rule --out <list>`**: one row exclusion list
-  (`stimulus_id,time` on the binned grid, `reason = centre_outside_item`) over
-  every per-item corpus's frames table, for `space fit --exclude-rows`. It
-  refuses a packed corpus, a unit holding more than one item, a table without
-  recorded segments, and overwriting a written list with different rows. The
-  sidecar pins each frames table by sha256 with its unit, row and excluded
-  counts.
+  unit. It drops the rows that belong to no item: a per-item clip's grid padding
+  (a 0.53 s word fills a 1.0 s clip) and the silence between packed items.
+  Units with no segments table keep every row.
+- **`extract.py centre-rule --corpus C | --table PATH --out <list>`**: one row
+  exclusion list (`stimulus_id,time` on the binned grid, `reason =
+  centre_outside_item`) over the named corpora's frames tables, per-item or
+  packed, for `space fit` / `space project --exclude-rows`. `--table` reads a
+  table in another root. It refuses no named corpus, a corpus named twice, a
+  per-item unit holding more than one item, a table without recorded segments,
+  and overwriting a written list with different rows. The sidecar pins each
+  frames table by sha256 with its layout and its unit, row and excluded counts.
 - **`space fit --declare TEXT`** (repeatable): statements about the block's
   inputs or domain, recorded verbatim as `declarations` in the manifest (space
   schema 1.20). They are not copied by `--like`.

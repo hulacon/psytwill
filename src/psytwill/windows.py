@@ -21,11 +21,11 @@ grid when w/2 is a multiple of the grid step (rounded to the nearest step
 otherwise, and recorded). The first w/2 of every clip then has no value;
 the member is absent there.
 
-**The centre rule** (:func:`outside_items`). A corpus staged one item per
-unit has no item boundary inside a unit, but its clips are rounded up to the
-grid, so a short item's last row can be mostly padding. The rule keeps a row
-only if its centre falls inside an item, and the rows it drops go to a row
-exclusion list (`scripts/fitcorpus/extract.py centre-rule`).
+**The centre rule** (:func:`outside_items`). A row is kept only if its centre
+falls inside an item. It drops the rows of a staged corpus that belong to no
+item: the grid padding after a short per-item clip (a 0.53 s word fills a
+1.0 s clip) and the silence a packed unit holds between items. The rows it
+drops go to a row exclusion list (`scripts/fitcorpus/extract.py centre-rule`).
 
 The segments tables are generated data on GPFS, not repo content. A features
 table records where they came from (`segments` in its sidecar, with each
@@ -201,12 +201,12 @@ def outside_items(labels: Iterable[str], segments: Mapping[str, pd.DataFrame], h
     some segment of its unit. A unit with no segments table is one item and
     keeps every row.
 
-    Built for corpora staged one item per unit (:func:`psytwill.staging.item_units`),
-    whose clips are rounded up to the grid: a 0.53 s word fills a 1.0 s clip, and
-    its second row is padding. Two files of one item keep the staged silence
-    between them, and rows centred in that silence are outside too. Applied as a
-    row exclusion list (``space fit --exclude-rows``), never as a mask: an outside
-    row is dropped for every member.
+    It drops what belongs to no item: the grid padding after a per-item clip
+    (:func:`psytwill.staging.item_units`; a 0.53 s word fills a 1.0 s clip, and its
+    second row is padding) and the silence a packed unit holds between items,
+    including between two files of one item. Applied as a row exclusion list
+    (``space fit --exclude-rows``), never as a mask: an outside row is dropped for
+    every member.
     """
     sid, t = _row_times(list(labels))
     c = t + hop / 2

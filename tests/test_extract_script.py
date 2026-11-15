@@ -485,8 +485,8 @@ def _per_item_table(tmp_path, monkeypatch, items, corpus="twp-unpresented", layo
     return durable, table
 
 
-def _centre_args(out, corpus=None, dry_run=False):
-    return argparse.Namespace(corpus=corpus, out=str(out), dry_run=dry_run)
+def _centre_args(out, corpus=("twp-unpresented",), table=None, dry_run=False):
+    return argparse.Namespace(corpus=list(corpus) if corpus else None, table=table, out=str(out), dry_run=dry_run)
 
 
 def test_centre_rule_lists_the_rows_outside_each_item_on_the_binned_key(tmp_path, monkeypatch):
@@ -504,18 +504,28 @@ def test_centre_rule_lists_the_rows_outside_each_item_on_the_binned_key(tmp_path
     assert (rows["reason"] == "centre_outside_item").all()
     meta = json.loads(out.with_name(out.stem + ".meta.json").read_text())
     c = meta["corpora"]["twp-unpresented"]
-    assert (c["n_units"], c["n_rows"], c["n_excluded"]) == (2, 4, 1)
+    assert (c["n_units"], c["n_rows"], c["n_excluded"], c["layout"]) == (2, 4, 1, "per-item")
     assert c["table"] == str(table) and meta["hop"] == 0.5 and meta["key"] == ["stimulus_id", "time"]
     assert extract.cmd_centre_rule(_centre_args(out)) == 0  # same rows again: a no-op
 
 
-def test_centre_rule_refuses_a_packed_corpus(tmp_path, monkeypatch):
+def test_centre_rule_drops_the_silence_between_packed_items(tmp_path, monkeypatch):
+    import pandas as pd
+
+    _, table = _per_item_table(tmp_path, monkeypatch, {
+        "u": ([(0.0, 1.2, "a"), (2.0, 3.0, "b")], [0.25, 0.75, 1.25, 1.75, 2.25, 2.75])},
+        corpus="librispeech", layout=None)
+    out = tmp_path / "o.parquet"
+    assert extract.cmd_centre_rule(_centre_args(out, corpus=None, table=[str(table)])) == 0
+    assert pd.read_parquet(out)["time"].tolist() == [1.0, 1.5]  # centres 1.25, 1.75: the staged gap
+
+
+def test_centre_rule_needs_named_corpora(tmp_path, monkeypatch):
     import pytest
 
-    _per_item_table(tmp_path, monkeypatch, {"u": ([(0.0, 0.5, "a"), (1.0, 1.5, "b")], [0.25, 1.25])},
-                    layout=None)
-    with pytest.raises(SystemExit, match="not staged per item"):
-        extract.cmd_centre_rule(_centre_args(tmp_path / "o.parquet", corpus=["twp-unpresented"]))
+    _per_item_table(tmp_path, monkeypatch, {"u": ([(0.0, 0.5, "a")], [0.25])})
+    with pytest.raises(SystemExit, match="name the corpora"):
+        extract.cmd_centre_rule(_centre_args(tmp_path / "o.parquet", corpus=None))
 
 
 def test_centre_rule_refuses_a_unit_holding_two_items(tmp_path, monkeypatch):
