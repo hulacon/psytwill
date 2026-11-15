@@ -21,6 +21,12 @@ grid when w/2 is a multiple of the grid step (rounded to the nearest step
 otherwise, and recorded). The first w/2 of every clip then has no value;
 the member is absent there.
 
+**The centre rule** (:func:`outside_items`). A corpus staged one item per
+unit has no item boundary inside a unit, but its clips are rounded up to the
+grid, so a short item's last row can be mostly padding. The rule keeps a row
+only if its centre falls inside an item, and the rows it drops go to a row
+exclusion list (`scripts/fitcorpus/extract.py centre-rule`).
+
 The segments tables are generated data on GPFS, not repo content. A features
 table records where they came from (`segments` in its sidecar, with each
 file's sha256), and a read that finds one missing or changed refuses.
@@ -184,6 +190,36 @@ def item_masks(space: SpaceMatrix, windows: Mapping[str, tuple[float, str]],
                 hit[i] = len(set(grp[first[i]:last[i] + 1])) > 1
             out[col][rows] = hit
     return {col: m for col, m in out.items() if m.any()}
+
+
+def outside_items(labels: Iterable[str], segments: Mapping[str, pd.DataFrame], hop: float) -> np.ndarray:
+    """Bool per row: the row's centre lies in no segment of its unit (the **centre rule**).
+
+    Rows are ``stimulus_id|time`` with ``time`` the start of a ``hop`` bin, and
+    the row's centre is ``time + hop / 2``, the same placement as
+    :func:`item_masks`. A row is inside when ``onset <= centre < offset`` for
+    some segment of its unit. A unit with no segments table is one item and
+    keeps every row.
+
+    Built for corpora staged one item per unit (:func:`psytwill.staging.item_units`),
+    whose clips are rounded up to the grid: a 0.53 s word fills a 1.0 s clip, and
+    its second row is padding. Two files of one item keep the staged silence
+    between them, and rows centred in that silence are outside too. Applied as a
+    row exclusion list (``space fit --exclude-rows``), never as a mask: an outside
+    row is dropped for every member.
+    """
+    sid, t = _row_times(list(labels))
+    c = t + hop / 2
+    out = np.zeros(len(t), dtype=bool)
+    for unit in np.unique(sid):
+        seg = segments.get(unit)
+        if seg is None:
+            continue
+        rows = np.flatnonzero(sid == unit)
+        on, off = seg["onset"].to_numpy(float), seg["offset"].to_numpy(float)
+        inside = ((c[rows, None] >= on[None, :]) & (c[rows, None] < off[None, :])).any(axis=1)
+        out[rows] = ~inside
+    return out
 
 
 # --------------------------------------------------------------------------

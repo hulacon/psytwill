@@ -449,3 +449,100 @@ def test_packed_corpora_keep_one_call_per_cell(tmp_path, monkeypatch):
     monkeypatch.setattr(extract.subprocess, "run", lambda cmd, **k: calls.append(cmd) or types.SimpleNamespace(returncode=1))
     extract.cmd_run(_run_args(model="loudness"))
     assert len(calls) == 3 and all("--inputs-from" not in c for c in calls)
+
+
+# ---- the centre rule: an exclusion list for per-item corpora --------------------------------
+
+def _per_item_table(tmp_path, monkeypatch, items, corpus="twp-unpresented", layout="per-item"):
+    """``items`` = {unit: (segments rows [(onset, offset, group)], frame centres)}."""
+    import json
+
+    import pandas as pd
+
+    from psytwill.windows import record_table_segments
+
+    durable = tmp_path / "durable"
+    inputs = durable / corpus / "inputs"
+    inputs.mkdir(parents=True)
+    if layout:
+        (inputs / "layout.json").write_text(json.dumps({"layout": layout}))
+    rows = []
+    for unit, (segs, centres) in items.items():
+        sid = f"ext-{corpus}-{unit}"
+        pd.DataFrame([(sid, on, off, g) for on, off, g in segs],
+                     columns=["stimulus_id", "onset", "offset", "group"]).to_csv(inputs / f"{unit}_segments.csv",
+                                                                                 index=False)
+        for t in centres:
+            for model in ("clap", "loudness"):
+                rows.append((sid, t, model, f"{model}_000", 1.0))
+    df = pd.DataFrame(rows, columns=["stimulus_id", "time", "model", "feature", "value"])
+    table = durable / corpus / "groups" / f"{corpus}_audio_frames_features.parquet"
+    table.parent.mkdir(parents=True)
+    df.to_parquet(table, index=False)
+    table.with_suffix(".meta.json").write_text("{}")
+    record_table_segments(table, inputs)
+    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=durable), raising=False)
+    return durable, table
+
+
+def _centre_args(out, corpus=None, dry_run=False):
+    return argparse.Namespace(corpus=corpus, out=str(out), dry_run=dry_run)
+
+
+def test_centre_rule_lists_the_rows_outside_each_item_on_the_binned_key(tmp_path, monkeypatch):
+    import json
+
+    import pandas as pd
+
+    durable, table = _per_item_table(tmp_path, monkeypatch, {
+        "echo-abide": ([(0.0, 0.53, "abide")], [0.25, 0.75]),
+        "echo-able": ([(0.0, 0.80, "able")], [0.25, 0.75])})
+    out = durable / "space" / "exclusions" / "A_test_exclude_rows.parquet"
+    assert extract.cmd_centre_rule(_centre_args(out)) == 0
+    rows = pd.read_parquet(out)
+    assert rows[["stimulus_id", "time"]].values.tolist() == [["ext-twp-unpresented-echo-abide", 0.5]]
+    assert (rows["reason"] == "centre_outside_item").all()
+    meta = json.loads(out.with_name(out.stem + ".meta.json").read_text())
+    c = meta["corpora"]["twp-unpresented"]
+    assert (c["n_units"], c["n_rows"], c["n_excluded"]) == (2, 4, 1)
+    assert c["table"] == str(table) and meta["hop"] == 0.5 and meta["key"] == ["stimulus_id", "time"]
+    assert extract.cmd_centre_rule(_centre_args(out)) == 0  # same rows again: a no-op
+
+
+def test_centre_rule_refuses_a_packed_corpus(tmp_path, monkeypatch):
+    import pytest
+
+    _per_item_table(tmp_path, monkeypatch, {"u": ([(0.0, 0.5, "a"), (1.0, 1.5, "b")], [0.25, 1.25])},
+                    layout=None)
+    with pytest.raises(SystemExit, match="not staged per item"):
+        extract.cmd_centre_rule(_centre_args(tmp_path / "o.parquet", corpus=["twp-unpresented"]))
+
+
+def test_centre_rule_refuses_a_unit_holding_two_items(tmp_path, monkeypatch):
+    import pytest
+
+    _per_item_table(tmp_path, monkeypatch, {"u": ([(0.0, 0.5, "a"), (1.0, 1.5, "b")], [0.25, 1.25])})
+    with pytest.raises(SystemExit, match="2 groups"):
+        extract.cmd_centre_rule(_centre_args(tmp_path / "o.parquet"))
+
+
+def test_centre_rule_refuses_a_table_without_recorded_segments(tmp_path, monkeypatch):
+    import pytest
+
+    _, table = _per_item_table(tmp_path, monkeypatch, {"u": ([(0.0, 0.5, "a")], [0.25])})
+    table.with_suffix(".meta.json").write_text("{}")
+    with pytest.raises(SystemExit, match="records no segments"):
+        extract.cmd_centre_rule(_centre_args(tmp_path / "o.parquet"))
+
+
+def test_centre_rule_refuses_to_overwrite_a_written_list(tmp_path, monkeypatch):
+    import pytest
+
+    _per_item_table(tmp_path, monkeypatch, {"u": ([(0.0, 0.53, "a")], [0.25, 0.75])})
+    out = tmp_path / "o.parquet"
+    extract.cmd_centre_rule(_centre_args(out))
+    import pandas as pd
+
+    pd.DataFrame({"stimulus_id": ["x"], "time": [0.0], "reason": ["r"]}).to_parquet(out)
+    with pytest.raises(SystemExit, match="immutable"):
+        extract.cmd_centre_rule(_centre_args(out))

@@ -166,3 +166,44 @@ def test_causal_refuses_a_fit_without_window_labels(tmp_path, capsys):
     assert main(["space", "project", "--features", str(table), "--key", "stimulus_id,time", "--window", "0.5",
                  "--space", str(out / "T.json"), "--causal", "-o", str(tmp_path / "s.parquet")]) == 1
     assert "--causal needs the fit's per-column window labels" in capsys.readouterr().err
+
+
+# ---- the centre rule (per-item corpora) ---------------------------------------------------
+
+def test_centre_rule_keeps_a_row_only_if_its_centre_is_inside_the_item():
+    from psytwill.windows import outside_items
+
+    # bins start at 0, 0.5, ...; a row's centre is its bin start + hop / 2
+    labels = ([f"word|{t}" for t in (0.0, 0.5)]            # a 0.53 s word in a 1.0 s clip
+              + [f"long|{t}" for t in (0.0, 0.5)]          # a 0.80 s word: both centres inside
+              + [f"edge|{t}" for t in (0.0, 0.5)]          # offset exactly on a centre: [onset, offset)
+              + [f"late|{t}" for t in (0.0, 0.5, 1.0)]     # an item starting after the unit does
+              + [f"track|{t}" for t in (29.5, 30.0)]       # a 30.02 s track's tail bin
+              + [f"film|{t}" for t in (0.0, 0.5)])         # no segments: one item per clip
+    one = lambda on, off: pd.DataFrame({"onset": [on], "offset": [off], "group": ["g"]})  # noqa: E731
+    segs = {"word": one(0.0, 0.53), "long": one(0.0, 0.80), "edge": one(0.0, 0.75),
+            "late": one(0.5, 1.5), "track": one(0.0, 30.02)}
+    out = outside_items(labels, segs, HOP)
+    assert [lab for lab, o in zip(labels, out) if o] == ["word|0.5", "edge|0.5", "late|0.0", "track|30.0"]
+    assert not outside_items(labels, {}, HOP).any()
+
+
+def test_centre_rule_treats_a_gap_between_two_files_of_one_item_as_outside():
+    from psytwill.windows import outside_items
+
+    seg = pd.DataFrame({"onset": [0.0, 2.0], "offset": [1.2, 3.0], "group": ["g", "g"]})
+    labels = [f"u|{t}" for t in np.arange(0.0, 3.0, HOP)]
+    out = outside_items(labels, {"u": seg}, HOP)
+    # centres 1.25 and 1.75 sit in the staged silence between the files [1.2, 2.0)
+    assert [lab for lab, o in zip(labels, out) if o] == ["u|1.0", "u|1.5"]
+
+
+def test_fit_records_declarations(tmp_path):
+    table, _ = _packed_table(tmp_path)
+    out = tmp_path / "space"
+    assert main(["space", "fit", "--features", str(table), *FIT, "-o", str(out), "--stem", "T",
+                 "--declare", "first", "--declare", "second"]) == 0
+    assert json.loads((out / "T.json").read_text())["declarations"] == ["first", "second"]
+    assert main(["space", "fit", "--like", str(out / "T.json"), "--no-criterion", "-o", str(out),
+                 "--stem", "T2"]) == 0
+    assert json.loads((out / "T2.json").read_text())["declarations"] == []  # --like does not carry them

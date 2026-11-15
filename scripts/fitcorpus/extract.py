@@ -28,6 +28,7 @@ Usage
     extract.py run --corpus librispeech --unit-index 3 --model psychoacoustic        # CPU job
     extract.py qc [--corpus C]             # transcript QC flags, <corpus>/qc/transcript_flags.parquet
     extract.py exclusions --base-rows R --base-reason WHY --out space/exclusions/<name>_exclude_rows.parquet
+    extract.py centre-rule --out space/exclusions/<name>_exclude_rows.parquet   # per-item corpora's padding rows
 
 Short-file corpora (speech, music, words) are first packed into units by
 `stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
@@ -1243,6 +1244,93 @@ def cmd_exclusions(args: argparse.Namespace) -> int:
     return 0
 
 
+CENTRE_RULE = ("a row of a per-item corpus is kept only if its centre (bin start + hop / 2) falls inside "
+               "its item's [onset, offset); the rows past each item's end (grid padding) are excluded")
+
+
+def _per_item_corpora() -> list[str]:
+    return sorted(c for c in CORPORA if _per_item_layout(c))
+
+
+def cmd_centre_rule(args: argparse.Namespace) -> int:
+    """One A exclusion list: the rows of per-item corpora whose centre lies outside their item."""
+    import numpy as np
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    import psytwill
+    from psytwill.exceptions import InputError
+    from psytwill.relate import sha256_file
+    from psytwill.windows import outside_items, table_segments
+
+    _per_item_layout.cache = {}  # type: ignore[attr-defined]
+    corpora = list(args.corpus or _per_item_corpora())
+    if not corpora:
+        sys.exit(f"ERROR: no corpus under {ROOTS.durable} is staged per item (inputs/layout.json); "
+                 "stage one with `stage.py <corpus> --per-item`, or name --corpus")
+    key, hop = ["stimulus_id", "time"], GRID_HOP
+    parts, record = [], {}
+    for corpus in corpora:
+        if not _per_item_layout(corpus):
+            sys.exit(f"ERROR: {corpus} is not staged per item under {ROOTS.durable} (no per-item "
+                     "inputs/layout.json); the centre rule is for per-item corpora only")
+        table = ROOTS.durable / corpus / "groups" / f"{corpus}_audio_frames_features.parquet"
+        if not table.exists():
+            sys.exit(f"ERROR: {table} does not exist; run `extract.py aggregate --corpus {corpus}` first")
+        try:
+            segs = table_segments(table)
+        except InputError as exc:
+            sys.exit(f"ERROR: {exc}")
+        if not segs:
+            sys.exit(f"ERROR: {table} records no segments; re-run `extract.py aggregate --corpus {corpus} "
+                     "--redo`, or `psytwill features --refresh-segments <inputs dir>`")
+        many = {sid: s["group"].nunique() for sid, s in segs.items() if s["group"].nunique() > 1}
+        if many:
+            sid, n = next(iter(many.items()))
+            sys.exit(f"ERROR: {corpus}: {len(many)} unit(s) hold more than one item (e.g. {sid}: {n} groups); "
+                     "a per-item unit holds one")
+        df = pq.read_table(table, columns=key).to_pandas().drop_duplicates()
+        df["time"] = np.floor(df["time"].to_numpy(float) / hop + 1e-9) * hop  # as `space fit --window`
+        df = df.drop_duplicates().sort_values(key, kind="stable").reset_index(drop=True)
+        missing = sorted(set(df["stimulus_id"]) - set(segs))
+        if missing:
+            sys.exit(f"ERROR: {corpus}: {len(missing)} unit(s) in {table.name} have no segments table "
+                     f"(e.g. {missing[0]}); re-run `extract.py aggregate --corpus {corpus} --redo`")
+        labels = [f"{s}|{t}" for s, t in zip(df["stimulus_id"], df["time"])]
+        hit = outside_items(labels, segs, hop)
+        parts.append(df.loc[hit, key].assign(reason="centre_outside_item"))
+        record[corpus] = {"table": str(table), "table_sha256": sha256_file(table),
+                          "n_units": int(df["stimulus_id"].nunique()), "n_rows": len(df),
+                          "n_excluded": int(hit.sum())}
+        print(f"{corpus}: {record[corpus]['n_units']} unit(s), {len(df)} row(s), {int(hit.sum())} outside their item")
+    rows = pd.concat(parts, ignore_index=True)
+    print(f"total: {len(rows)} row(s) excluded")
+    out = Path(args.out)
+    if args.dry_run:
+        return 0
+    if out.exists():
+        tmp = out.with_name(out.name + ".new")
+        rows.to_parquet(tmp, index=False)
+        same = pd.read_parquet(out).equals(pd.read_parquet(tmp))
+        tmp.unlink()
+        if same:
+            print(f"unchanged: {out}")
+            return 0
+        sys.exit(f"ERROR: {out} exists with different rows; an exclusion list a fit pins is immutable, "
+                 "so name a new one")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rows.to_parquet(out, index=False)
+    out.with_name(out.stem + ".meta.json").write_text(json.dumps({
+        "what": "A fit exclusion rows (--exclude-rows, with --window 0.5); key stimulus_id,time on the binned "
+                "grid; reason centre_outside_item",
+        "rule": CENTRE_RULE, "hop": hop, "key": key, "psytwill_version": psytwill.__version__,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "corpora": record, "n_rows": len(rows), "sha256": sha256_file(out),
+    }, indent=1) + "\n")
+    print(f"-> {out}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--durable-root")
@@ -1291,6 +1379,13 @@ def main() -> int:
     p.add_argument("--out", required=True, help="the list to write (immutable once written)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_exclusions)
+    p = sub.add_parser("centre-rule",
+                       help="one A exclusion list: per-item corpora's rows whose centre lies outside their item")
+    p.add_argument("--corpus", action="append", choices=sorted(CORPORA),
+                   help="a per-item corpus (repeatable; default every per-item corpus in the root)")
+    p.add_argument("--out", required=True, help="the list to write (immutable once written)")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_centre_rule)
 
     args = ap.parse_args()
     global ROOTS
