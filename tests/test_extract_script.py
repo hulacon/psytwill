@@ -556,3 +556,43 @@ def test_centre_rule_refuses_to_overwrite_a_written_list(tmp_path, monkeypatch):
     pd.DataFrame({"stimulus_id": ["x"], "time": [0.0], "reason": ["r"]}).to_parquet(out)
     with pytest.raises(SystemExit, match="immutable"):
         extract.cmd_centre_rule(_centre_args(out))
+
+
+# ---- attached models: never extracted on the fit corpora unless asked ----------------------
+
+def _attached_args(**kw):
+    base = dict(corpus=None, source=None, model=None, skip_model=None, unit=None, unit_index=None,
+                unit_slice=None, with_attached=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _one_source(monkeypatch, models):
+    unit = extract.Unit(id="u0", out_dir=Path("/nonexistent/u0"))
+    src = extract.Source("c", "image", "viz2psy", "", models, "synthetic", lambda: [unit])
+    monkeypatch.setattr(extract, "build_sources", lambda: [src])
+    return src
+
+
+def test_attached_models_are_skipped_by_default(monkeypatch):
+    from psytwill.battery import BATTERY
+
+    attached = sorted(m for m, b in BATTERY.items() if b.attached)
+    assert attached  # the battery has some
+    _one_source(monkeypatch, ["clip", *attached])
+    assert [m for _, _, m in extract._filtered(_attached_args())] == ["clip"]
+    assert [m for _, _, m in extract._filtered(_attached_args(with_attached=True))] == ["clip", *attached]
+    # naming an attached model is asking for it
+    assert [m for _, _, m in extract._filtered(_attached_args(model=attached[0]))] == [attached[0]]
+
+
+def test_plan_counts_no_attached_cells_by_default(monkeypatch, capsys, tmp_path):
+    from psytwill.battery import BATTERY
+
+    attached = sorted(m for m, b in BATTERY.items() if b.attached)
+    _one_source(monkeypatch, ["clip", *attached])
+    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=tmp_path), raising=False)
+    monkeypatch.setattr(extract, "is_done", lambda *a: False)
+    assert extract.cmd_plan(_attached_args()) == 0
+    row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("c/image"))
+    assert row.split()[3:5] == ["1", "1"]  # 1 model, 1 cell
