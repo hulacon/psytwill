@@ -3,6 +3,28 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.67.0 — 2026-11-15
+
+Minor bump: both retrieval sides can be pooled grids; subsets and retention in
+the retrieval comparison. Existing outputs and their numbers are unchanged
+(`compare` draws the same resamples as before for `a - b`).
+
+### Added
+- **`bench retrieval --query-segments / --query-window`**: the query side can be a
+  time grid mean-pooled into segments, as `--target-segments` already did for the
+  target. A film's sound and its picture over the same segments is then one
+  within-stimulus retrieval.
+- **`--subset NAME=FILE`** (repeatable) on `bench retrieval` and on `bench compare`
+  for retrieval runs: the statistics again over the items whose stimulus or item
+  label is listed. Maps and candidate sets stay those of the full run; only the
+  averaging and the resampling are restricted to the subset's own units.
+- **Retention in `bench compare` (retrieval):** `(a - 0.5) / (b - 0.5)` on
+  `pct_beaten`, computed within each paired draw, with `retention_defined: false`
+  when b's interval reaches chance. Both arms' own intervals from the same draws are
+  reported too.
+- `bench.core.paired_bootstrap`, `parse_subsets` and `in_subset`, and
+  `bench.retrieval.summarize` (the summary of any items table or subset of one).
+
 ## 0.66.0 — 2026-11-15
 
 Minor bump: two bench tasks for human judgements on items.

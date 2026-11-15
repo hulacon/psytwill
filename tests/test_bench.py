@@ -740,3 +740,105 @@ def test_cli_rdm_rating_and_compare(tmp_path):
                  "--tag", "g-n", "--n-boot", "50"]) == 0
     s = json.loads((out / "compare_rating__g-n.json").read_text())["summary"]
     assert set(s) >= {"valence", "arousal"}
+
+
+# ------------------------------------------- paired bootstrap, subsets, two pooled grids
+
+
+def test_paired_bootstrap_matches_diff_bootstrap_and_flags_retention_at_chance():
+    from psytwill.bench.core import paired_bootstrap
+
+    rng = np.random.default_rng(30)
+    a, b = 0.7 + 0.1 * rng.normal(size=60), 0.6 + 0.1 * rng.normal(size=60)
+    g = np.repeat(np.arange(12), 5)
+    pb = paired_bootstrap(a, b, g, chance=0.5, n_boot=300, seed=3)
+    ref = bootstrap_mean(a - b, g, n_boot=300, seed=3)
+    assert pb["diff"]["lo"] == pytest.approx(ref["lo"]) and pb["diff"]["hi"] == pytest.approx(ref["hi"])
+    assert pb["retention"]["mean"] == pytest.approx((a.mean() - .5) / (b.mean() - .5))
+    assert pb["retention_defined"]
+    same = paired_bootstrap(a, a, g, chance=0.5, n_boot=100)
+    assert same["retention"]["lo"] == pytest.approx(1.0) and same["retention"]["hi"] == pytest.approx(1.0)
+    flat = paired_bootstrap(a, 0.5 + 0.05 * rng.normal(size=60), g, chance=0.5, n_boot=200)
+    assert not flat["retention_defined"]
+
+
+def test_in_subset_matches_stimulus_or_item_label():
+    from psytwill.bench.core import in_subset
+
+    keep = in_subset(["f1|0", "f1|1", "f2|0", "f3|4"], {"f1", "f3|4"})
+    assert keep.tolist() == [True, True, False, True]
+
+
+def _grid(sm_name, films, seg_len, n_seg, latent, proj, rng, noise=0.3):
+    rows = []
+    for f in films:
+        for k in range(n_seg):
+            for b in range(int(seg_len / 0.5)):
+                t = k * seg_len + b * 0.5
+                x = latent[f][k] @ proj + noise * rng.normal(size=proj.shape[1])
+                rows.append((f, t, x))
+    labels = [f"{f}|{t}" for f, t, _ in rows]
+    return SpaceMatrix(name=sm_name, labels=labels, X=np.vstack([x for *_, x in rows]),
+                       features=[f"{sm_name}_{j:03d}" for j in range(proj.shape[1])])
+
+
+def _long_grid(sm, extractor):
+    rows = []
+    for lab, x in zip(sm.labels, sm.X):
+        sid, t = lab.split("|")
+        for j, v in enumerate(x):
+            rows.append((sid, float(t), sm.name, f"{sm.name}_{j:03d}", float(v)))
+    df = pd.DataFrame(rows, columns=["stimulus_id", "time", "model", "feature", "value"])
+    df["value_str"] = pd.Series([None] * len(df), dtype="string")
+    df["modality"], df["extractor"], df["extractor_version"] = "x", extractor, "0.0"
+    return df
+
+
+def test_cli_retrieval_pools_both_sides_and_reports_subsets(tmp_path):
+    pytest.importorskip("pyarrow")
+    from psytwill.bench.retrieval import summarize
+
+    rng = np.random.default_rng(31)
+    films = [f"film{i}" for i in range(10)]
+    n_seg, seg_len = 6, 2.0
+    latent = {f: rng.normal(size=(n_seg, 4)) for f in films}
+    v = _grid("vis", films, seg_len, n_seg, latent, rng.normal(size=(4, 7)), rng)
+    a = _grid("aud", films, seg_len, n_seg, latent, rng.normal(size=(4, 5)), rng)
+    a.labels = [f"{lab.split('|')[0]}|{float(lab.split('|')[1]) + 0.25}" for lab in a.labels]  # centre stamps
+    vp, ap = tmp_path / "v_frames_features.parquet", tmp_path / "a_frames_features.parquet"
+    _long_grid(v, "viz2psy").to_parquet(vp, index=False)
+    _long_grid(a, "aud2psy").to_parquet(ap, index=False)
+    segs = pd.DataFrame([{"stimulus_id": f, "chunk_idx": k, "onset": k * seg_len, "offset": (k + 1) * seg_len}
+                         for f in films for k in range(n_seg)])
+    sp = tmp_path / "segs.csv"
+    segs.to_csv(sp, index=False)
+    held = tmp_path / "held.txt"
+    held.write_text("film0\nfilm1\nfilm2\n")
+    some = tmp_path / "some.txt"
+    some.write_text("film5|0\nfilm5|1\nfilm6|3\n")
+    out = tmp_path / "out"
+    common = ["--query-features", str(ap), "--query-model", "aud", "--query-segments", str(sp), "--query-window", "0.5",
+              "--target-features", str(vp), "--target-segments", str(sp), "--target-window", "0.5",
+              "--within-stimulus", "--n-splits", "5", "-o", str(out), "--n-boot", "100",
+              "--subset", f"held={held}", "--subset", f"some={some}"]
+    assert main(["bench", "retrieval", *common, "--target-model", "vis", "--tag", "av"]) == 0
+    side = json.loads((out / "retrieval__av.json").read_text())
+    s = side["summary"]
+    assert s["n_items"] == 60 and s["query_pooling"]["n_segments"] == 60
+    assert s["both_directions"]["pct_beaten"]["mean"] > 0.8
+    assert s["subsets"]["held"]["n_stimuli"] == 3 and s["subsets"]["some"]["n_items_scored"] == 3
+    items = pd.read_csv(out / side["items_file"])
+    ref = summarize(items[items["stimulus_id"].str.split("|").str[0].isin(["film0", "film1", "film2"])],
+                    within_stimulus=True, n_boot=100, seed=0)
+    assert s["subsets"]["held"]["both_directions"]["pct_beaten"] == pytest.approx(ref["both_directions"]["pct_beaten"])
+    # a second arm whose picture is noise, compared on the same items and subsets
+    noise = SpaceMatrix(name="vis", labels=v.labels, X=rng.normal(size=v.X.shape), features=v.features)
+    np_ = tmp_path / "n_frames_features.parquet"
+    _long_grid(noise, "viz2psy").to_parquet(np_, index=False)
+    common[common.index(str(vp))] = str(np_)
+    assert main(["bench", "retrieval", *common, "--target-model", "vis", "--tag", "noise"]) == 0
+    assert main(["bench", "compare", str(out / "retrieval__av.json"), str(out / "retrieval__noise.json"), "-o", str(out),
+                 "--tag", "av-noise", "--n-boot", "100", "--subset", f"held={held}"]) == 0
+    c = json.loads((out / "compare_retrieval__av-noise.json").read_text())["summary"]
+    assert c["pct_beaten"]["diff"]["lo"] > 0 and "retention" in c["pct_beaten"]
+    assert c["subsets"]["held"]["n_items"] == 18

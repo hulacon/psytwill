@@ -119,12 +119,24 @@ def retrieval(
     else:
         raise BenchError(f"unknown mode {mode!r}; use zero-shot or mapped")
     items = pd.concat(rows, ignore_index=True)
-    unit = (lambda d: d["stimulus_id"].map(stimulus_of)) if within_stimulus else (lambda d: None)
     summary = {"n_items": n, "query_rows_per_id_max": int(q_n.max()), "target_rows_per_id_max": int(t_n.max()),
                "chance_pct_beaten": 0.5, "within_stimulus": within_stimulus,
                "ci_unit": "stimulus" if within_stimulus else "item", "center_within": center_within}
+    summary |= summarize(items, within_stimulus=within_stimulus, n_boot=n_boot, seed=seed)
+    return items, summary
+
+
+def summarize(items: pd.DataFrame, *, within_stimulus: bool, n_boot: int = 2000, seed: int = 0) -> dict:
+    """Per-direction and both-direction statistics of an items table (all of it, or a subset's rows).
+
+    A subset is scored on the items' existing rows: candidates and maps are
+    those of the full run, only the averaging and the resampling are
+    restricted.
+    """
+    unit = (lambda d: d["stimulus_id"].map(stimulus_of)) if within_stimulus else (lambda d: None)
+    summary: dict = {"n_items_scored": int(items["stimulus_id"].nunique())}
     if within_stimulus:
-        summary["n_stimuli"] = int(len(np.unique(groups)))
+        summary["n_stimuli"] = int(items["stimulus_id"].map(stimulus_of).nunique())
     for direction, d in items.groupby("direction"):
         summary[direction] = {
             "pct_beaten": bootstrap_mean(d["pct_beaten"], unit(d), n_boot=n_boot, seed=seed),
@@ -137,4 +149,4 @@ def retrieval(
         "pct_beaten": bootstrap_mean(both["pct_beaten"], unit(both), n_boot=n_boot, seed=seed),
         "top1": bootstrap_mean(both["top1"], unit(both), n_boot=n_boot, seed=seed),
     }
-    return items, summary
+    return summary
