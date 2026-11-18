@@ -18,6 +18,7 @@ from psytwill.cli import main
 from psytwill.decompose import cv_cca, fit_cca
 from psytwill.exceptions import SpaceError
 from psytwill.relate import (
+    add_registers,
     check_relation,
     fit_relation,
     load_relation,
@@ -316,10 +317,102 @@ def test_cli_registers_from_label(tmp_path):
     assert main(["space", "relate", "fit", "--a", str(a), "--b", str(b), "--name", "PQ", "--n-perm", "20",
                  "--registers-from-label", "-o", str(out), "--stem", "PQ_v0.2"]) == 0
     m = json.loads((out / "PQ_v0.2.json").read_text())
-    assert m["relate_schema_version"] == "1.3" and m["register_key"].startswith("corpus")
+    assert m["relate_schema_version"] == "1.4" and m["register_key"].startswith("corpus")
+    assert all(v["fit"] for v in m["per_register"].values())
     assert {r: v["n"] for r, v in m["per_register"].items()} == {"librispeech": half, "musopen": N_ITEMS - half}
     w = np.load(out / "PQ_v0.2.npz")
     assert w["reg::musopen::cov"].shape == (2 * m["k"], 2 * m["k"])
+
+
+# --- coupling-only registers (`relate registers`) ------------------------------
+
+
+def test_added_register_is_the_frozen_maps_moments_and_leaves_the_fit_alone():
+    """Fit on register x only; add y through the frozen map. y's moments are those of the
+    map's variates on y's rows, exactly as a fit register's are, and nothing else moves."""
+    A, B, reg = _two_registers()
+    x, y = reg == "x", reg == "y"
+    fit = fit_relation(A[x], B[x], name="PQ", n_perm=0, fixed_k=K_SHARED, registers=reg[x], register_key="test")
+    Yb = B[y].copy()
+    Yb[:7, 0] = np.nan  # rows with a NaN side are dropped, and counted
+    out = add_registers(fit, A[y], Yb, reg[y], key="given", tables={"a": {"scores": "a.parquet"}},
+                        source={"manifest": "PQ_v0.1.json", "manifest_sha256": "0" * 64})
+    np.testing.assert_allclose(out.project(A, "a"), fit.project(A, "a"))
+    for f in ("k", "r_cv", "r_insample", "prefix_k", "n_rows", "register_key"):
+        assert out.manifest[f] == fit.manifest[f]
+    Pa, Pb = fit.project(A[y][7:], "a"), fit.project(B[y][7:], "b")
+    J = np.c_[Pa, Pb]
+    np.testing.assert_allclose(out.registers["y"].mean, J.mean(0), atol=1e-12)
+    np.testing.assert_allclose(out.registers["y"].cov, np.cov(J, rowvar=False), atol=1e-12)
+    pr = out.manifest["per_register"]
+    assert pr["x"]["fit"] is True and pr["y"]["fit"] is False
+    assert pr["y"]["n"] == y.sum() - 7 and pr["y"]["n_dropped_nan"] == 7 and pr["y"]["key"] == "given"
+    rr = [np.corrcoef(Pa[:, j], Pb[:, j])[0, 1] for j in range(K_SHARED)]
+    np.testing.assert_allclose(pr["y"]["r"], rr, atol=1e-10)
+    assert out.manifest["derived_from"] == [{"manifest": "PQ_v0.1.json", "manifest_sha256": "0" * 64}]
+    assert out.manifest["relate_schema_version"] == "1.4"
+    # the loose register couples less than the tight one it was not fitted on
+    assert max(pr["y"]["r"]) < min(pr["x"]["r"])
+    # the source fit is untouched
+    assert set(fit.registers) == {"x"} and set(fit.manifest["per_register"]) == {"x"}
+    # conditional reads an added register as it reads a fit one
+    coef, icpt, _ = out.conditional("y", given="a")
+    beta = np.linalg.lstsq(np.c_[np.ones(len(Pa)), Pa], Pb, rcond=None)[0]
+    np.testing.assert_allclose(coef, beta[1:].T, atol=1e-10)
+
+
+def test_added_registers_refuse_a_name_already_held_and_ragged_labels():
+    A, B, reg = _two_registers()
+    fit = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED, registers=reg)
+    with pytest.raises(SpaceError, match="already has register"):
+        add_registers(fit, A, B, reg, key="given")
+    with pytest.raises(SpaceError, match="one label per paired row"):
+        add_registers(fit, A, B, np.full(len(A) - 1, "z"), key="given")
+    plain = fit_relation(A, B, name="PQ", n_perm=0, fixed_k=K_SHARED)  # fitted without registers
+    out = add_registers(plain, A, B, np.full(len(A), "z"), key="given")
+    assert set(out.manifest["per_register"]) == {"z"} and out.manifest["register_key"] is None
+
+
+def test_cli_registers_derives_a_pinned_version_and_never_overwrites(tables, tmp_path, capsys):
+    a, b, A, Bc = tables
+    out = tmp_path / "rel"
+    assert main(["space", "relate", "fit", "--a", str(a), "--b", str(b), "--name", "PQ", "--pool-b", "mean",
+                 "--n-perm", "20", "-o", str(out), "--stem", "PQ_v0.1"]) == 0
+    src = out / "PQ_v0.1.json"
+    before = src.read_bytes()
+    # another corpus's rows, scored through the same blocks (byte-identical block manifests)
+    A2, B2, rng = _latents(seed=9)
+    ids = [f"ext-other-{i:04d}" for i in range(N_ITEMS)]
+    od = tmp_path / "other"
+    od.mkdir()
+    a2 = _write_block(od, "P", A2, {"stimulus_id": ids}, tag="v1")
+    b2 = _write_block(od, "Q", B2, {"stimulus_id": ids}, tag="v1")
+    assert main(["space", "relate", "registers", "--relation", str(src), "--a", str(a2), "--b", str(b2),
+                 "--register", "other", "-o", str(out), "--stem", "PQ_v0.1_reg"]) == 0
+    assert "added 1 coupling-only register" in capsys.readouterr().out
+    assert src.read_bytes() == before
+    m = json.loads((out / "PQ_v0.1_reg.json").read_text())
+    v = m["per_register"]["other"]
+    assert v["fit"] is False and v["n"] == N_ITEMS and len(v["tables"]["a"]["sha256"]) == 64
+    assert m["derived_from"][0]["manifest"] == str(src.resolve())
+    back = load_relation(out / "PQ_v0.1_reg.json")
+    assert set(back.registers) == {"other"} and back.k == m["k"]
+    np.testing.assert_allclose(back.project(A, "a"), load_relation(src).project(A, "a"))
+    # never over the source, never over an existing version, and the same name never twice
+    assert main(["space", "relate", "registers", "--relation", str(src), "--a", str(a2), "--b", str(b2),
+                 "--register", "other", "-o", str(out), "--stem", "PQ_v0.1"]) == 1
+    assert "never over it" in capsys.readouterr().err
+    assert main(["space", "relate", "registers", "--relation", str(src), "--a", str(a2), "--b", str(b2),
+                 "--register", "other", "-o", str(out), "--stem", "PQ_v0.1_reg"]) == 1
+    assert "not overwritten" in capsys.readouterr().err
+    assert main(["space", "relate", "registers", "--relation", str(out / "PQ_v0.1_reg.json"), "--a", str(a2),
+                 "--b", str(b2), "--register", "other", "-o", str(out), "--stem", "PQ_v0.1_reg2"]) == 1
+    assert "already has register" in capsys.readouterr().err
+    # a table projected through another block is refused, as for check / project
+    other = _write_block(od, "P", A2, {"stimulus_id": ids}, tag="v2")
+    assert main(["space", "relate", "registers", "--relation", str(src), "--a", str(other), "--b", str(b2),
+                 "--register", "x", "-o", str(out), "--stem", "PQ_v0.1_x"]) == 1
+    assert "Re-project the table" in capsys.readouterr().err
 
 
 def test_read_scores_orders_columns_numerically_past_999(tmp_path):

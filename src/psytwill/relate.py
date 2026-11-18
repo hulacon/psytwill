@@ -76,7 +76,14 @@ from psytwill.space import BLOCK_VIEWS
 #: joint moments of the top-k variates [a, b] on that register's fit rows.
 #: 1.3: each side records `view`, the block view its scores were read in.
 #: A side without it (schema <= 1.2) was fitted on the covariance view.
-RELATE_SCHEMA_VERSION = "1.3"
+#: 1.4: each `per_register` entry carries `fit`: true for a register among the
+#: fit rows, false for a coupling-only register that `relate registers` added
+#: through the frozen map (an entry without `fit`, schema <= 1.3, is a fit
+#: register). Coupling-only entries also carry `key` (how their rows were
+#: labelled), `n_dropped_nan` and `tables` (the sha256-pinned score tables they
+#: were read from). The manifest's `derived_from` lists the relation manifests
+#: it was derived from, oldest first; the map is theirs, unchanged.
+RELATE_SCHEMA_VERSION = "1.4"
 #: The view of a score table or relation side that does not record one: views
 #: arrived with `space project --view` (psytwill 0.44.0), and before it every
 #: table was the covariance view.
@@ -351,7 +358,7 @@ def fit_relation(X: np.ndarray, Y: np.ndarray, *, name: str, groups: Sequence | 
         name_: {"n": m.n, "r": [float(v) for v in _register_r(m, k)],
                 # a covariance from n <= 2k rows is singular: kept and flagged; `conditional` then
                 # gives only the per-direction coupling
-                "full_rank": bool(m.n > 2 * k)}
+                "full_rank": bool(m.n > 2 * k), "fit": True}
         for name_, m in moments.items()
     }
     return RelationFit(name=name, k=k, map=top, manifest=manifest, registers=moments)
@@ -367,6 +374,50 @@ def register_moments(Pa: np.ndarray, Pb: np.ndarray, registers: Sequence) -> dic
         cov = np.cov(rows, rowvar=False, ddof=1) if len(rows) > 1 else np.full((J.shape[1],) * 2, np.nan)
         out[r] = RegisterMoments(n=int(len(rows)), mean=rows.mean(axis=0), cov=np.atleast_2d(cov))
     return out
+
+
+def add_registers(fit: RelationFit, X: np.ndarray, Y: np.ndarray, registers: Sequence, *, key: str,
+                  tables: dict | None = None, source: dict | None = None) -> RelationFit:
+    """Coupling-only registers: the joint moments of the FROZEN map's variates on paired rows
+    it was not fitted on (another corpus, say), added beside the fit's own registers.
+
+    k, the map and every fit statistic are unchanged; only ``registers`` and the manifest's
+    ``per_register`` grow, with each new entry flagged ``fit: false``. A register's moments are
+    computed exactly as :func:`fit_relation` computes a fit register's, so :meth:`RelationFit.conditional`
+    reads both alike. Unlike a fit register's, a coupling-only register's r is out of sample for
+    the map. Rows with a NaN on either side are dropped, as :func:`check_relation` drops them.
+    A register name the relation already has is refused: a fit register is never overwritten,
+    and replacing an added one means deriving again from the manifest before it.
+
+    ``source`` names the manifest this derivation starts from ({manifest, manifest_sha256});
+    it is appended to ``derived_from``.
+    """
+    reg = np.asarray(registers, dtype=object).astype(str)
+    if len(reg) != len(X) or len(X) != len(Y):
+        raise SpaceError(f"add_registers needs one label per paired row: {len(reg)} labels, "
+                         f"{len(X)} side-a rows, {len(Y)} side-b rows")
+    keep = np.isfinite(X).all(axis=1) & np.isfinite(Y).all(axis=1)
+    if not keep.any():
+        raise SpaceError(f"relation {fit.name}: no paired row is finite on both sides; nothing to add")
+    clash = sorted(set(reg[keep].tolist()) & set(fit.registers))
+    if clash:
+        raise SpaceError(f"relation {fit.name} already has register(s) {clash}; a register is added once. "
+                         "Name it differently (--register), or derive again from the manifest that lacks it")
+    new = register_moments(fit.project(X[keep], "a"), fit.project(Y[keep], "b"), reg[keep])
+    manifest = json.loads(json.dumps(fit.manifest))
+    manifest["relate_schema_version"] = RELATE_SCHEMA_VERSION
+    per = dict(manifest.get("per_register") or {})
+    for r in per.values():
+        r.setdefault("fit", True)  # schema <= 1.3: every entry is a fit register
+    k = fit.k
+    for name_, m in new.items():
+        per[name_] = {"n": m.n, "r": [float(v) for v in _register_r(m, k)], "full_rank": bool(m.n > 2 * k),
+                      "fit": False, "key": key, "n_dropped_nan": int(((reg == name_) & ~keep).sum()),
+                      "tables": tables}
+    manifest["per_register"] = per
+    if source is not None:
+        manifest["derived_from"] = list(manifest.get("derived_from") or []) + [source]
+    return RelationFit(name=fit.name, k=k, map=fit.map, manifest=manifest, registers={**fit.registers, **new})
 
 
 def _register_r(m: RegisterMoments, k: int) -> np.ndarray:

@@ -3,6 +3,43 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.69.0 — 2026-11-18
+
+Minor bump: coupling-only registers on a frozen relation.
+
+### Added
+- **`psytwill space relate registers`** (`relate.add_registers`) adds a
+  relation's coupling on rows it was not fitted on, such as another corpus, as
+  registers beside the fit's own.
+  - Inputs: a relation manifest and two paired score tables, checked against
+    the relation's block manifests and views exactly as `relate check` and
+    `relate project` check them.
+  - The rows are projected through the **frozen** map. Their joint moments go
+    into a **new** manifest + weights version (`--stem`, required), and k, the
+    map and every fit statistic are copied unchanged.
+  - Register names: `--register NAME` (every row) or `--registers-from-label`
+    (the corpus parse `relate fit` uses).
+  - `RelationFit.conditional` reads an added register exactly as it reads a fit
+    register.
+- Why: `relate fit --registers-from-label` keeps moments only for registers
+  among the fit rows. A single-corpus relation therefore carried one register,
+  and the off-register coupling a prior needs had no place in the manifest.
+- Refused:
+  - writing over the source manifest or over any existing version;
+  - a register name the relation already has (a fit register is never
+    overwritten);
+  - labels that do not match the paired rows.
+
+### Changed
+- **`relate_schema_version` 1.4.**
+  - Every `per_register` entry carries `fit`: true for a fit register, false for
+    an added one.
+  - Added entries also record `key`, `n_dropped_nan` and `tables` (both score
+    tables, sha256-pinned).
+  - The manifest's `derived_from` lists the manifests it was derived from,
+    oldest first.
+  - An entry without `fit` (schema ≤ 1.3) is a fit register.
+
 ## 0.68.0 — 2026-11-15
 
 Minor bump: an event-boundary task.
