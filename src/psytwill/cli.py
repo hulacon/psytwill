@@ -1471,7 +1471,7 @@ def _run_relate_fit(args: argparse.Namespace) -> None:
     print(f"  {manifest}\n  {npz}")
 
 
-def _relate_pair(args: argparse.Namespace):
+def _relate_pair(args: argparse.Namespace, *, with_index: bool = False):
     from psytwill.relate import load_relation, pair_tables, read_scores, require_side
 
     fit = load_relation(args.relation)
@@ -1481,7 +1481,41 @@ def _relate_pair(args: argparse.Namespace):
     sides = fit.manifest["sides"]
     idx, X, Y, _ = pair_tables(a, b, fit.manifest["join"], pool_a=sides["a"]["pool"], pool_b=sides["b"]["pool"],
                                exclude_ids=_read_ids(args.exclude_ids))
-    return fit, X, Y
+    return (fit, X, Y, idx, a, b) if with_index else (fit, X, Y)
+
+
+def _run_relate_registers(args: argparse.Namespace) -> None:
+    import numpy as np
+
+    from psytwill.relate import REGISTER_FROM_LABEL, add_registers, register_labels, save_relation, sha256_file
+
+    src = Path(args.relation).resolve()
+    target = (Path(args.output) / f"{args.stem}.json").resolve()
+    if target == src:
+        raise InputError(f"{target} is the relation being read; a derived relation is written beside it "
+                         "under a new --stem, never over it")
+    if target.exists() or target.with_suffix(".npz").exists():
+        raise InputError(f"{target} (or its .npz) already exists; relation versions are not overwritten. "
+                         "Pick a new --stem")
+    fit, X, Y, idx, a, b = _relate_pair(args, with_index=True)
+    if args.registers_from_label:
+        labels, key = register_labels(idx), REGISTER_FROM_LABEL
+    else:
+        labels, key = np.full(len(X), args.register, dtype=object), "given (--register)"
+    tables = {side: {"scores": str(t.path), "sha256": sha256_file(t.path)} for side, t in (("a", a), ("b", b))}
+    if args.exclude_ids:
+        tables["exclude_ids_file"] = args.exclude_ids
+    out = add_registers(fit, X, Y, labels, key=key, tables=tables,
+                        source={"manifest": str(src), "manifest_sha256": sha256_file(src)})
+    npz, manifest = save_relation(out, args.output, stem=args.stem)
+    added = [r for r, v in out.manifest["per_register"].items() if not v["fit"] and r not in fit.registers]
+    print(f"psytwill space relate registers [{fit.name}, k={fit.k}]: added {len(added)} coupling-only "
+          f"register(s) through the frozen map (map and k unchanged)")
+    for r in added:
+        v = out.manifest["per_register"][r]
+        print(f"  {r}: n={v['n']} (dropped {v['n_dropped_nan']} with a NaN side), r first {v['r'][0]:.3f}, "
+              f"k-th {v['r'][-1]:.3f}{'' if v['full_rank'] else ' (n <= 2k: per-direction coupling only)'}")
+    print(f"  {manifest}\n  {npz}")
 
 
 def _run_relate_check(args: argparse.Namespace) -> None:
@@ -2234,7 +2268,7 @@ def build_parser() -> argparse.ArgumentParser:
     ck.add_argument("-o", "--output", help="per-member CSV")
     ck.set_defaults(func=_run_space_check)
 
-    rel = spsub.add_parser("relate", help="relations between fitted blocks: fit | check | project")
+    rel = spsub.add_parser("relate", help="relations between fitted blocks: fit | check | registers | project")
     relsub = rel.add_subparsers(dest="relate_verb", required=True)
 
     def _relate_pair_args(q: argparse.ArgumentParser) -> None:
@@ -2279,6 +2313,18 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--seed", type=int, default=0)
     rc.add_argument("-o", "--output", help="per-component CSV")
     rc.set_defaults(func=_run_relate_check)
+
+    rr = relsub.add_parser("registers",
+                           help="add coupling-only registers to a frozen relation, as a new manifest version")
+    _relate_pair_args(rr)
+    rr.add_argument("--relation", required=True, help="the relation's .json manifest (read, never rewritten)")
+    who = rr.add_mutually_exclusive_group(required=True)
+    who.add_argument("--register", help="one register name for every paired row (e.g. friends)")
+    who.add_argument("--registers-from-label", action="store_true",
+                     help="register per row from the first join column's ext-<corpus>-* id, as `relate fit`")
+    rr.add_argument("-o", "--output", required=True, help="output directory for the derived relation")
+    rr.add_argument("--stem", required=True, help="file stem of the derived relation (must not exist)")
+    rr.set_defaults(func=_run_relate_registers)
 
     rp = relsub.add_parser("project", help="place one side's rows in the relation's shared coordinates")
     rp.add_argument("--relation", required=True, help="the relation's .json manifest")
