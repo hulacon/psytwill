@@ -3,6 +3,23 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.70.0 — 2026-11-19
+
+Minor bump: a group-bootstrap interval for readout set reads.
+
+### Added
+- **`readout(..., n_boot=, boot_level=)`** gives each set read (`strict`,
+  `nameable`) a percentile interval for its held-out R² (`SetRead.r2_ci`):
+  whole groups (e.g. films) resampled with replacement over the read's
+  out-of-fold predictions, no refit. Needs `groups`. Control draws and
+  per-member reads carry none. Readout schema 1.2.
+- **`compare.group_bootstrap_r2(y, pred, groups, ...)`**: that interval for any
+  out-of-fold predictions, recomputing variance-weighted R² from per-group sums.
+
+### Changed
+- `ridge_predictivity` now delegates to a private `_ridge_fit` that also keeps
+  the out-of-fold predictions. Its result is unchanged.
+
 ## 0.69.0 — 2026-11-18
 
 Minor bump: coupling-only registers on a frozen relation.

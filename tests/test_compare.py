@@ -401,3 +401,43 @@ def test_groups_of_the_wrong_length_raise_space_error():
     X, Y = rng.standard_normal((30, 3)), rng.standard_normal((30, 2))
     with pytest.raises(SpaceError, match="groups"):
         ridge_predictivity(X, Y, groups=np.arange(29) % 5)
+
+
+def test_group_bootstrap_r2_brackets_r2_score_and_is_seeded():
+    from sklearn.metrics import r2_score
+
+    from psytwill.compare import group_bootstrap_r2
+
+    rng = np.random.default_rng(0)
+    y = rng.normal(size=(200, 3))
+    pred = y + rng.normal(scale=0.5, size=y.shape)
+    g = np.repeat(np.arange(10), 20)
+    lo, hi, draws = group_bootstrap_r2(y, pred, g, n_boot=500, random_state=0)
+    assert lo < r2_score(y, pred, multioutput="variance_weighted") < hi
+    assert draws.shape == (500,)
+    assert np.array_equal(draws, group_bootstrap_r2(y, pred, g, n_boot=500, random_state=0)[2])
+    with pytest.raises(SpaceError, match="at least 2 groups"):
+        group_bootstrap_r2(y, pred, np.zeros(200), n_boot=10)
+
+
+def test_group_bootstrap_r2_resamples_whole_groups():
+    from psytwill.compare import group_bootstrap_r2
+
+    # perfect in group 0, useless in group 1: draws spread between the two
+    y = np.r_[np.linspace(-1, 1, 50), np.linspace(-1, 1, 50)][:, None]
+    pred = np.r_[np.linspace(-1, 1, 50), np.zeros(50)][:, None]
+    _, _, draws = group_bootstrap_r2(y, pred, np.repeat([0, 1], 50), n_boot=400, random_state=0)
+    assert np.isclose(draws.max(), 1.0) and np.isclose(draws.min(), 0.0)
+
+
+def test_ridge_predictivity_unchanged_by_the_oof_split():
+    from psytwill.compare import DEFAULT_ALPHAS, _ridge_fit, ridge_predictivity
+
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(120, 4))
+    Y = X @ rng.normal(size=(4, 2)) + rng.normal(size=(120, 2))
+    g = np.repeat(np.arange(6), 20)
+    a = ridge_predictivity(X, Y, groups=g, scaling="set")
+    f = _ridge_fit(X, Y, groups=g, n_splits=5, alphas=DEFAULT_ALPHAS, random_state=0, scaling="set")
+    assert a == f.result
+    assert f.oof.shape == Y.shape and np.isfinite(f.oof).all()

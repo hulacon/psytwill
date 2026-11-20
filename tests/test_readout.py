@@ -117,7 +117,7 @@ def test_same_seed_same_result_and_the_record_is_json():
     a, b = readout(bat, T, **kw), readout(bat, T, **kw)
     assert a.to_dict() == b.to_dict()
     rec = json.loads(json.dumps(a.to_dict()))
-    assert rec["schema"] == "1.1" and rec["battery"] == ["named_a", "named_b", "embed"]
+    assert rec["schema"] == "1.2" and rec["battery"] == ["named_a", "named_b", "embed"]
 
 
 @pytest.mark.parametrize("kw, msg", [
@@ -181,3 +181,20 @@ def test_a_control_draws_r2_does_not_depend_on_the_basis_it_came_in():
     zs = ridge_predictivity(Xc @ B, T, groups=_groups()).r2
     zr = ridge_predictivity(Xc @ B @ R, T, groups=_groups()).r2
     assert abs(zs - zr) > 1e-6
+
+
+def test_bootstrap_interval_brackets_the_read_and_needs_groups():
+    bat = _battery()
+    T = _target(bat["named_a"], noise=1.0)
+    kw = {k: v for k, v in FAST.items() if k not in ("n_perm", "k_nn")}
+    r = readout(bat, T, nameable=["named_a", "named_b"], strict=["named_a"], groups=_groups(), knn=False,
+                n_boot=300, **kw)
+    for s in r.reads:
+        lo, hi = s.r2_ci
+        assert lo <= s.r2 <= hi and hi - lo > 0
+    assert r.params["n_boot"] == 300
+    plain = readout(bat, T, nameable=["named_a", "named_b"], groups=_groups(), knn=False, **kw)
+    assert plain.read("nameable").r2_ci is None
+    assert plain.read("nameable").r2 == r.read("nameable").r2  # the interval does not move the read
+    with pytest.raises(SpaceError, match="n_boot needs groups"):
+        readout(bat, T, nameable=["named_a"], knn=False, n_boot=10, **kw)
