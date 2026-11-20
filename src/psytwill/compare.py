@@ -167,6 +167,16 @@ class RidgeResult:
     alphas_selected: list[float] = field(default_factory=list)
 
 
+@dataclass
+class _RidgeFit:
+    """A ridge read with what a resampled R^2 needs: out-of-fold predictions on the used rows."""
+
+    result: RidgeResult
+    oof: np.ndarray
+    y: np.ndarray
+    groups: np.ndarray | None
+
+
 def ridge_predictivity(
     X,
     Y,
@@ -199,6 +209,12 @@ def ridge_predictivity(
       columns leaves R^2 unchanged). Use it when another read of the same
       ``X`` (a captured share, a Euclidean neighbour graph) is in that metric.
     """
+    return _ridge_fit(X, Y, groups=groups, n_splits=n_splits, alphas=alphas, random_state=random_state,
+                      scaling=scaling).result
+
+
+def _ridge_fit(X, Y, *, groups, n_splits, alphas, random_state, scaling) -> _RidgeFit:
+    """:func:`ridge_predictivity`, keeping its out-of-fold predictions."""
     if scaling not in ("column", "set"):
         raise SpaceError(f"scaling must be 'column' or 'set'; got {scaling!r}")
     A, B, g, n_dropped = _align(X, Y, groups)
@@ -242,7 +258,7 @@ def ridge_predictivity(
         )
         chosen.extend(np.atleast_1d(model.alpha_).astype(float).tolist())
 
-    return RidgeResult(
+    return _RidgeFit(RidgeResult(
         r2=float(r2_score(B, oof, multioutput="variance_weighted")),
         r2_mean=float(np.mean(r2_score(B, oof, multioutput="raw_values"))),
         r2_per_fold=per_fold,
@@ -251,7 +267,50 @@ def ridge_predictivity(
         n_splits=n_splits_used,
         grouped=g is not None,
         alphas_selected=sorted(set(chosen)),
-    )
+    ), oof=oof, y=B, groups=g)
+
+
+def group_bootstrap_r2(y, pred, groups, *, n_boot: int = 2000, level: float = 0.95,
+                       random_state: int = 0) -> tuple[float, float, np.ndarray]:
+    """Percentile interval of variance-weighted R^2 when whole groups are resampled.
+
+    ``y`` and ``pred`` hold the same rows (out-of-fold predictions: the fits
+    are not redone, so the interval reflects which stimuli were read, not
+    refitting noise). Groups (e.g. films) are drawn with replacement, ``n``
+    of ``n`` groups per resample, and R^2 = 1 - sum SSE / sum SST is
+    recomputed with each resample's own column means, as ``r2_score``'s
+    variance-weighted form. Returns ``(lo, hi, draws)``.
+    """
+    Y = _as_2d(y, "y").astype(float)
+    P = _as_2d(pred, "pred").astype(float)
+    if Y.shape != P.shape:
+        raise SpaceError(f"y {Y.shape} and pred {P.shape} differ")
+    g = np.asarray(groups)
+    if g.shape[0] != Y.shape[0]:
+        raise SpaceError(f"groups has {g.shape[0]} entries for {Y.shape[0]} rows")
+    if n_boot < 1:
+        raise SpaceError(f"n_boot must be >= 1; got {n_boot}")
+    if not 0 < level < 1:
+        raise SpaceError(f"level must lie in (0, 1); got {level}")
+    _, inv = np.unique(g, return_inverse=True)
+    n_g = int(inv.max()) + 1
+    if n_g < 2:
+        raise SpaceError("a group bootstrap needs at least 2 groups")
+    cnt = np.bincount(inv, minlength=n_g).astype(float)
+    sy = np.zeros((n_g, Y.shape[1]))
+    syy = np.zeros_like(sy)
+    sse = np.zeros_like(sy)
+    np.add.at(sy, inv, Y)
+    np.add.at(syy, inv, Y ** 2)
+    np.add.at(sse, inv, (Y - P) ** 2)
+    rng = np.random.default_rng(random_state)
+    W = np.stack([np.bincount(rng.integers(0, n_g, n_g), minlength=n_g) for _ in range(n_boot)]).astype(float)
+    N = W @ cnt
+    SY, SYY, SSE = W @ sy, W @ syy, W @ sse
+    sst = (SYY - SY ** 2 / N[:, None]).sum(1)
+    draws = 1.0 - SSE.sum(1) / sst
+    a = (1 - level) / 2
+    return float(np.quantile(draws, a)), float(np.quantile(draws, 1 - a)), draws
 
 
 # --------------------------------------------------------------------------

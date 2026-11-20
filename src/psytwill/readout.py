@@ -72,6 +72,8 @@ from psytwill.compare import (
     DEFAULT_ALPHAS,
     DEFAULT_K,
     _overlap_from_knn,
+    _ridge_fit,
+    group_bootstrap_r2,
     knn_indices,
     neighbor_overlap_null,
     ridge_predictivity,
@@ -80,7 +82,7 @@ from psytwill.exceptions import SpaceError
 from psytwill.subspace import captured_share, matched_subspaces
 
 #: Bump when a field of :class:`Readout`'s dict form changes meaning or goes away.
-READOUT_SCHEMA = "1.1"
+READOUT_SCHEMA = "1.2"  # 1.2: SetRead.r2_ci (stimulus bootstrap), params n_boot / boot_level
 
 
 @dataclass
@@ -96,6 +98,8 @@ class SetRead:
     """The set's span's share of the battery's (centred) variance."""
     r2: float
     r2_per_fold: list[float]
+    r2_ci: tuple[float, float] | None = None
+    """Group-bootstrap interval of ``r2`` (``n_boot`` > 0): groups resampled, out-of-fold predictions kept."""
     control_r2: list[float] = field(default_factory=list)
     """Held-out R² of each matched random subspace (empty when no control was drawn)."""
     r2_percentile: float | None = None
@@ -169,6 +173,8 @@ def readout(
     n_splits: int = 5,
     alphas: Sequence[float] = DEFAULT_ALPHAS,
     random_state: int = 0,
+    n_boot: int = 0,
+    boot_level: float = 0.95,
 ) -> Readout:
     """Read ``target`` through the nameable members of ``battery``, each read against a matched control.
 
@@ -184,6 +190,11 @@ def readout(
     to fewer than three directions, and the per-member reads can be that
     thin. ``block_size`` keeps temporal blocks intact in the k-NN permutation
     null (rows must then be in temporal order).
+
+    ``n_boot`` > 0 gives each set read a ``boot_level`` interval for its R²
+    (:func:`psytwill.compare.group_bootstrap_r2`): whole groups resampled
+    over the read's out-of-fold predictions, no refit. It needs ``groups``.
+    Control draws and per-member reads carry no interval.
 
     ``n_control=0`` skips the control (the reads are then unreferenced).
     ``n_pool`` defaults to ``max(20 * n_control, 2000)``.
@@ -212,6 +223,8 @@ def readout(
     if bad:
         raise SpaceError(f"member(s) {', '.join(bad)} do not have the target's {n} rows")
     g = None if groups is None else np.asarray(groups)
+    if n_boot and g is None:
+        raise SpaceError("n_boot needs groups: the bootstrap resamples whole groups (e.g. films)")
     if g is not None and g.shape[0] != n:
         raise SpaceError(f"groups has {g.shape[0]} entries for {n} rows")
 
@@ -250,9 +263,15 @@ def readout(
         Q = np.zeros((d, k))
         Q[idx, np.arange(k)] = 1.0
         share = captured_share(X, Q)
-        rr = _r2(P)
+        fit = _ridge_fit(P, Y, groups=g, n_splits=n_splits, alphas=alphas, random_state=random_state,
+                         scaling="set")
+        rr = fit.result
         out = SetRead(label=label, members=list(members), k=k, share=float(share), r2=float(rr.r2),
                       r2_per_fold=[float(v) for v in rr.r2_per_fold])
+        if n_boot:
+            lo, hi, _ = group_bootstrap_r2(fit.y, fit.oof, fit.groups, n_boot=n_boot, level=boot_level,
+                                           random_state=random_state)
+            out.r2_ci = (lo, hi)
         if knn:
             nr = neighbor_overlap_null(P, Y, k=k_nn, metric=metric, n_perm=n_perm, block_size=block_size,
                                        random_state=random_state, knn_y=knn_y)
@@ -299,5 +318,5 @@ def readout(
         params={"n_control": n_control, "n_pool": pool, "tol": tol, "knn": knn, "k_nn": k_nn,
                 "metric": metric, "n_perm": n_perm, "block_size": block_size, "n_splits": n_splits,
                 "alphas": [float(a) for a in alphas], "random_state": random_state,
-                "ridge_scaling": "set"},
+                "ridge_scaling": "set", "n_boot": n_boot, "boot_level": boot_level},
     )
