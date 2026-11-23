@@ -56,6 +56,52 @@ def test_a_trailing_window_masks_only_after_the_boundary():
     assert min(hit) >= 9.5 and max(hit) < 14.0  # [c-4, c] reaches g1 until c - 4 >= 9.5
 
 
+
+def _item_masks_reference(space, windows, segments, hop):
+    """The per-row set count item_masks replaced (0.70.1), kept as its oracle."""
+    from psytwill.windows import _row_times, _window_bounds
+    sid, t = _row_times(space.labels)
+    c = t + hop / 2
+    out = {col: np.zeros(len(t), dtype=bool) for col in windows}
+    for unit in np.unique(sid):
+        seg = segments.get(unit)
+        if seg is None:
+            continue
+        rows = np.flatnonzero(sid == unit)
+        on, off = seg["onset"].to_numpy(float), seg["offset"].to_numpy(float)
+        grp = seg["group"].astype(str).to_numpy()
+        cr = c[rows]
+        for col, (w, align) in windows.items():
+            lo, hi = _window_bounds(cr, w, align, float(t[rows].max() + hop))
+            first = np.searchsorted(off, lo, side="right")
+            last = np.searchsorted(on, hi, side="left") - 1
+            out[col][rows] = [last[i] > first[i] and len(set(grp[first[i]:last[i] + 1])) > 1
+                              for i in range(len(rows))]
+    return {col: m for col, m in out.items() if m.any()}
+
+
+def test_item_masks_match_the_per_row_group_count():
+    """Many short segments with repeated and alternating groups, a unit with one
+    segment, and one with none: the prefix count of group changes equals the
+    distinct-group count on every window and alignment."""
+    rng = np.random.RandomState(3)
+    labels, segments = [], {}
+    for u in range(6):
+        labels += [f"u{u}|{b * HOP}" for b in range(N_BINS)]
+        if u == 5:
+            continue  # no segments for this unit
+        n_seg = 1 if u == 4 else 12
+        edges = np.sort(rng.uniform(0, N_BINS * HOP, 2 * n_seg))
+        segments[f"u{u}"] = pd.DataFrame({"onset": edges[0::2], "offset": edges[1::2],
+                                          "group": rng.choice(["g1", "g2", "g3"], n_seg, p=[.6, .3, .1])})
+    sp = SpaceMatrix(name="a", labels=labels, X=np.zeros((len(labels), 1)), features=["a_00"])
+    wins = {"w1": (1.0, "centred"), "w4": (4.0, "centred"), "w10": (10.0, "trailing")}
+    got, ref = item_masks(sp, wins, segments, HOP), _item_masks_reference(sp, wins, segments, HOP)
+    assert ref and got.keys() == ref.keys()
+    for col in ref:
+        np.testing.assert_array_equal(got[col], ref[col])
+
+
 def test_causal_shift_relabels_centred_values_half_a_window_later():
     sh = causal_shifts({"a_00": (4.0, "centred"), "t": (3.0, "trailing")}, HOP)
     assert sh == {"a_00": {"window_sec": 4.0, "shift_sec": 2.0, "rounding_sec": 0.0}}

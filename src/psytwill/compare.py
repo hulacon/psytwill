@@ -495,10 +495,33 @@ def knn_indices(X, *, k: int = DEFAULT_K, metric: str = "cosine") -> np.ndarray:
     return np.argsort(D, axis=1, kind="stable")[:, : min(k, n - 1)].copy()
 
 
-def _overlap_from_knn(na: np.ndarray, nb: np.ndarray) -> float:
-    k_eff = na.shape[1]
-    shared = sum(len(set(na[i]) & set(nb[i])) for i in range(na.shape[0]))
-    return float(shared / (na.shape[0] * k_eff))
+_OVERLAP_CHUNK = 4096  # rows per broadcast block: chunk x k x k bools (6.6 MB at k 40)
+
+
+def _rows_distinct(nbrs: np.ndarray) -> bool:
+    """No row of a neighbour list repeats an index."""
+    s = np.sort(nbrs, axis=1)
+    return not (s[:, 1:] == s[:, :-1]).any()
+
+
+def _overlap_from_knn(na: np.ndarray, nb: np.ndarray, *, distinct: bool | None = None) -> float:
+    """Mean share of each row's neighbours common to both lists (set intersection).
+
+    Vectorised as an equality count over each row's k x k pairs, which equals
+    the set intersection when neither list repeats an index within a row.
+    :func:`knn_indices` never does; a caller-supplied list that does takes the
+    per-row set path. ``distinct`` skips that check when the caller has made it.
+    """
+    na, nb = np.asarray(na), np.asarray(nb)
+    n, k_eff = na.shape
+    if distinct is None:
+        distinct = _rows_distinct(na) and _rows_distinct(nb)
+    if distinct:
+        shared = sum(int((na[s:s + _OVERLAP_CHUNK, :, None] == nb[s:s + _OVERLAP_CHUNK, None, :]).sum())
+                     for s in range(0, n, _OVERLAP_CHUNK))
+    else:
+        shared = sum(len(set(na[i]) & set(nb[i])) for i in range(n))
+    return float(shared / (n * k_eff))
 
 
 def neighbor_overlap(X, Y, *, k: int = DEFAULT_K, metric: str = "cosine") -> float:
@@ -554,7 +577,8 @@ def neighbor_overlap_null(
                 "removal, so the cached graph is for a different row set. Pass "
                 "the graph built on these same rows, or omit it."
             )
-    observed = _overlap_from_knn(na, nb)
+    distinct = _rows_distinct(na) and _rows_distinct(nb)  # relabelling below keeps it
+    observed = _overlap_from_knn(na, nb, distinct=distinct)
 
     rng = np.random.RandomState(random_state)
     inverse = np.empty(n, dtype=int)
@@ -565,7 +589,7 @@ def neighbor_overlap_null(
         # are the original neighbours of perm[i], relabeled into new positions
         inverse[perm] = np.arange(n)
         nb_perm = inverse[nb[perm]]
-        null.append(_overlap_from_knn(na, nb_perm))
+        null.append(_overlap_from_knn(na, nb_perm, distinct=distinct))
 
     arr = np.asarray(null)
     return NullResult(
