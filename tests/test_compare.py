@@ -182,6 +182,24 @@ def test_neighbor_overlap_clamps_k_to_available_rows(rng):
     assert neighbor_overlap(X, X, k=100) == pytest.approx(1.0)
 
 
+def _overlap_reference(na, nb):
+    return sum(len(set(na[i]) & set(nb[i])) for i in range(len(na))) / (na.shape[0] * na.shape[1])
+
+
+def test_overlap_from_knn_matches_set_intersection(rng, monkeypatch):
+    """The vectorised count is the per-row set intersection, across chunk edges,
+    and a list that repeats an index within a row still gets set semantics."""
+    from psytwill import compare
+    monkeypatch.setattr(compare, "_OVERLAP_CHUNK", 7)  # several chunks, one ragged
+    for n, k in ((50, 5), (23, 10)):
+        X, Y = rng.randn(n, 4), rng.randn(n, 4)
+        na, nb = compare.knn_indices(X, k=k), compare.knn_indices(Y, k=k)
+        assert compare._overlap_from_knn(na, nb) == pytest.approx(_overlap_reference(na, nb), abs=0)
+        assert compare._overlap_from_knn(na, na) == 1.0
+    dup = np.array([[1, 1, 2], [3, 4, 5]]); other = np.array([[1, 2, 9], [3, 3, 3]])
+    assert compare._overlap_from_knn(dup, other) == pytest.approx(_overlap_reference(dup, other), abs=0)
+
+
 # --- permutation nulls -----------------------------------------------------
 
 

@@ -178,6 +178,10 @@ def item_masks(space: SpaceMatrix, windows: Mapping[str, tuple[float, str]],
         rows = np.flatnonzero(sid == unit)
         on, off = seg["onset"].to_numpy(float), seg["offset"].to_numpy(float)
         grp = seg["group"].astype(str).to_numpy()
+        # changes[j] = number of j' < j with grp[j'] != grp[j' + 1]. A run of
+        # segments first..last holds two groups exactly when it contains an
+        # adjacent change, i.e. changes[last] > changes[first].
+        changes = np.concatenate([[0], np.cumsum(grp[1:] != grp[:-1])])
         duration = float(t[rows].max() + hop)
         cr = c[rows]
         for col, (w, align) in windows.items():
@@ -185,9 +189,8 @@ def item_masks(space: SpaceMatrix, windows: Mapping[str, tuple[float, str]],
             first = np.searchsorted(off, lo, side="right")  # first segment ending after lo
             last = np.searchsorted(on, hi, side="left") - 1  # last segment starting before hi
             hit = np.zeros(len(rows), dtype=bool)
-            span = last > first
-            for i in np.flatnonzero(span):
-                hit[i] = len(set(grp[first[i]:last[i] + 1])) > 1
+            span = np.flatnonzero(last > first)  # here 0 <= first < last < len(seg)
+            hit[span] = changes[last[span]] > changes[first[span]]
             out[col][rows] = hit
     return {col: m for col, m in out.items() if m.any()}
 

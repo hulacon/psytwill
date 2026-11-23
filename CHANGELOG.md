@@ -3,6 +3,21 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.70.1 — 2026-11-23
+
+Patch: two per-row Python loops vectorised. Results are unchanged, and each is
+checked against the loop it replaced in the test suite.
+
+### Changed
+- **`windows.item_masks`** counts group changes with a prefix sum: a run of
+  segments holds two groups exactly when it contains an adjacent change. It no
+  longer builds a set per row.
+- **`compare._overlap_from_knn`** (neighbour overlap, its permutation null, and
+  readout's k-NN controls) counts shared neighbours as an equality count over
+  each row's k × k pairs, in row chunks. It falls back to per-row sets when a
+  supplied list repeats an index within a row (`knn_indices` never does).
+  `neighbor_overlap_null` checks that once, not once per permutation.
+
 ## 0.70.0 — 2026-11-19
 
 Minor bump: a group-bootstrap interval for readout set reads.
