@@ -77,8 +77,15 @@ from pathlib import Path
 
 from psytwill.battery import BATTERY, check_sidecar
 from psytwill.fitcorpus import CORPORA, EXT_PREFIX, ext_id
+from psytwill.passmanifest import PassManifest, load_pass
 
 PY = sys.executable
+#: The stage-0 version a video cell must have been framed under to count as
+#: done; mirrors ``viz2psy.framing.STAGE0_VERSION`` (bump both together).
+STAGE0_VERSION = "1"
+#: The frame source the framing rule reads (decoded frames scored directly, D5).
+FRAME_SOURCE = "raw decode"
+SAR_TOL = 1e-5
 GRID_HOP = 0.5  # shared frame grid, matching the mmmdata store
 NSD_UNIT = 1000  # images per NSD unit (== the shared1000 arm's proven size)
 NSD_TOTAL = 73000
@@ -171,7 +178,28 @@ class Roots:
         self.framing_table = self._resolve(args.framing_table, "PSYTWILL_FRAMING_TABLE", "--framing-table",
                                            required=False)
         self._framing_sha: str | None = None
+        self._framing_rows: dict[str, dict] | None = None
         self.nsd_hdf5 = self._resolve(args.nsd_hdf5, "PSYTWILL_NSD_HDF5", "--nsd-hdf5", required=False)
+        self.pass_manifest = self._resolve(getattr(args, "pass_manifest", None), "PSYTWILL_PASS_MANIFEST",
+                                           "--pass-manifest", required=False)
+        self._pass: PassManifest | None = None
+
+    def pass_(self) -> PassManifest | None:
+        """The pass manifest, loaded once; None when none is given."""
+        if self.pass_manifest is None:
+            return None
+        if self._pass is None:
+            self._pass = load_pass(self.pass_manifest)
+        return self._pass
+
+    def framing_box(self, video: str) -> dict | None:
+        """The current framing table's row for one video (keyed as viz2psy keys it:
+        absolute, symlinks kept); None when the video is not in the table."""
+        self.framing_sha256()  # refuses without a table or its parameter record
+        if self._framing_rows is None:
+            with open(self.framing_table, newline="") as fh:
+                self._framing_rows = {r["path"]: r for r in csv.DictReader(fh)}
+        return self._framing_rows.get(os.path.abspath(video))
 
     def framing_sha256(self) -> str:
         """The framing table's sha256, from its parameter record (viz2psy writes it)."""
@@ -643,7 +671,7 @@ def is_video_cell(src: Source, unit: Unit) -> bool:
 
 def is_done(stem: Path, src: Source | None = None, unit: Unit | None = None) -> bool:
     """Sidecar present AND clean against the clamped battery AND, for a video
-    cell, framed with the current framing table."""
+    cell, framed as the current framing table frames each of its files."""
     meta = sidecar_for(stem)
     if not meta.exists():
         return False
@@ -654,14 +682,79 @@ def is_done(stem: Path, src: Source | None = None, unit: Unit | None = None) -> 
     if check_sidecar(sidecar, source=str(meta)):
         return False
     if src is not None and unit is not None and is_video_cell(src, unit):
-        inp = sidecar.get("input") or {}
-        framing = inp.get("framing") or {}
-        if framing.get("framing_table_sha256") != ROOTS.framing_sha256():
-            return False
-        if len(unit.inputs) > 1:  # a video set: exactly this unit's clips, in order
-            listed = [v.get("path") for v in inp.get("videos") or []]
-            return listed == [str(Path(p).resolve()) for p in unit.inputs]
+        return framing_current(sidecar, unit)
     return True
+
+
+def framing_current(sidecar: dict, unit: Unit) -> bool:
+    """Fit <-> projection framing parity for one video cell (spec 3a.4): the
+    sidecar's stage-0 version and frame source, and each file's box (crop,
+    pixel aspect, stored size) against that file's row in the current table.
+
+    The table's version and sha256 are recorded, not compared, so a new table
+    version (a new corpus's rows) does not re-extract cells whose boxes did
+    not change.
+    """
+    inp = sidecar.get("input") or {}
+    rule = inp.get("framing") or {}
+    if rule.get("stage0_version") != STAGE0_VERSION or rule.get("frame_source") != FRAME_SOURCE:
+        return False
+    if len(unit.inputs) > 1:  # a video set: exactly this unit's clips, in order, one box each
+        videos = inp.get("videos") or []
+        if [v.get("path") for v in videos] != [str(Path(p).resolve()) for p in unit.inputs]:
+            return False
+        records = videos
+    else:
+        records = [rule]
+    for video, rec in zip(unit.inputs, records):
+        row = ROOTS.framing_box(video)
+        if row is None or row.get("error"):
+            return False
+        crop = rec.get("crop") or {}
+        if any(int(crop.get(e, -1)) != int(row[f"crop_{e}"]) for e in ("left", "right", "top", "bottom")):
+            return False
+        if list(rec.get("stored_wh") or []) != [int(row["width"]), int(row["height"])]:
+            return False
+        if rec.get("pixel_aspect") is None or abs(float(rec["pixel_aspect"]) - float(row["sar"])) > SAR_TOL:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# The pass manifest
+# ---------------------------------------------------------------------------
+
+_INSTALLED: dict[str, str] = {}
+
+
+def installed_version(package: str) -> str:
+    """The producer version the extracting interpreter (PY) has installed."""
+    if package not in _INSTALLED:
+        r = subprocess.run([PY, "-c", f"import importlib.metadata as m; print(m.version({package!r}))"],
+                           capture_output=True, text=True)
+        _INSTALLED[package] = r.stdout.strip() if r.returncode == 0 else "not installed"
+    return _INSTALLED[package]
+
+
+def pass_problem(src: Source, unit: Unit, model: str) -> str | None:
+    """Why the pass manifest does not allow extracting this cell now; None = allowed
+    (or no manifest given)."""
+    pm = ROOTS.pass_()
+    if pm is None:
+        return None
+    cell = pm.cell_for(src.corpus, src.source, model)
+    if cell is None:
+        return f"not in pass {pm.name} (a later cell needs a dated deviation in the manifest)"
+    ids = cell.unit_ids()
+    if ids is not None and unit.id not in ids:
+        return f"unit {unit.id} is outside the pinned subset of pass cell {cell.key} ({cell.units})"
+    want = pm.version_for(cell, src.package)
+    if want is None:
+        return f"pass {pm.name} pins no {src.package} version"
+    have = installed_version(src.package)
+    if have != want:
+        return f"pass {pm.name} runs {src.package} {want}; this interpreter has {have}"
+    return None
 
 
 def command_for(src: Source, unit: Unit, model: str) -> list[str]:
@@ -739,6 +832,7 @@ def _filtered(args: argparse.Namespace) -> list[tuple[Source, Unit, str]]:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     rows = []
+    outside: dict[str, list[str]] = {}
     for src in build_sources():
         if args.corpus and src.corpus != args.corpus:
             continue
@@ -753,6 +847,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         n = len(units) * len(models)
         done = sum(is_done(stem_for(src, u, m), src, u) for u in units for m in models)
         rows.append((src.key, src.package, len(units), len(models), n, done, src.what, src.depends))
+        pm = ROOTS.pass_()
+        if pm is not None:
+            outside[src.key] = sorted(m for m in models if pm.cell_for(src.corpus, src.source, m) is None)
     print(f"fit-corpus manifest   durable: {ROOTS.durable}")
     print(f"{'corpus/source':22} {'pkg':9} {'units':>5} {'models':>6} {'cells':>7} {'done':>7} {'todo':>6}")
     print("-" * 72)
@@ -764,7 +861,33 @@ def cmd_plan(args: argparse.Namespace) -> int:
     print(f"{'TOTAL':22} {'':9} {'':5} {'':6} {tot[0]:7d} {tot[1]:7d} {tot[2]:6d}")
     for key, _, _, _, _, _, what, dep in rows:
         print(f"  {key}: {what}" + (f"  [depends: {dep}]" if dep else ""))
+    pm = ROOTS.pass_()
+    if pm is not None:
+        _plan_pass(pm, rows, outside, args)
     return 0
+
+
+def _plan_pass(pm: PassManifest, rows: list, outside: dict[str, list[str]], args: argparse.Namespace) -> None:
+    """The pass manifest against the driver: cells with no driver source yet, and
+    driver models the pass does not cover."""
+    driver = {key: models for key, models in
+              ((s.key, set(s.models)) for s in build_sources())}
+    print(f"\npass {pm.name} ({pm.path}, sha256 {pm.sha256[:12]}): {len(pm.cells)} cells"
+          + (f", frozen {pm.frozen}" if pm.frozen else ", not frozen")
+          + "; producers " + ", ".join(f"{k} {v}" for k, v in sorted(pm.producers.items())))
+    for c in pm.cells:
+        if args.corpus and c.corpus != args.corpus:
+            continue
+        if c.key not in driver:
+            state = "NO DRIVER SOURCE"
+        else:
+            unknown = sorted(set(c.models) - driver[c.key] - {"*"})
+            state = f"UNKNOWN MODEL(S) {', '.join(unknown)}" if unknown else "ok"
+        print(f"  {c.stage:6} {c.key:28} {','.join(c.models)[:40]:40} {state}"
+              + (f"  [deviation: {c.deviation}]" if c.deviation else ""))
+    for key, models in sorted(outside.items()):
+        if models:
+            print(f"  not in pass (carried if done; new extraction refused): {key} {', '.join(models)}")
 
 
 def cmd_inputs(args: argparse.Namespace) -> int:
@@ -952,6 +1075,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     cells = _filtered(args)
     todo = [(s, u, m) for s, u, m in cells if args.redo or not is_done(stem_for(s, u, m), s, u)]
     print(f"{len(cells)} cells matched: {len(todo)} to run, {len(cells) - len(todo)} already done")
+    pm = ROOTS.pass_()
+    refused: list[str] = []
+    if pm is None:
+        print("  no pass manifest (--pass-manifest / $PSYTWILL_PASS_MANIFEST): cells are not checked against a pass")
+    else:
+        allowed = []
+        for s_, u_, m_ in todo:
+            why = pass_problem(s_, u_, m_)
+            if why:
+                refused.append(f"{s_.key}/{m_}[{u_.id}]: {why}")
+            else:
+                allowed.append((s_, u_, m_))
+        todo = allowed
+        print(f"  pass {pm.name} ({pm.path}): {len(todo)} allowed, {len(refused)} refused")
+        for line in refused[:20]:
+            print(f"    REFUSED {line}")
+        if len(refused) > 20:
+            print(f"    ... and {len(refused) - 20} more")
     if not args.dry_run:
         problem = caption_vlm_gpu_problem({m for _, _, m in todo}, gpu_names())
         if problem:
@@ -1015,10 +1156,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             if args.fail_fast:
                 break
     if not args.dry_run:
-        print(f"\nDone: {n_ok} extracted, {n_fail} failed")
+        print(f"\nDone: {n_ok} extracted, {n_fail} failed" + (f", {len(refused)} refused by the pass" if refused else ""))
         for f in failures:
             print(f"  FAILED {f}")
-    return 1 if n_fail else 0
+    return 1 if n_fail or refused else 0
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -1450,6 +1591,8 @@ def main() -> int:
     ap.add_argument("--media-root")
     ap.add_argument("--framing-table")
     ap.add_argument("--nsd-hdf5")
+    ap.add_argument("--pass-manifest", help="the release's pass manifest (psytwill.passmanifest): `run` "
+                                            "refuses cells outside it; `plan` reports coverage")
     sub = ap.add_subparsers(dest="verb", required=True)
 
     def filters(p: argparse.ArgumentParser) -> None:

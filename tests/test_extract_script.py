@@ -75,18 +75,53 @@ def test_video_cell_without_table_refuses(tmp_path, monkeypatch):
         extract.command_for(src, unit, "clip")
 
 
-def test_video_cell_done_only_under_the_current_table(tmp_path, monkeypatch):
+_TABLE_COLS = "path,size_bytes,width,height,sar,crop_left,crop_right,crop_top,crop_bottom,box_source,error"
+
+
+def _boxed_table(tmp_path, rows, sha="f" * 64, name="framing_table.csv"):
+    """A framing table with real rows: {video path: (crop_left, crop_right, crop_top, crop_bottom)}."""
+    t = tmp_path / name
+    lines = [_TABLE_COLS] + [f"{Path(v).absolute()},1,720,480,0.888889,{l},{r},{tp},{bt},detector,"
+                             for v, (l, r, tp, bt) in rows.items()]
+    t.write_text("\n".join(lines) + "\n")
+    (tmp_path / (name + ".json")).write_text(f'{{"sha256": "{sha}"}}')
+    return t
+
+
+def _framed(crop=(6, 4, 0, 0), sha="old" * 8, **over):
+    rec = {"frame_source": "raw decode", "stage0_version": "1", "stored_wh": [720, 480], "pixel_aspect": 0.888889,
+           "crop": dict(zip(("left", "right", "top", "bottom"), crop)), "framing_table_sha256": sha}
+    rec.update(over)
+    return rec
+
+
+def test_video_cell_done_when_its_box_matches_the_current_table(tmp_path, monkeypatch):
     import json
 
-    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, _table(tmp_path, sha="new" * 8)), raising=False)
-    monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
     src, unit = _video_cell(tmp_path)
+    # a new table version (another sha) holding the same box for this file
+    table = _boxed_table(tmp_path, {unit.inputs[0]: (6, 4, 0, 0)}, sha="new" * 8)
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, table), raising=False)
+    monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
     stem = extract.stem_for(src, unit, "clip")
     stem.parent.mkdir(parents=True)
-    for sha, want in [("old" * 8, False), ("new" * 8, True), (None, False)]:
-        framing = {"frame_source": "raw decode"} if sha is None else {"framing_table_sha256": sha}
+    cases = [
+        (_framed(), True),  # the table sha differs, the box does not: still done
+        (_framed(crop=(6, 4, 1, 0)), False),  # the box moved
+        (_framed(stage0_version="0"), False),
+        (_framed(frame_source="decoded frames"), False),
+        (_framed(pixel_aspect=1.0), False),
+        (_framed(stored_wh=[640, 480]), False),
+        ({"frame_source": "raw decode"}, False),  # framed before stage 0 was recorded
+    ]
+    for framing, want in cases:
         extract.sidecar_for(stem).write_text(json.dumps({"input": {"type": "video", "framing": framing}}))
-        assert extract.is_done(stem, src, unit) is want
+        assert extract.is_done(stem, src, unit) is want, framing
+    # a file absent from the current table is not done
+    other = _boxed_table(tmp_path, {"/elsewhere.mkv": (6, 4, 0, 0)}, name="other.csv")
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, other), raising=False)
+    extract.sidecar_for(stem).write_text(json.dumps({"input": {"type": "video", "framing": _framed()}}))
+    assert extract.is_done(stem, src, unit) is False
     # non-video cells ignore framing
     assert extract.is_done(stem) is True
 
@@ -246,23 +281,29 @@ def test_video_set_cell_command(tmp_path, monkeypatch):
     assert cmd[cmd.index("--id-pattern") + 1] == "ext-avcaps-{stem}"
 
 
-def test_video_set_done_only_for_exactly_its_clips(tmp_path, monkeypatch):
+def test_video_set_done_only_for_exactly_its_clips_and_their_boxes(tmp_path, monkeypatch):
     import json
 
-    sha = "new" * 8
-    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, _table(tmp_path, sha=sha)), raising=False)
     monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
     tr = _avcaps_media(tmp_path, "train", ["10.mp4", "20.mp4"])
+    table = _boxed_table(tmp_path, {tr / "10.mp4": (0, 0, 0, 0), tr / "20.mp4": (0, 0, 8, 8)})
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path, table), raising=False)
     src = {s.key: s for s in extract.build_sources()}["avcaps/video"]
     unit = extract._avcaps_video_units()[0]
     stem = extract.stem_for(src, unit, "clip")
     stem.parent.mkdir(parents=True)
     a, b = str((tr / "10.mp4").resolve()), str((tr / "20.mp4").resolve())
-    for listed, table_sha, want in [([a, b], sha, True), ([a], sha, False), ([b, a], sha, False),
-                                    ([a, b], "old" * 8, False)]:
-        side = {"input": {"type": "video_set", "framing": {"framing_table_sha256": table_sha},
-                          "videos": [{"path": p} for p in listed]}}
-        extract.sidecar_for(stem).write_text(json.dumps(side))
+    box = {a: (0, 0, 0, 0), b: (0, 0, 8, 8)}
+    rule = {k: v for k, v in _framed().items() if k in ("frame_source", "stage0_version", "framing_table_sha256")}
+
+    def video(path, crop=None):
+        f = _framed(crop=crop or box[path])
+        return {"path": path, **{k: f[k] for k in ("stored_wh", "pixel_aspect", "crop")}}
+
+    for videos, want in [([video(a), video(b)], True), ([video(a)], False), ([video(b), video(a)], False),
+                         ([video(a), video(b, crop=(0, 0, 0, 0))], False)]:
+        extract.sidecar_for(stem).write_text(json.dumps({"input": {"type": "video_set", "framing": rule,
+                                                                   "videos": videos}}))
         assert extract.is_done(stem, src, unit) is want
 
 
@@ -354,7 +395,7 @@ def _per_item_corpus(tmp_path, monkeypatch, n=3, corpus="fma"):
         rows.append(f"x-{i},ext-{corpus}-x-{i},{wav},44100,30.0,1,30.0")
     (inputs / "units.csv").write_text("\n".join(rows) + "\n")
     (inputs / "layout.json").write_text('{"layout": "per-item"}')
-    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=durable, scratch=tmp_path / "scratch",
+    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=durable, scratch=tmp_path / "scratch", pass_=lambda: None,
                                                                 nsd_hdf5=None, media=None, framing_table=None),
                         raising=False)
     monkeypatch.setattr(extract, "check_sidecar", lambda sidecar, source: [])
@@ -616,7 +657,7 @@ def test_plan_counts_no_attached_cells_by_default(monkeypatch, capsys, tmp_path)
 
     attached = sorted(m for m, b in BATTERY.items() if b.attached)
     _one_source(monkeypatch, ["clip", *attached])
-    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=tmp_path), raising=False)
+    monkeypatch.setattr(extract, "ROOTS", types.SimpleNamespace(durable=tmp_path, pass_=lambda: None), raising=False)
     monkeypatch.setattr(extract, "is_done", lambda *a: False)
     assert extract.cmd_plan(_attached_args()) == 0
     row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("c/image"))
