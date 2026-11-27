@@ -3,6 +3,50 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.72.0 — 2026-11-27
+
+Minor: the corpus registry becomes typed bookkeeping, and a release records it
+(release schema 1.6). It is warn-only: no fit, relation, bench read or
+membership pass refuses on it.
+
+### Added
+- **Typed `fitcorpus.CorpusSpec` fields:**
+  - `licence` and `media` (`local` / `fetch` / `fetch-gated` / `manual`);
+  - `roles`, each a `Role(kind, product, split)` with kinds `fit` / `gate` /
+    `register` / `dev` / `bar` / `report` / `screen` / `brain`, and a
+    `member-training` role naming the probe or detector the corpus trained or
+    calibrated;
+  - per-member `training_overlap` (`none` / `present` (split) / `undisclosed` /
+    `unchecked`, with a `*` default);
+  - `dropped`, a reason: the key stays registered so minted ids still parse.
+
+  Checked at import.
+- **Registered:** `coco` (draws outside NSD), `tvc`, `vidor`, `song-describer`,
+  `paraspeechcaps`, `peterson`, `meadows`, `giordano`, `envisounds`,
+  `semeval-2022`, `semeval-2026` and `veatic`. `peoples-speech` and `jamendo`
+  are marked dropped.
+- **`psytwill.registry`:**
+  - the consumer's **usage file**, `<data root>/registry/usage.toml`. It holds
+    the corpus's overlap with the consumer's own stimuli, by grain (`recording`
+    / `stimulus` / `item` / `concept` / `none`), and per-split `read_by`
+    history. These are data, not code. A release with a data root needs the
+    file and names its path when it is missing;
+  - the uses a release's manifests show (block corpus rows, relation
+    registers);
+  - the conflict matrix as warnings: `undeclared-use`, `declared-not-used`,
+    `unregistered`, `dropped-used`, `unrecorded`, `dev-and-bar`, `same-rows`,
+    `bar-read`, `member-training`, `consumer-overlap`, `no-gate` / `gates`,
+    `training-overlap`. Analytic members (no checkpoint) are skipped for
+    training overlap.
+- **Release schema 1.6, `registry`:** the table, the usage file's path and
+  sha256, the uses, the analytic members and the warnings. `space release write`
+  takes `--registry-usage`. `write` and `verify` both print every warning, and
+  verify recomputes them from what the release recorded.
+
+### Changed
+- AVCaps's registry text now matches its use: V↔A fit (train), and A↔L / V↔L
+  coupling registers over every clip.
+
 ## 0.71.0 — 2026-11-27
 
 Minor: AVA becomes a fit corpus.

@@ -17,6 +17,7 @@ from psytwill.cli import main
 from psytwill.exceptions import SpaceError
 from psytwill.release import build_release, load_release, parse_absent, write_release
 from psytwill.relate import read_scores, relate_tables, save_relation
+from tests.conftest import write_usage
 
 
 def _block(tmp_path, block, X, ids, tag="v1"):
@@ -122,7 +123,7 @@ def test_member_windows_are_recorded_and_checked(tmp_path):
     ok = _new_block(tmp_path, "A", "stimulus_id,time",
                     {"clap": (10.0, "battery"), "pitch": ("grid", "battery"), "conv": ("event", "labels")})
     rel = build_release(name="sp", version="0.2.0", blocks=[ok])
-    assert rel["release_schema_version"] == "1.5"
+    assert rel["release_schema_version"] == "1.6"
     assert rel["blocks"]["A"]["member_windows"] == {"clap": 10.0, "pitch": "grid", "conv": "event"}
     bad = _new_block(tmp_path, "B", "stimulus_id,time", {"x": (None, "undeclared")})
     with pytest.raises(SpaceError, match="x: no window declared"):
@@ -164,6 +165,7 @@ def test_exclusion_lists_must_live_under_the_data_root(tmp_path):
     outside.write_text("ext-t-000\n")
     w = {"pitch": ("grid", "battery")}
     good = _new_block(tmp_path, "A", "stimulus_id,time", w, exclude_ids_file=str(inside))
+    write_usage(root)
     with pytest.raises(SpaceError, match="give the release a data root"):
         build_release(name="sp", version="0.2.0", blocks=[good])
     rel = build_release(name="sp", version="0.2.0", blocks=[good], data_root=root)
@@ -184,6 +186,7 @@ def test_cli_write_takes_a_data_root(tmp_path, capsys):
     root.mkdir()
     ids = root / "ids.txt"
     ids.write_text("ext-t-000\n")
+    write_usage(root)
     m = _new_block(tmp_path, "A", "stimulus_id,time", {"pitch": ("grid", "battery")}, exclude_ids_file=str(ids))
     assert main(["space", "release", "write", "--name", "sp", "--version", "0.2.0", "--blocks", str(m),
                  "--data-root", str(root), "-o", str(tmp_path / "rel")]) == 0
@@ -225,7 +228,7 @@ def _entry(**kw):
 def test_attached_members_are_pinned_and_verified(fitted, store):
     rel = build_release(name="sp", version="0.2.0", blocks=[fitted["P"]], attached_root=store,
                         attached=[_entry(), _entry(model="norms", basis="bar", columns=["norms_a"])])
-    assert rel["release_schema_version"] == "1.5"
+    assert rel["release_schema_version"] == "1.6"
     head, norms = rel["attached"]
     assert (head["n_cells"], head["columns"], head["package"]) == (2, ["head_x", "head_y"], "viz2psy")
     assert sorted(Path(f).name for f in head["files"]) == ["head.csv", "head.csv", "head.meta.json", "head.meta.json"]

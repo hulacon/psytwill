@@ -1596,7 +1596,8 @@ def _run_release_write(args: argparse.Namespace) -> None:
     rel = build_release(name=args.name, version=args.version, blocks=args.blocks, relations=args.relations or [],
                         absent=[parse_absent(a) for a in (args.absent or [])], note=args.note,
                         model_prefix=args.model_prefix, data_root=args.data_root,
-                        attached=attached, attached_root=attached_root)
+                        attached=attached, attached_root=attached_root,
+                        registry_usage=args.registry_usage)
     path = write_release(rel, args.output)
     if rel.get("labels"):
         print(f"  labels {path.parent / rel['labels']['table']}\n  columns {path.parent / rel['labels']['columns']}")
@@ -1607,6 +1608,16 @@ def _run_release_write(args: argparse.Namespace) -> None:
                   for x in rel["attached"]) or "none"
     print(f"psytwill space release {rel['name']} {rel['version']}: blocks {b}; relations {r}; absent {a}; "
           f"attached {t}\n  {path}")
+    _print_registry_warnings(rel["registry"]["warnings"])
+
+
+def _print_registry_warnings(warnings: list[str] | None) -> None:
+    if warnings is None:
+        print("  registry: none recorded (release schema < 1.6)")
+        return
+    print(f"  registry: {len(warnings)} warning(s)")
+    for w in warnings:
+        print(f"    WARN {w}")
 
 
 def _run_release_verify(args: argparse.Namespace) -> None:
@@ -1619,6 +1630,9 @@ def _run_release_verify(args: argparse.Namespace) -> None:
           + (f", {len(m['exclusions'])} exclusion lists" if m.get("exclusions") else "")
           + (f", {len(m['attached'])} attached" if m.get("attached") else "")
           + "; every pinned file matches")
+    from psytwill.registry import release_warnings
+
+    _print_registry_warnings(release_warnings(m))
 
 
 def _run_release_project(args: argparse.Namespace) -> None:
@@ -2348,6 +2362,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "baseline release takes its own, e.g. b0")
     rw.add_argument("--data-root", help="the fit-corpora directory: every exclusion file a pinned fit names must "
                                         "lie under it (required when any does); each is pinned by sha256")
+    rw.add_argument("--registry-usage", metavar="USAGE.toml",
+                    help="the consumer's corpus usage file (overlap with its stimuli, splits read); default "
+                         "<data root>/registry/usage.toml, which must exist when --data-root is given")
     rw.add_argument("--attached", metavar="SPEC.json",
                     help="attached members (opt-in producer features in no block): a JSON file "
                          "{\"root\": <stimulus feature store>, \"attached\": [{model, basis: bar|decided, gap, "

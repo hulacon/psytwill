@@ -42,3 +42,13 @@ def two_topic_frame():
         rows.append(base + rng.randn(16) * 0.05)
     labels = [f"s{i}/{'A' if i % 2 == 0 else 'B'}" for i in range(8)]
     return embedding_frame(rows, prefix="minilm", labels=labels)
+
+
+def write_usage(data_root, body: str = "") -> "Path":
+    """A consumer registry usage file at its default place under ``data_root``."""
+    from pathlib import Path
+
+    p = Path(data_root) / "registry" / "usage.toml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('usage_schema_version = "1.0"\n' + body)
+    return p

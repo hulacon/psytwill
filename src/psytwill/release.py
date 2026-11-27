@@ -33,6 +33,14 @@ without the bar. Keeping the two apart lets a reader tell "a gain at the
 uncorrected level" from "attached as an instrument". Every sidecar of the model
 under the entry's root, and every table of its family, is pinned by sha256, so
 ``release verify`` refuses a release whose attached tables changed.
+
+**Registry** (release schema 1.6). The release records the corpus registry it
+was written under: each corpus's declared roles, licence, media route and
+member training overlap (code), its overlap with the consumer's stimuli and
+its read history (the consumer's usage file under ``data_root``), the uses the
+pinned manifests show, and the conflict-matrix warnings
+(:mod:`psytwill.registry`). They are printed at write and at verify, and never
+refuse.
 """
 
 from __future__ import annotations
@@ -64,7 +72,11 @@ from psytwill.relate import RelationFit, load_relation, sha256_file
 #: 1.5: `attached` -- a list of attached members ({name, package, model, basis,
 #: gap, evidence, root, columns, n_columns_declared, n_cells, extractor_versions,
 #: files {path: sha256}}); see the module docstring.
-RELEASE_SCHEMA_VERSION = "1.5"
+#: 1.6: `registry` -- {usage_file, usage_sha256, corpora, uses, warnings}: the
+#: corpus registry table the release was written under (code facts + the
+#: consumer's usage file), the (corpus, product, kind) uses its manifests show,
+#: and the warnings of :func:`psytwill.registry.registry_warnings`. Warn-only.
+RELEASE_SCHEMA_VERSION = "1.6"
 #: The `basis` of an attached member: met the pre-registered bar, or attached by decision.
 ATTACHED_BASES = ("bar", "decided")
 #: Block / relation manifest fields that name an exclusion file.
@@ -237,7 +249,8 @@ def resolve_attached(entries: Sequence[dict], *, root: str | Path | None = None,
 def build_release(*, name: str, version: str, blocks: Sequence[str | Path], relations: Sequence[str | Path] = (),
                   absent: Sequence[tuple[Sequence[str], str]] = (), note: str | None = None,
                   model_prefix: str = "pspace", data_root: str | Path | None = None,
-                  attached: Sequence[dict] = (), attached_root: str | Path | None = None) -> dict:
+                  attached: Sequence[dict] = (), attached_root: str | Path | None = None,
+                  registry_usage: str | Path | None = None) -> dict:
     if not model_prefix.isidentifier() or model_prefix != model_prefix.lower():
         raise SpaceError(f"model prefix {model_prefix!r} must be a lower-case identifier (it names store models)")
     out: dict = {"release_schema_version": RELEASE_SCHEMA_VERSION, "name": name, "version": version,
@@ -248,6 +261,8 @@ def build_release(*, name: str, version: str, blocks: Sequence[str | Path], rela
                  "attached": []}
     by_sha: dict[str, str] = {}
     metas: list[tuple[str, dict]] = []
+    block_metas: dict[str, dict] = {}
+    relation_metas: dict[str, dict] = {}
     for path in blocks:
         meta, pin = _pinned(Path(path))
         if meta.get("kind", "block") != "block" or "block" not in meta:
@@ -261,6 +276,7 @@ def build_release(*, name: str, version: str, blocks: Sequence[str | Path], rela
                             "member_windows": member_windows(meta)}
         by_sha[pin["manifest_sha256"]] = b
         metas.append((str(path), meta))
+        block_metas[b] = meta
     pairs: set[frozenset] = set()
     for path in relations:
         meta, pin = _pinned(Path(path))
@@ -281,6 +297,7 @@ def build_release(*, name: str, version: str, blocks: Sequence[str | Path], rela
                                           "scope": meta.get("scope"), "fitted_with": meta.get("psytwill_version")}
         pairs.add(frozenset((sides["a"], sides["b"])))
         metas.append((str(path), meta))
+        relation_metas[meta["name"]] = meta
     for pair, evidence in absent:
         unknown = [b for b in pair if b not in out["blocks"]]
         if unknown:
@@ -291,6 +308,11 @@ def build_release(*, name: str, version: str, blocks: Sequence[str | Path], rela
     out["exclusions"] = _exclusions(metas, data_root)
     out["attached"] = resolve_attached(attached, root=attached_root,
                                        block_members=[m for b in out["blocks"].values() for m in b["members"]])
+    from psytwill.registry import record_registry
+
+    out["registry"] = record_registry(
+        block_metas, relation_metas, usage=registry_usage, data_root=data_root,
+        relation_sides={n: (e["a"], e["b"]) for n, e in out["relations"].items()})
     return out
 
 
