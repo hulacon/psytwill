@@ -126,6 +126,20 @@ CORPORA: dict[str, CorpusSpec] = {
                   "login (fetch.py blender)",
         ),
         CorpusSpec(
+            "ava",
+            tier="b",
+            serves="D rows (motion) and V<->A on live-action film: many titles, one 15-min "
+                   "segment each",
+            notes="AVA (Gu et al. 2018) minutes 15:00-30:00 of each film, from the CVDF "
+                  "mirror; third-party YouTube films, research use, never redistributed. "
+                  "Native id = 10 hex of sha1(YouTube id): YouTube ids are case-sensitive "
+                  "and may start with '-'. inputs/ids.csv maps native <-> YouTube id and "
+                  "declares each file's clock: the video keeps its original timestamps "
+                  "(first frame at the keyframe before 895 s), the audio starts at 900 s, "
+                  "so a frame at video time t sits at t + video_start_s - audio_start_s "
+                  "on the audio clock",
+        ),
+        CorpusSpec(
             "clotho",
             tier="a",
             serves="A<->L (audio-only captions: annotators heard the clip, saw nothing)",

@@ -3,6 +3,23 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.71.0 — 2026-11-27
+
+Minor: AVA becomes a fit corpus.
+
+### Added
+- **`fitcorpus.CORPORA["ava"]`** (tier b): AVA films, minutes 15:00–30:00, one
+  segment per film. Native id = 10 hex of sha1(YouTube id), because YouTube ids
+  are case-sensitive and may start with `-`.
+- **`extract.py` sources `ava/frames`** (every V model, `motion` included, no
+  `caption_vlm`) and **`ava/audio`** (the full A battery). Video and audio are
+  separate files under `<durable>/ava/inputs/{video,audio}/`, paired by YouTube id.
+- **`extract.py inputs` writes `ava/inputs/ids.csv`**: native ↔ YouTube id and
+  each film's declared clock. The video keeps its original timestamps (first
+  frame at the keyframe before 895 s) and the audio starts at 900 s, so a frame
+  at video time t sits at t + `video_start_s` − `audio_start_s` on the audio's
+  clock. Consumers pairing V and A rows must apply it.
+
 ## 0.70.1 — 2026-11-23
 
 Patch: two per-row Python loops vectorised. Results are unchanged, and each is

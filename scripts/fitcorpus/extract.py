@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -265,6 +266,79 @@ def _blender_media() -> list[Path]:
 #: CC-BY open movies (tier a, the animated wedge; DECIDED 2026-08-25, joined
 #: step 3 2026-11-09: the freely downloadable films only).
 VIDEO_CORPORA = ("movie10", "friends", "blender")
+
+
+#: AVA (a fit corpus from psytwill-space 0.3.0): one 15-min segment (15:00-30:00) per
+#: film, video and audio as separate files under ``<durable>/ava/inputs/{video,audio}/``,
+#: named by the YouTube id. The audio starts at 900 s on the film's clock; the video keeps
+#: its original timestamps, so its first frame sits at the keyframe before 895 s.
+AVA_AUDIO_START_S = 900.0
+
+
+def ava_native(youtube_id: str) -> str:
+    """AVA native id: 10 hex of sha1(YouTube id). YouTube ids are case-sensitive and may
+    start with '-', so they cannot be lowercased into the ext-id namespace."""
+    return hashlib.sha1(youtube_id.encode()).hexdigest()[:10]
+
+
+def _ava_media() -> list[tuple[str, Path, Path]]:
+    """(YouTube id, video, audio) for every film with both files present."""
+    root = ROOTS.durable / "ava" / "inputs"
+    if not (root / "video").is_dir() or not (root / "audio").is_dir():
+        return []
+    vids = {p.stem: p for p in (root / "video").iterdir()
+            if p.suffix.lower() in VIDEO_SUFFIXES and p.is_file()}
+    auds = {p.stem: p for p in (root / "audio").glob("*.flac") if p.is_file()}
+    return [(y, vids[y], auds[y]) for y in sorted(vids) if y in auds]
+
+
+def _ava_units(kind: str) -> list[Unit]:
+    """One unit per film; ``kind`` = "video" (V) or "audio" (A, the flac)."""
+    out = []
+    for yid, video, audio in _ava_media():
+        native = ava_native(yid)
+        out.append(Unit(
+            id=native,
+            out_dir=ROOTS.durable / "ava" / "features" / native,
+            inputs=[str(video if kind == "video" else audio)],
+            extra=["--stimulus-id", ext_id("ava", native)],
+        ))
+    return out
+
+
+def _video_start_s(path: Path) -> float:
+    """The container's first presentation time (ffprobe), in seconds."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=start_time",
+                        "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        sys.exit(f"ERROR: ffprobe could not read the start time of {path}: {r.stderr.strip()}")
+    return float(r.stdout.strip())
+
+
+def _ensure_ava_ids(force: bool = False) -> int:
+    """``ava/inputs/ids.csv``: native <-> YouTube id, and each film's declared clock.
+
+    A frame at video time t sits at t + video_start_s - audio_start_s on the audio's
+    clock (V and A pair on that clock). Written once; ``--force`` rewrites it."""
+    media = _ava_media()
+    out = ROOTS.durable / "ava" / "inputs" / "ids.csv"
+    if not media or (out.exists() and not force):
+        return 0
+    rows = []
+    for yid, video, audio in media:
+        native = ava_native(yid)
+        rows.append(dict(youtube_id=yid, native=native, stimulus_id=ext_id("ava", native),
+                         video=video.name, audio=audio.name,
+                         video_start_s=f"{_video_start_s(video):.6f}",
+                         audio_start_s=f"{AVA_AUDIO_START_S:.6f}"))
+    natives = [r["native"] for r in rows]
+    if len(set(natives)) != len(natives):
+        sys.exit("ERROR: AVA native ids collide (sha1 prefix); widen ava_native")
+    with out.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
 
 
 def _video_media(corpus: str) -> list[Path]:
@@ -483,6 +557,18 @@ def build_sources() -> list[Source]:
             lambda c=corpus: _video_transcript_units(c),
             depends=f"{corpus}/audio/transcribe",
         ))
+    S.append(Source(
+        "ava", "frames", "viz2psy", "", list(V_MODELS),
+        f"AVA films, minutes 15-30, frames every {GRID_HOP} s through the framing table "
+        f"(motion included; no {CAPTION_VLM})",
+        lambda: _ava_units("video"),
+    ))
+    S.append(Source(
+        "ava", "audio", "aud2psy", "", _ordered_audio(),
+        f"AVA soundtracks (flac, t 0 = 900 s on the film clock), {GRID_HOP} s hop; "
+        "diarize/transcribe run before the models that read their tables",
+        lambda: _ava_units("audio"),
+    ))
     for corpus, what in {**STAGED_CURATED, **STAGED_WHISPER, **STAGED_MUSIC}.items():
         S.append(Source(
             corpus, "audio", "aud2psy", "", _ordered_audio(),
@@ -709,6 +795,9 @@ def cmd_inputs(args: argparse.Namespace) -> int:
     for corpus in STAGED_WHISPER:
         n = sum(_ensure_transcript_input(corpus, u, force=args.force) for u in _staged_units(corpus))
         print(f"{corpus} transcripts: {n} input CSVs written")
+
+    n = _ensure_ava_ids(force=args.force)
+    print(f"ava ids + clocks: {n} rows written" if n else "ava ids + clocks: present (or no media)")
 
     # clip-corpus captions: stage.py's captions.csv, sharded per caption type
     for corpus, ctypes in CAPTION_TYPES.items():
