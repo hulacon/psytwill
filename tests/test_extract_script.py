@@ -122,6 +122,31 @@ def test_blender_runs_like_the_other_video_corpora():
     assert srcs["blender/transcript"].depends == "blender/audio/transcribe"
 
 
+def test_ava_units_pair_video_and_audio_by_youtube_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract, "ROOTS", _roots(tmp_path), raising=False)
+    inp = tmp_path / "durable" / "ava" / "inputs"
+    (inp / "video").mkdir(parents=True)
+    (inp / "audio").mkdir()
+    for name in ("-Ab_C1.mkv", "xYz.mp4", "noaudio.webm"):  # case-sensitive ids, a leading '-'
+        (inp / "video" / name).write_bytes(b"x")
+    for name in ("-Ab_C1.flac", "xYz.flac", "novideo.flac"):
+        (inp / "audio" / name).write_bytes(b"x")
+    v, a = extract._ava_units("video"), extract._ava_units("audio")
+    assert [u.id for u in v] == [u.id for u in a] == [extract.ava_native("-Ab_C1"), extract.ava_native("xYz")]
+    assert v[0].inputs == [str(inp / "video" / "-Ab_C1.mkv")]
+    assert a[0].inputs == [str(inp / "audio" / "-Ab_C1.flac")]
+    assert v[0].extra == ["--stimulus-id", f"ext-ava-{extract.ava_native('-Ab_C1')}"]
+    assert extract.ava_native("abc") != extract.ava_native("ABC")
+
+
+def test_ava_sources_are_v_with_motion_and_the_full_a_battery():
+    srcs = {s.key: s for s in extract.build_sources()}
+    assert "motion" in srcs["ava/frames"].models
+    assert extract.CAPTION_VLM not in srcs["ava/frames"].models
+    assert srcs["ava/audio"].models == srcs["movie10/audio"].models
+    assert not any(k.startswith("ava/") and k.split("/")[1] in ("transcript", "vlmcap") for k in srcs)
+
+
 # ---- caption_vlm wiring (psytwill-space 0.2.0 caption member) ----------------
 
 def _models_by_source():
