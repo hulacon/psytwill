@@ -34,8 +34,9 @@ Short-file corpora (speech, music, words) are first packed into units by
 `stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
 reads, and `<unit>_segments.csv` beside it maps unit time back to files.
 
-Per-item corpora (`stage.py --per-item`; `<corpus>/inputs/layout.json` says
-so) are thousands of short units, one item each. Their aud2psy cells run
+Per-recording corpora (`stage.py`'s layout since 0.3.0, rule C; the 0.2.x
+`--per-item` roots likewise; `<corpus>/inputs/layout.json` says so) are many
+short units, one recording each. Their aud2psy cells run
 batched: one `aud2psy --inputs-from` call per model per `--batch-items` units,
 each model loaded once, every unit still writing its own family and sidecar.
 Producers run first; a consumer's manifest row names its unit's stored
@@ -78,6 +79,7 @@ from pathlib import Path
 from psytwill.battery import BATTERY, check_sidecar
 from psytwill.fitcorpus import CORPORA, EXT_PREFIX, ext_id
 from psytwill.passmanifest import PassManifest, load_pass
+from psytwill.staging import ONE_RECORDING_LAYOUTS
 
 PY = sys.executable
 #: The stage-0 version a video cell must have been framed under to count as
@@ -121,11 +123,12 @@ BATCH_ITEMS = 500
 
 
 def _per_item_layout(corpus: str) -> bool:
-    """True when stage.py staged ``corpus`` one unit per item (its ``inputs/layout.json``)."""
+    """True when stage.py staged ``corpus`` one unit per recording (``per-recording``, or the 0.2.x
+    ``per-item``; its ``inputs/layout.json``)."""
     cache = _per_item_layout.cache  # type: ignore[attr-defined]
     if corpus not in cache:
         rec = ROOTS.durable / corpus / "inputs" / "layout.json"
-        cache[corpus] = rec.exists() and json.loads(rec.read_text()).get("layout") == "per-item"
+        cache[corpus] = rec.exists() and json.loads(rec.read_text()).get("layout") in ONE_RECORDING_LAYOUTS
     return cache[corpus]
 
 
@@ -1494,7 +1497,8 @@ def _frames_table(corpus: str) -> Path:
 
 
 def _table_layout(table: Path) -> str:
-    """``per-item`` or ``packed``: the staging record beside the table's corpus (absent = packed)."""
+    """``per-recording``, ``per-item`` or ``packed``: the staging record beside the table's corpus
+    (absent = packed)."""
     rec = table.parent.parent / "inputs" / "layout.json"
     return json.loads(rec.read_text()).get("layout", "packed") if rec.exists() else "packed"
 
@@ -1533,10 +1537,10 @@ def cmd_centre_rule(args: argparse.Namespace) -> int:
             sys.exit(f"ERROR: {table} records no segments; re-run `extract.py aggregate --corpus {corpus} "
                      "--redo`, or `psytwill features --refresh-segments <inputs dir>`")
         many = {sid: s["group"].nunique() for sid, s in segs.items() if s["group"].nunique() > 1}
-        if layout == "per-item" and many:
+        if layout in ONE_RECORDING_LAYOUTS and many:
             sid, n = next(iter(many.items()))
             sys.exit(f"ERROR: {corpus}: {len(many)} unit(s) hold more than one item (e.g. {sid}: {n} groups); "
-                     "a per-item unit holds one")
+                     f"a {layout} unit holds one")
         seen = []  # the table is long (a row per feature): de-duplicate the key batch by batch
         for batch in pq.ParquetFile(table).iter_batches(columns=key, batch_size=1 << 22):
             d = batch.to_pandas()

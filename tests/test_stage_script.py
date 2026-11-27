@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from psytwill.staging import pack_groups
+
 _SPEC = importlib.util.spec_from_file_location(
     "fitcorpus_stage", Path(__file__).parents[1] / "scripts" / "fitcorpus" / "stage.py")
 stage = importlib.util.module_from_spec(_SPEC)
@@ -98,7 +100,7 @@ class TestCaptions:
 
 def test_captioned_corpora_pack_with_the_wide_gap():
     seg = [stage.Segment(segment=f"c{k}", group=f"c{k}", duration=15.2) for k in range(2)]
-    unit = stage.pack_groups([(s.group, [s]) for s in seg], target=3600, hop=stage.HOP,
+    unit = pack_groups([(s.group, [s]) for s in seg], target=3600, hop=stage.HOP,
                              gap=stage.GAPS["clotho"])[0]
     assert unit.onsets[1] - unit.offsets[0] >= 10.0
 
@@ -202,10 +204,19 @@ def _stage_args(root, per_item, max_groups=None, **kw):
 
 
 def _stage(monkeypatch, root, items, per_item):
+    """Stage ``items`` as fma: per item (True), per recording (False), or ``"packed"`` (the 0.2.x
+    layout, which stage.py no longer stages: built here from the library, as a control)."""
     pytest.importorskip("soundfile")  # stage.write_unit writes wavs; CI installs psytwill's deps only
     monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter(items))
-    args = _stage_args(root, per_item)
-    rows = stage.stage_packed("fma", args)
+    if per_item == "packed":
+        args = _stage_args(root, False)
+        sr, plans, decode = stage.ADAPTERS["fma"](args)
+        units = [u for prefix, groups in plans
+                 for u in pack_groups(groups, target=3600, hop=stage.HOP, gap=stage.GAP, unit_prefix=prefix)]
+        rows = [stage.write_unit("fma", u, sr, decode, args) for u in units]
+    else:
+        args = _stage_args(root, per_item)
+        rows = stage.stage_recordings("fma", args)
     stage.write_manifest("fma", rows, args)
     return rows
 
@@ -253,7 +264,7 @@ class TestPerItemStaging:
         pytest.importorskip("soundfile")
         monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter([("a", A_ITEM), ("b", B_ITEM), ("c", C_ITEM)]))
         args = _stage_args(tmp_path, per_item=True, max_groups=2)
-        assert [r["unit"] for r in stage.stage_packed("fma", args)] == ["x-a", "x-b"]
+        assert [r["unit"] for r in stage.stage_recordings("fma", args)] == ["x-a", "x-b"]
         rec = json.loads((tmp_path / "durable" / "fma" / "inputs" / stage.LAYOUT_FILE).read_text())
         assert rec["max_groups"] == 2  # a pilot root is never mistaken for a full one
 
@@ -282,25 +293,136 @@ class TestWindowNearAnItemBoundary:
     def test_synthetic_window(self, tmp_path, monkeypatch):
         got = {}
         for neighbour, y in (("b", B_ITEM), ("c", C_ITEM)):
-            for per_item in (True, False):
+            for per_item in (True, "packed"):
                 rows = _stage(monkeypatch, tmp_path / f"{neighbour}-{per_item}", [("a", A_ITEM), (neighbour, y)],
                               per_item=per_item)
-                wav, c = self._last_row(rows, "x-a" if per_item else "x-000")
+                wav, c = self._last_row(rows, "x-a" if per_item is True else "x-000")
                 got[neighbour, per_item] = _centred_window_mean(wav, ITEM_SR, c, 3.0)
         assert got["b", True] == got["c", True]  # per item: the neighbour is never read
-        assert got["b", False] != got["c", False]  # packed: it is
+        assert got["b", "packed"] != got["c", "packed"]  # packed: it is
 
     def test_real_windowed_member(self, tmp_path, monkeypatch):
         """aud2psy's tonal (a 3 s centred chroma window) on the same layouts."""
         pipeline = pytest.importorskip("aud2psy.pipeline")
         got = {}
         for neighbour, y in (("b", B_ITEM), ("c", C_ITEM)):
-            for per_item in (True, False):
+            for per_item in (True, "packed"):
                 rows = _stage(monkeypatch, tmp_path / f"{neighbour}-{per_item}", [("a", A_ITEM), (neighbour, y)],
                               per_item=per_item)
-                path = next(r["path"] for r in rows if r["unit"] == ("x-a" if per_item else "x-000"))
+                path = next(r["path"] for r in rows if r["unit"] == ("x-a" if per_item is True else "x-000"))
                 frames = pipeline.score_audio(path, ["tonal"], hop=stage.HOP, show_progress=False).frames_df
                 got[neighbour, per_item] = frames[frames["time"] < 2.2].filter(like="tonal_").to_numpy(float)
         np.testing.assert_array_equal(got["b", True], got["c", True])
-        assert not np.allclose(got["b", False], got["c", False], equal_nan=True)
-        assert not np.allclose(got["b", True], got["b", False], equal_nan=True)
+        assert not np.allclose(got["b", "packed"], got["c", "packed"], equal_nan=True)
+        assert not np.allclose(got["b", True], got["b", "packed"], equal_nan=True)
+
+
+# ---- per recording (rule C, psytwill-space 0.3.0) and re-staging a packed root ----------------
+
+
+class TestPerRecordingStaging:
+    def test_the_default_layout_is_one_unit_per_recording(self, tmp_path, monkeypatch):
+        rows = _stage(monkeypatch, tmp_path, [("a", A_ITEM), ("b", B_ITEM)], per_item=False)
+        assert [r["unit"] for r in rows] == ["x-a", "x-b"]
+        assert all(Path(r["path"]).parent.name == "recordings" for r in rows)
+        rec = json.loads((tmp_path / "durable" / "fma" / "inputs" / stage.LAYOUT_FILE).read_text())
+        assert rec["layout"] == "per-recording" and "rule C" in rec["decided"]
+
+    def test_clip_corpora_use_the_clip_id(self):
+        assert stage.recording_id("clotho", "dev-", "dev-6e1c53a4f5") == "dev-6e1c53a4f5"
+        assert stage.recording_id("avcaps", "train-", "10023318885") == "10023318885"
+        assert stage.recording_id("librispeech", "spk103-", "1240") == "spk103-1240"
+        assert stage.recording_id("gigaspeech", "pod-", "POD0000000004") == "pod-pod0000000004"
+
+    def test_packed_prefix(self):
+        assert stage.packed_prefix("spk103-000") == "spk103-"
+        with pytest.raises(SystemExit):
+            stage.packed_prefix("x-a")
+
+
+def _packed_root(tmp_path, monkeypatch, items, name="old"):
+    """A packed fma root: every item in one unit x-000, plus a lone item in x-001."""
+    pytest.importorskip("soundfile")
+    root = tmp_path / name
+    monkeypatch.setitem(stage.ADAPTERS, "fma", _item_adapter(items))
+    args = _stage_args(root, False)
+    sr, plans, decode = stage.ADAPTERS["fma"](args)
+    groups = plans[0][1]
+    units = pack_groups(groups[:-1], target=3600, hop=stage.HOP, gap=stage.GAP, unit_prefix="x-")
+    units += [stage.layout_unit("x-001", groups[-1][1], hop=stage.HOP, gap=stage.GAP)]
+    rows = [stage.write_unit("fma", u, sr, decode, args) for u in units]
+    stage.write_manifest("fma", rows, args)
+    tr = root / "durable" / "fma" / "inputs" / "x-000_transcript.csv"  # a transcript for the shift check
+    seg = list(csv.DictReader(open(root / "durable" / "fma" / "inputs" / "x-000_segments.csv")))
+    tr.write_text("stimulus_id,text,onset,offset\n" + "".join(
+        f"ext-fma-x-000,word {r['group']},{r['onset']},{r['offset']}\n" for r in seg))
+    return root
+
+
+def _restage_args(tmp_path, old, new="new", **kw):
+    return argparse.Namespace(scratch_root=tmp_path / new / "scratch", durable_root=tmp_path / new / "durable",
+                              restage_from=old / "durable", dry_run=False, force=False, per_item=False, **kw)
+
+
+class TestRestage:
+    ITEMS = [("a", A_ITEM), ("b", B_ITEM), ("c", C_ITEM)]
+
+    def test_split_units_are_exact_slices_and_lone_units_stay(self, tmp_path, monkeypatch):
+        old = _packed_root(tmp_path, monkeypatch, self.ITEMS)
+        args = _restage_args(tmp_path, old)
+        rows = stage.restage("fma", args)
+        stage.write_manifest("fma", rows, args)
+        assert [r["unit"] for r in rows] == ["x-a", "x-b", "x-001"]
+        new_in = tmp_path / "new" / "durable" / "fma" / "inputs"
+        m = list(csv.DictReader(open(new_in / stage.RECORDING_MAP)))
+        assert [(r["new_unit"], r["old_unit"], r["unchanged"]) for r in m] == [
+            ("x-a", "x-000", "false"), ("x-b", "x-000", "false"), ("x-001", "x-001", "true")]
+        old_wav = _read_wav(next(r["path"] for r in csv.DictReader(open(old / "durable" / "fma" / "inputs" /
+                                                                         "units.csv")) if r["unit"] == "x-000"))
+        for r in m[:2]:
+            new = _read_wav(next(x["path"] for x in rows if x["unit"] == r["new_unit"]))
+            a = int(round(float(r["shift_sec"]) * ITEM_SR))
+            np.testing.assert_array_equal(new, old_wav[a:a + len(new)])  # sample-exact
+        assert float(m[1]["shift_sec"]) > 0
+        seg_b = list(csv.DictReader(open(new_in / "x-b_segments.csv")))
+        assert seg_b[0]["stimulus_id"] == "ext-fma-x-b" and float(seg_b[0]["onset"]) == 0.0
+        assert seg_b[0]["genre"] == "test"
+        tr_b = list(csv.DictReader(open(new_in / "x-b_transcript.csv")))
+        assert tr_b == [{"stimulus_id": "ext-fma-x-b", "text": "word b", "onset": "0.000",
+                         "offset": seg_b[0]["offset"]}]
+        lone = next(r for r in rows if r["unit"] == "x-001")
+        assert "/old/" in lone["path"]  # the packed wav, read in place
+        rec = json.loads((new_in / stage.LAYOUT_FILE).read_text())
+        assert rec["layout"] == "per-recording" and rec["recording_map"] == stage.RECORDING_MAP
+
+    def test_a_split_unit_matches_a_fresh_per_recording_staging(self, tmp_path, monkeypatch):
+        old = _packed_root(tmp_path, monkeypatch, self.ITEMS)
+        rows = stage.restage("fma", _restage_args(tmp_path, old))
+        fresh = _stage(monkeypatch, tmp_path / "fresh", self.ITEMS[:2], per_item=False)
+        for unit in ("x-a", "x-b"):
+            r = next(x for x in rows if x["unit"] == unit)
+            f = next(x for x in fresh if x["unit"] == unit)
+            assert r["duration_sec"] == f["duration_sec"]
+            np.testing.assert_allclose(_read_wav(r["path"]), _read_wav(f["path"]), atol=1 / 32768)
+
+    def test_refusals(self, tmp_path, monkeypatch):
+        old = _packed_root(tmp_path, monkeypatch, self.ITEMS)
+        with pytest.raises(SystemExit, match="same root"):
+            stage.restage("fma", argparse.Namespace(**{**vars(_restage_args(tmp_path, old)),
+                                                       "durable_root": old / "durable"}))
+        rows = stage.restage("fma", _restage_args(tmp_path, old))
+        stage.write_manifest("fma", rows, _restage_args(tmp_path, old))
+        with pytest.raises(SystemExit, match="already staged"):
+            stage.restage("fma", _restage_args(tmp_path, old))
+        with pytest.raises(SystemExit, match="reads a packed root"):
+            stage.restage("fma", _restage_args(tmp_path, tmp_path / "new", new="newer"))
+        (old / "durable" / stage.HELDOUT_MARKER).write_text("")
+        with pytest.raises(SystemExit, match="marker"):
+            stage.restage("fma", _restage_args(tmp_path, old, new="third"))
+
+    def test_dry_run_writes_nothing(self, tmp_path, monkeypatch, capsys):
+        old = _packed_root(tmp_path, monkeypatch, self.ITEMS)
+        args = argparse.Namespace(**{**vars(_restage_args(tmp_path, old)), "dry_run": True})
+        assert stage.restage("fma", args) == []
+        assert not (tmp_path / "new").exists()
+        assert "2 packed units -> 3 per-recording units (1 split, 1 unchanged)" in capsys.readouterr().out

@@ -3,6 +3,43 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.74.0 — 2026-11-27
+
+Minor: one extraction file per recording (rule C). Packing retires.
+
+### Changed
+- **`stage.py` stages one unit per recording**, layout `per-recording` in
+  `inputs/layout.json`, wavs under `<scratch>/<corpus>/recordings/`. A
+  recording is the staging group: a clip, a chapter, an episode, a track, a
+  movement, a word.
+  - Unit ids are `<prefix><group>` (e.g. `spk103-1240`). Clip corpora (clotho,
+    avcaps) use the clip's own id, so a unit's `stimulus_id` is the clip's,
+    and the caption tables join on it.
+  - Packing several recordings into a unit is no longer staged, and
+    `--target-minutes` is gone. `pack_groups` stays in the library, and
+    packed roots on disk still read as before.
+  - `--per-item` still stages into a 0.2.x per-item root (the older name for
+    the same layout).
+- **`extract.py`** treats `per-recording` as it treats `per-item`: batched
+  aud2psy calls, and the centre rule's one-group-per-unit check.
+
+### Added
+- **`staging.split_recordings`** re-stages one packed unit as per-recording
+  units. Each is checked to be laid out exactly as `item_units` would lay it
+  out, so old time `t` is new time `t − shift`. A one-group unit stays as it
+  is, unless `keep_single=False`. `staging.ONE_RECORDING_LAYOUTS` names the
+  layouts.
+- **`stage.py <corpus> --restage-from OLD_DURABLE`** re-stages a packed root
+  into fresh roots:
+  - split units are cut sample-exactly from the packed wav, with their
+    segment and transcript rows shifted and re-keyed;
+  - units holding one recording are kept (clip corpora excepted);
+  - captions are copied;
+  - held-out markers must agree;
+  - `inputs/recording_map.csv` (new ↔ old unit and stimulus id, group,
+    `shift_sec`, `unchanged`) is written. It is the join that lets unwindowed
+    features carry from the packed extraction.
+
 ## 0.73.0 — 2026-11-27
 
 Minor: the pass manifest, and framing parity on each file's box.
