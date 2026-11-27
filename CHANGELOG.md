@@ -3,6 +3,37 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.73.0 — 2026-11-27
+
+Minor: the pass manifest, and framing parity on each file's box.
+
+### Added
+- **`psytwill.passmanifest`:** one declared extraction pass per release. A
+  TOML lists every cell (corpus × source × models), each with:
+  - its stage (`pass` / `screen` / `top-up`);
+  - the log entry that decided it;
+  - its producer version pin;
+  - optionally, a sha-pinned unit subset (required for screens).
+
+  A cell added after `frozen` must carry a dated `deviation`.
+  `PassManifest.record()` is what a release will record.
+- **`extract.py --pass-manifest`** (or `$PSYTWILL_PASS_MANIFEST`):
+  - `run` refuses cells outside the pass, units outside a cell's pinned
+    subset, and a producer whose installed version is off its pin. Each
+    refused cell is listed, and the exit code is non-zero.
+  - `plan` reports every pass cell against the driver (`ok` / `NO DRIVER
+    SOURCE` / unknown models), and the driver cells the pass does not cover.
+  - Without a manifest, `run` says so and runs as before.
+
+### Changed
+- **`extract.py is_done` compares each video file's box, not the framing
+  table's sha** (fit ↔ projection framing parity, per file). A video cell is
+  done when its sidecar's stage-0 version and frame source match, and each
+  file's crop, pixel aspect and stored size match that file's row in the
+  current framing table. A new table version that keeps a file's box no
+  longer re-extracts it. A file absent from the table is not done. Done
+  counts are unchanged on the existing framed corpora.
+
 ## 0.72.0 — 2026-11-27
 
 Minor: the corpus registry becomes typed bookkeeping, and a release records it
