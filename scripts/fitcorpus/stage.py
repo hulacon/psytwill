@@ -2,13 +2,17 @@
 """Stage short-file audio corpora into extraction units (psytwill-space).
 
 The fit-corpus driver (`extract.py`) runs the aud2psy battery one *unit*
-per cell — one media file in, one feature family out. Speech and music
-corpora arrive as thousands of short files, so this verb packs them into
-grid-aligned units (`psytwill.staging`): files concatenated in a fixed
-order with a silence gap, each starting on the 0.5 s frame grid, and a
-segments table saying where every original file sits. The extractors see
-one wav per unit and nothing else; downstream pooling recovers the files
-from the table.
+per cell — one media file in, one feature family out. **One unit is one
+recording** (rule C, psytwill-space 0.3.0, DECIDED 2026-11-25): a clip, a
+chapter, a podcast episode, a track, a movement, a word. A recording's files
+are laid end to end with a silence gap, each starting on the 0.5 s frame grid,
+and a segments table says where every original file sits. Packing several
+recordings into one unit is no longer staged: windowed members must clamp at
+the recording's own edges, never read the next one.
+
+Unit ids: `<prefix><group>` (e.g. `spk103-1240`, a LibriSpeech speaker's
+chapter). The clip corpora (clotho, avcaps) use the clip's own native id, so
+the unit's `stimulus_id` is the clip's, and the caption tables join on it.
 
     stage.py librispeech      --scratch-root R --durable-root D [--split train-clean-100]
     stage.py gigaspeech       ... [--budget-hours 40]
@@ -19,7 +23,9 @@ from the table.
     stage.py clotho           ...   (dev + eval clips; also writes captions.csv)
     stage.py avcaps           ...   (MP4 soundtracks; also writes captions.csv)
     stage.py avcaps --frames  ...   (V frames as PNG, viz2psy's own sampler; see below)
-    stage.py fma --per-item   ...   (one clip per item, no packing; twp-unpresented, fma, musopen)
+    stage.py fma --per-item   ...   (into a root already staged per item, the 0.2.x name for per recording)
+    stage.py librispeech --restage-from OLD_DURABLE --durable-root NEW --scratch-root NEW_SCRATCH
+                                    (re-stage a packed root per recording; see below)
 
 Writes (idempotent; a unit whose wav and tables exist is skipped unless
 --force):
@@ -55,6 +61,22 @@ records the layout; extract.py reads it to batch the many short units. A
 durable root holds one layout per corpus: stage per item into a fresh root,
 never over a packed one.
 
+Re-staging a packed root (`--restage-from`): every unit of an existing packed
+staging is split into its recordings (`psytwill.staging.split_recordings`),
+written into a fresh durable / scratch root:
+
+- a unit holding one recording is kept as it is: same id, wav (read in
+  place) and tables. Clip corpora are the exception: their unit id is the
+  clip's own, so a lone clip is re-laid out and renamed like the rest;
+- a unit holding several is cut sample-exactly from its packed wav, one wav
+  per recording. Its segments and transcript rows are shifted to the new
+  unit's time and keyed by the new `stimulus_id`;
+- `<durable>/<corpus>/inputs/recording_map.csv` records, per new unit, the
+  old unit and stimulus id, the group and the `shift_sec` (old time = new
+  time + shift) and whether it was `unchanged`. Unwindowed features of the
+  packed extraction carry onto the new units through it; only windowed
+  members need extracting again.
+
 Held-out LibriSpeech (`--split test-clean` / `test-other`): staged exactly as
 the fit split, but only into a durable root that holds a `HELDOUT` marker file,
 and the fit split never into one. A held-out root is laid out like the fit
@@ -89,14 +111,13 @@ from psytwill.staging import (
     Unit,
     item_units,
     layout_unit,
+    split_recordings,
     normalize_gigaspeech_text,
     normalize_librispeech_text,
-    pack_groups,
 )
 
 HOP = 0.5
 GAP = 0.5
-TARGET_MIN = 25.0  # minutes of audio per packed unit (≈ one CNeuroMod segment ×2)
 
 # A packed unit carries the corpus's native rate; speech corpora are 16 kHz
 # (LibriSpeech, GigaSpeech), music 44.1 kHz, the twp recordings 24 kHz.
@@ -114,6 +135,24 @@ GAPS = {"clotho": 10.0, "avcaps": 10.0}
 # "re-extract per item", DECIDED 2026-11-13): a word, a track, a movement.
 PER_ITEM_CORPORA = ("twp-unpresented", "fma", "musopen")
 LAYOUT_FILE = "layout.json"  # in <durable>/<corpus>/inputs/; absent = packed
+RECORDING_MAP = "recording_map.csv"  # in <durable>/<corpus>/inputs/ of a re-staged root
+#: Corpora whose group key is already the clip's native id: the unit id is the
+#: key itself, so the unit's stimulus_id is the clip's (captions join on it).
+CLIP_ID_CORPORA = ("clotho", "avcaps")
+DECIDED = "rule C, one file per recording: psytwill-space 0.3.0 class 3b, DECIDED 2026-11-25"
+
+
+def recording_id(corpus: str, prefix: str, group: str) -> str:
+    """The per-recording unit id for one group: the clip's id, or ``<prefix><group>``."""
+    return slug(group) if corpus in CLIP_ID_CORPORA else f"{prefix}{slug(group)}"
+
+
+def packed_prefix(unit: str) -> str:
+    """The plan prefix of a packed unit id ``<prefix><k:03d>`` (``spk103-000`` -> ``spk103-``)."""
+    head, sep, tail = unit.rpartition("-")
+    if not sep or not tail.isdigit():
+        sys.exit(f"ERROR: {unit!r} is not a packed unit id (<prefix>-<k>)")
+    return head + "-"
 
 
 def staged_layout(corpus: str, durable_root: Path) -> str | None:
@@ -126,11 +165,12 @@ def staged_layout(corpus: str, durable_root: Path) -> str | None:
 
 
 def check_layout(corpus: str, args) -> str:
-    """The layout to stage, refusing per-item for other corpora and a second layout in one root."""
-    want = "per-item" if getattr(args, "per_item", False) else "packed"
+    """The layout to stage (per recording; ``per-item`` into a 0.2.x per-item root), refusing a
+    second layout in one root."""
+    want = "per-item" if getattr(args, "per_item", False) else "per-recording"
     if want == "per-item" and corpus not in PER_ITEM_CORPORA:
-        sys.exit(f"ERROR: --per-item is for the packed short-item corpora {', '.join(PER_ITEM_CORPORA)} "
-                 f"(DECIDED 2026-11-13); {corpus} is staged packed")
+        sys.exit(f"ERROR: --per-item is for the 0.2.x per-item corpora {', '.join(PER_ITEM_CORPORA)}; "
+                 f"{corpus} is staged per recording (the default)")
     have = staged_layout(corpus, args.durable_root)
     if have is not None and have != want:
         sys.exit(f"ERROR: {args.durable_root / corpus / 'inputs'} is staged {have}; a root holds one layout "
@@ -667,7 +707,7 @@ def write_unit(corpus: str, unit: Unit, sr: int, decode, args) -> dict:
     import soundfile as sf
 
     sid = ext_id(corpus, unit.unit)
-    media_dir = "items" if getattr(args, "per_item", False) else "units"  # never mix the two layouts' wavs
+    media_dir = "items" if getattr(args, "per_item", False) else "recordings"  # never mix layouts' wavs
     wav = args.scratch_root / corpus / media_dir / f"{unit.unit}.wav"
     inputs = args.durable_root / corpus / "inputs"
     seg_csv = inputs / f"{unit.unit}_segments.csv"
@@ -706,7 +746,7 @@ def write_unit(corpus: str, unit: Unit, sr: int, decode, args) -> dict:
     return row
 
 
-def stage_packed(corpus: str, args) -> list[dict]:
+def stage_recordings(corpus: str, args) -> list[dict]:
     layout = check_layout(corpus, args)
     sr, plans, decode = ADAPTERS[corpus](args)
     units: list[Unit] = []
@@ -717,24 +757,24 @@ def stage_packed(corpus: str, args) -> list[dict]:
         if layout == "per-item":
             units.extend(item_units(groups, hop=HOP, gap=GAPS.get(corpus, GAP), unit_prefix=prefix))
         else:
-            units.extend(pack_groups(groups, target=args.target_minutes * 60, hop=HOP,
-                                     gap=GAPS.get(corpus, GAP), unit_prefix=prefix))
+            units.extend(item_units(groups, hop=HOP, gap=GAPS.get(corpus, GAP),
+                                    unit_id=lambda g, p=prefix: recording_id(corpus, p, g)))
     audio_h = sum(s.duration for u in units for s in u.segments) / 3600
     print(f"{corpus}: {len(units)} units ({layout}), {sum(len(u.segments) for u in units)} segments, "
-          f"{audio_h:.2f} h of audio, {sr} Hz"
-          + ("" if layout == "per-item" else f", target {args.target_minutes:g} min/unit"))
+          f"{audio_h:.2f} h of audio, {sr} Hz")
     if args.dry_run:
         for u in units[:5]:
             print(f"  {u.unit}: {len(u.segments)} segments, {u.duration / 60:.1f} min")
         return []
-    if layout == "per-item":
-        inputs = args.durable_root / corpus / "inputs"
-        inputs.mkdir(parents=True, exist_ok=True)
-        (inputs / LAYOUT_FILE).write_text(json.dumps({
-            "layout": "per-item", "hop": HOP, "gap_within_item": GAPS.get(corpus, GAP),
-            "trailing_gap": 0.0, "media_dir": str(args.scratch_root / corpus / "items"),
-            "max_groups": max_groups,
-            "decided": "E5 re-extract per item, psytwill-space-next 2026-11-13"}, indent=1) + "\n")
+    inputs = args.durable_root / corpus / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    (inputs / LAYOUT_FILE).write_text(json.dumps({
+        "layout": layout, "hop": HOP, "gap_within_item": GAPS.get(corpus, GAP),
+        "trailing_gap": 0.0, "media_dir": str(args.scratch_root / corpus / ("items" if layout == "per-item"
+                                                                             else "recordings")),
+        "max_groups": max_groups,
+        "decided": "E5 re-extract per item, psytwill-space-next 2026-11-13" if layout == "per-item" else DECIDED},
+        indent=1) + "\n")
     rows = []
     for k, u in enumerate(units, 1):
         rows.append(write_unit(corpus, u, sr, decode, args))
@@ -776,6 +816,130 @@ def stage_narratives(args) -> list[dict]:
     return rows
 
 
+def _read_csv(path: Path) -> list[dict]:
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
+    tmp = path.with_name(path.name + ".part")
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    tmp.rename(path)
+
+
+def restage(corpus: str, args) -> list[dict]:
+    """Re-stage the packed staging under ``--restage-from`` per recording (see the module doc)."""
+    import soundfile as sf
+
+    old = args.restage_from
+    have = staged_layout(corpus, old)
+    if have != "packed":
+        sys.exit(f"ERROR: {old / corpus / 'inputs'} is staged {have or 'nothing'}; --restage-from reads a packed root")
+    if old.resolve() == args.durable_root.resolve():
+        sys.exit("ERROR: --restage-from and --durable-root are the same root")
+    if staged_layout(corpus, args.durable_root) is not None:
+        sys.exit(f"ERROR: {args.durable_root / corpus / 'inputs'} is already staged; re-stage into a fresh root")
+    if (old / HELDOUT_MARKER).is_file() != (args.durable_root / HELDOUT_MARKER).is_file():
+        sys.exit(f"ERROR: {old} and {args.durable_root} disagree on the {HELDOUT_MARKER} marker; a held-out "
+                 "staging re-stages only into a held-out root, and a fit staging never into one")
+    old_in, new_in = old / corpus / "inputs", args.durable_root / corpus / "inputs"
+    gap = GAPS.get(corpus, GAP)
+    units = _read_csv(old_in / "units.csv")
+    plan = []
+    for u in units:
+        segs = _read_csv(old_in / f"{u['unit']}_segments.csv")
+        pre = packed_prefix(u["unit"])
+        try:
+            pieces = split_recordings(u["unit"], segs, unit_id=lambda g, p=pre: recording_id(corpus, p, g),
+                                      old_duration=float(u["duration_sec"]), hop=HOP, gap=gap,
+                                      keep_single=corpus not in CLIP_ID_CORPORA)
+        except ValueError as exc:
+            sys.exit(f"ERROR: {corpus}: {exc}")
+        plan.append((u, segs, pieces))
+    n_new = sum(len(p) for _, _, p in plan)
+    n_split = sum(1 for _, _, p in plan if not p[0].unchanged)
+    ids = [pc.new_unit for _, _, p in plan for pc in p]
+    if len(set(ids)) != len(ids):
+        dup = sorted({i for i in ids if ids.count(i) > 1})
+        sys.exit(f"ERROR: {corpus}: {len(dup)} recording(s) occur in more than one packed unit (e.g. {dup[0]})")
+    print(f"{corpus}: {len(units)} packed units -> {n_new} per-recording units "
+          f"({n_split} split, {len(units) - n_split} unchanged)")
+    if args.dry_run:
+        for u, _, p in plan[:5]:
+            print(f"  {u['unit']} -> " + ", ".join(f"{pc.new_unit}@{pc.shift:g}" for pc in p[:4])
+                  + (" ..." if len(p) > 4 else ""))
+        return []
+    new_in.mkdir(parents=True, exist_ok=True)
+    rows, mrows = [], []
+    for u, segs, pieces in plan:
+        old_sid = u["stimulus_id"]
+        tr_old = old_in / f"{u['unit']}_transcript.csv"
+        tr_rows = _read_csv(tr_old) if tr_old.exists() else []
+        for pc in pieces:
+            sid = ext_id(corpus, pc.new_unit)
+            mrows.append({"new_unit": pc.new_unit, "new_stimulus_id": sid, "old_unit": u["unit"],
+                          "old_stimulus_id": old_sid, "group": pc.group, "shift_sec": f"{pc.shift:.3f}",
+                          "duration_sec": f"{pc.duration:.3f}", "n_segments": len(pc.segments),
+                          "unchanged": str(pc.unchanged).lower()})
+            seg_new, tr_new = new_in / f"{pc.new_unit}_segments.csv", new_in / f"{pc.new_unit}_transcript.csv"
+            if pc.unchanged:
+                if not seg_new.exists() or args.force:
+                    _write_csv(seg_new, segs, list(segs[0]))
+                if tr_rows and (not tr_new.exists() or args.force):
+                    _write_csv(tr_new, tr_rows, list(tr_rows[0]))
+                rows.append({**u, "sr": int(u["sr"]), "duration_sec": float(u["duration_sec"]),
+                             "n_segments": int(u["n_segments"]), "audio_sec": float(u["audio_sec"])})
+                continue
+            wav_old = Path(u["path"])
+            sr = int(u["sr"])
+            wav_new = args.scratch_root / corpus / "recordings" / f"{pc.new_unit}.wav"
+            if not wav_new.exists() or args.force:
+                if not wav_old.exists():
+                    sys.exit(f"ERROR: packed wav {wav_old} is missing (scratch purge?); re-stage the packed "
+                             "root from its sources first, or stage this corpus per recording from scratch")
+                a, n = int(round(pc.shift * sr)), int(round(pc.duration * sr))
+                y, file_sr = sf.read(str(wav_old), start=a, stop=a + n, dtype="int16", always_2d=False)
+                if file_sr != sr:
+                    sys.exit(f"ERROR: {wav_old} is {file_sr} Hz, its manifest says {sr}")
+                if len(y) < n:  # the packed unit's last recording can end at the file's end
+                    y = np.concatenate([y, np.zeros(n - len(y), dtype=y.dtype)])
+                wav_new.parent.mkdir(parents=True, exist_ok=True)
+                tmp = wav_new.with_suffix(".wav.part")
+                sf.write(str(tmp), y, sr, format="WAV", subtype="PCM_16")
+                tmp.rename(wav_new)
+            mine = set(pc.segments)
+            seg_rows = []
+            for r in segs:
+                if r["segment"] in mine:
+                    on, off = float(r["onset"]) - pc.shift, float(r["offset"]) - pc.shift
+                    seg_rows.append({**r, "stimulus_id": sid, "onset": f"{on:.3f}", "offset": f"{off:.3f}"})
+            _write_csv(seg_new, seg_rows, list(segs[0]))
+            lo, hi = pc.shift, pc.shift + pc.duration
+            mine_tr = [{**r, "stimulus_id": sid, "onset": f"{float(r['onset']) - lo:.3f}",
+                        "offset": f"{float(r['offset']) - lo:.3f}"}
+                       for r in tr_rows if lo - 1e-6 <= float(r["onset"]) < hi]
+            if mine_tr:
+                _write_csv(tr_new, mine_tr, list(tr_rows[0]))
+            rows.append({"unit": pc.new_unit, "stimulus_id": sid, "path": str(wav_new), "sr": sr,
+                         "duration_sec": round(pc.duration, 3), "n_segments": len(pc.segments),
+                         "audio_sec": round(sum(float(r["duration"]) for r in seg_rows), 3)})
+    _write_csv(new_in / RECORDING_MAP, mrows, list(mrows[0]))
+    (new_in / LAYOUT_FILE).write_text(json.dumps({
+        "layout": "per-recording", "hop": HOP, "gap_within_item": gap, "trailing_gap": 0.0,
+        "media_dir": str(args.scratch_root / corpus / "recordings"),
+        "restaged_from": str((old / corpus).resolve()), "recording_map": RECORDING_MAP,
+        "note": "units holding one recording are kept as they are (same id, wav, tables, trailing gap)",
+        "decided": DECIDED}, indent=1) + "\n")
+    for name in ("captions.csv", "captions_dropped.csv"):  # keyed by clip id, unchanged by the re-stage
+        if (old_in / name).exists() and not (new_in / name).exists():
+            (new_in / name).write_bytes((old_in / name).read_bytes())
+    print(f"wrote {new_in / RECORDING_MAP} ({len(mrows)} rows)")
+    return rows
+
+
 def write_manifest(corpus: str, rows: list[dict], args) -> None:
     out = args.durable_root / corpus / "inputs" / "units.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -795,7 +959,9 @@ def main() -> int:
     ap.add_argument("--split", choices=LIBRISPEECH_SPLITS, default=LIBRISPEECH_FIT_SPLIT,
                     help="librispeech only: the subset to stage; a held-out split needs a durable "
                          f"root holding a {HELDOUT_MARKER} file")
-    ap.add_argument("--target-minutes", type=float, default=TARGET_MIN)
+    ap.add_argument("--restage-from", default=None, metavar="OLD_DURABLE",
+                    help="re-stage the packed staging of this corpus under OLD_DURABLE one unit per recording, "
+                         "into --durable-root / --scratch-root (fresh roots); writes recording_map.csv")
     ap.add_argument("--budget-hours", type=float, default=40.0, help="gigaspeech / musopen: hours of audio to take (whole episodes / works)")
     ap.add_argument("--per-genre", type=int, default=250, help="fma: clips per top genre (seeded draw)")
     ap.add_argument("--seed", type=int, default=0)
@@ -828,11 +994,19 @@ def main() -> int:
             sys.exit("ERROR: --frames is implemented for avcaps only")
         stage_avcaps_frames(args)
         return 0
+    if args.restage_from:
+        if args.corpus == "narratives":
+            sys.exit("ERROR: narratives is staged one story per unit already")
+        args.restage_from = Path(args.restage_from)
+        rows = restage(args.corpus, args)
+        if rows:
+            write_manifest(args.corpus, rows, args)
+        return 0
     if args.corpus in ("clotho", "avcaps"):
         write_captions(args.corpus, args)
         if args.captions_only:
             return 0
-    rows = stage_narratives(args) if args.corpus == "narratives" else stage_packed(args.corpus, args)
+    rows = stage_narratives(args) if args.corpus == "narratives" else stage_recordings(args.corpus, args)
     if rows and not args.dry_run:
         write_manifest(args.corpus, rows, args)
     return 0

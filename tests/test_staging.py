@@ -9,6 +9,7 @@ from psytwill.staging import (
     normalize_gigaspeech_text,
     normalize_librispeech_text,
     pack_groups,
+    split_recordings,
 )
 
 
@@ -112,3 +113,49 @@ class TestTextNormalisation:
 
     def test_librispeech_lowercases_only(self):
         assert normalize_librispeech_text("THE  QUICK BROWN ") == "the quick brown"
+
+
+class TestSplitRecordings:
+    def _rows(self, unit):
+        return [{"segment": s.segment, "group": s.group, "onset": on, "offset": on + s.duration}
+                for s, on in zip(unit.segments, unit.onsets)]
+
+    def test_each_group_becomes_a_unit_laid_out_as_item_units_would(self):
+        groups = [("ch1", [seg(0, "ch1", 3.2), seg(1, "ch1", 2.1)]), ("ch2", [seg(2, "ch2", 4.4)])]
+        packed = pack_groups(groups, target=600.0, unit_prefix="spk1-")[0]
+        pieces = split_recordings(packed.unit, self._rows(packed), unit_id=lambda g: f"spk1-{g}",
+                                  old_duration=packed.duration)
+        fresh = item_units(groups, unit_id=lambda g: f"spk1-{g}")
+        assert [p.new_unit for p in pieces] == [u.unit for u in fresh] == ["spk1-ch1", "spk1-ch2"]
+        for p, u in zip(pieces, fresh):
+            assert list(p.onsets) == u.onsets and p.duration == u.duration
+            assert p.shift % 0.5 == 0 and not p.unchanged
+        assert pieces[1].shift == packed.onsets[2]
+
+    def test_a_one_group_unit_is_unchanged(self):
+        u = layout_unit("spk1-000", [seg(0, "ch1", 3.0)])
+        (p,) = split_recordings(u.unit, self._rows(u), unit_id=lambda g: "x", old_duration=u.duration)
+        assert p.unchanged and p.new_unit == "spk1-000" and p.duration == u.duration and p.shift == 0
+        (q,) = split_recordings(u.unit, self._rows(u), unit_id=lambda g: f"clip-{g}", old_duration=u.duration,
+                                keep_single=False)  # a clip corpus: the id must become the clip's
+        assert not q.unchanged and q.new_unit == "clip-ch1" and q.duration == 3.0
+
+    def test_refusals(self):
+        rows = [{"segment": "a", "group": "g1", "onset": 0.0, "offset": 1.0},
+                {"segment": "b", "group": "g2", "onset": 1.5, "offset": 2.0},
+                {"segment": "c", "group": "g1", "onset": 2.5, "offset": 3.0}]
+        with pytest.raises(ValueError, match="not contiguous"):
+            split_recordings("u", rows, unit_id=lambda g: g, old_duration=3.5)
+        off_grid = [{"segment": "a", "group": "g1", "onset": 0.0, "offset": 1.0},
+                    {"segment": "b", "group": "g2", "onset": 1.7, "offset": 2.0}]
+        with pytest.raises(ValueError, match="off the"):
+            split_recordings("u", off_grid, unit_id=lambda g: g, old_duration=2.5)
+        wide = [{"segment": "a", "group": "g1", "onset": 0.0, "offset": 1.0},
+                {"segment": "b", "group": "g1", "onset": 5.0, "offset": 6.0},  # a 4 s gap, not the 0.5 s rule
+                {"segment": "c", "group": "g2", "onset": 7.0, "offset": 8.0}]
+        with pytest.raises(ValueError, match="cannot carry"):
+            split_recordings("u", wide, unit_id=lambda g: g, old_duration=8.5)
+        with pytest.raises(ValueError, match="native id"):
+            split_recordings("u", rows[:2], unit_id=lambda g: g.upper(), old_duration=2.5)
+        with pytest.raises(ValueError, match="twice"):
+            split_recordings("u", rows[:2], unit_id=lambda g: "same", old_duration=2.5)
