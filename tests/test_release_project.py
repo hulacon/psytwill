@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 from psytwill.cli import main
+from tests.conftest import write_usage
 
 N_IMG, N_HELD, N_CAP, LATENT = 240, 40, 2, 2
 FIT = ["--k-schedule", "2,4", "--n-splits", "3", "--n-perm", "150", "--k-nn", "10", "--eval-n", "0", "--seed", "0"]
@@ -72,6 +73,7 @@ def space(tmp_path_factory):
     for blk, side in (("V", "a"), ("L", "b")):
         assert main(["space", "relate", "project", "--relation", str(sp / "rel" / "VL_t.json"), "--side", side,
                      "--scores", str(sp / f"{blk}_all.parquet"), "-o", str(sp / f"VL_{blk}_all.parquet")]) == 0
+    write_usage(tmp)
     rels = tmp / "releases"
     for version in ("0.1.0", "0.2.0"):
         assert main(["space", "release", "write", "--name", "sp", "--version", version,
