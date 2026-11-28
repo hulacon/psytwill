@@ -27,7 +27,12 @@ from psytwill.space import (
     prepare_member,
     check_fit,
     check_member,
+    DEFAULT_N_SPLITS,
+    FOLD_DEFAULTS_RULE,
+    TEMPERED_EXPONENT,
     corpus_row_weights,
+    corpus_weight_shares,
+    resolve_weight_exponent,
     eval_subsample,
     fit_block,
     fit_block_map,
@@ -319,7 +324,7 @@ class TestPRBasisAndReporting:
 
         meta = json.loads(manifest.read_text())
         assert sum(meta["member_pr"].values()) == pytest.approx(meta["pr_sum_bound"])
-        assert meta["space_schema_version"] == "1.20"
+        assert meta["space_schema_version"] == "1.21"
 
     def test_compression_numbers_are_reported(self, members):
         sp, _ = members
@@ -708,7 +713,7 @@ class TestMasking:
 
         meta = json.loads(manifest.read_text())
         assert "member_structural_fill" not in meta and meta["block_cov"] == "pairwise"
-        assert meta["space_schema_version"] == "1.20"
+        assert meta["space_schema_version"] == "1.21"
 
 
 
@@ -1114,10 +1119,54 @@ class TestCorpusWeights:
         corpora = ["x"] * (N - 100) + ["y"] * 100
         fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, corpus_weights="equal",
                         **_fit_kwargs())
-        assert fit.manifest["corpus_weights"] == {"scheme": "equal",
-                                                  "corpus_rows": {"x": N - 100, "y": 100}}
+        assert fit.manifest["corpus_weights"] == {"scheme": "equal", "exponent": 0.0,
+                                                  "corpus_rows": {"x": N - 100, "y": 100},
+                                                  "corpus_shares": {"x": 0.5, "y": 0.5}}
         plain = fit_block(sp, ["a", "b"], block="T", **_fit_kwargs())
         assert plain.manifest["corpus_weights"] is None
+
+    def test_tempered_weights_give_each_corpus_n_to_the_0_3(self):
+        c = np.array(["x"] * 1000 + ["y"] * 10)
+        w = corpus_row_weights(c, "tempered")
+        tx, ty = w[c == "x"].sum(), w[c == "y"].sum()
+        assert np.isclose(tx / ty, (1000 / 10) ** 0.3)
+        assert np.allclose(w[c == "x"], 1000 ** -0.7) and np.allclose(w[c == "y"], 10 ** -0.7)
+        shares = corpus_weight_shares(c, "tempered")
+        assert np.isclose(shares["x"], 1000 ** 0.3 / (1000 ** 0.3 + 10 ** 0.3))
+        assert np.isclose(sum(shares.values()), 1.0)
+        assert corpus_weight_shares(c, "tempered", 0.5)["y"] == pytest.approx(10 ** 0.5 / (1000 ** 0.5 + 10 ** 0.5))
+
+    def test_equal_weights_are_bit_identical_to_one_over_n(self):
+        c = np.array(["x"] * 7 + ["y"] * 3)
+        assert np.array_equal(corpus_row_weights(c), np.where(c == "x", 1.0 / 7, 1.0 / 3))
+
+    def test_exponents_are_checked(self):
+        with pytest.raises(SpaceError, match="strictly between 0"):
+            corpus_row_weights(["x"], "tempered", 1.0)
+        with pytest.raises(SpaceError, match="exponent needs 'tempered'"):
+            corpus_row_weights(["x"], "equal", 0.3)
+        assert resolve_weight_exponent("tempered") == TEMPERED_EXPONENT == 0.3
+
+    def test_fit_records_a_tempered_weighting(self, members):
+        sp, _ = members
+        corpora = ["x"] * (N - 100) + ["y"] * 100
+        fit = fit_block(sp, ["a", "b"], block="T", corpora=corpora, corpus_weights="tempered",
+                        **_fit_kwargs())
+        cw = fit.manifest["corpus_weights"]
+        assert cw["scheme"] == "tempered" and cw["exponent"] == 0.3
+        assert cw["corpus_shares"]["y"] == pytest.approx(100 ** 0.3 / ((N - 100) ** 0.3 + 100 ** 0.3), abs=1e-6)
+        equal = fit_block(sp, ["a", "b"], block="T", corpora=corpora, corpus_weights="equal", **_fit_kwargs())
+        assert not np.allclose(fit.map.whiteners["a"].mean, equal.map.whiteners["a"].mean)
+        with pytest.raises(SpaceError, match="needs corpus_weights='tempered'"):
+            fit_block(sp, ["a", "b"], block="T", corpora=corpora, corpus_weight_exponent=0.5, **_fit_kwargs())
+
+    def test_fold_defaults_are_declared(self, members):
+        sp, _ = members
+        fd = fit_block(sp, ["a", "b"], block="T", **_fit_kwargs()).manifest["fold_defaults"]
+        assert fd["rule"] == FOLD_DEFAULTS_RULE
+        assert fd["n_splits"]["default"] == DEFAULT_N_SPLITS == 5
+        assert fd["n_splits"]["value"] == 3 and fd["n_splits"]["kept"] is False  # _fit_kwargs' 3 folds
+        assert fd["grouped"]["value"] is False
 
     def test_weighting_needs_corpora_and_a_known_scheme(self, members):
         sp, _ = members

@@ -87,6 +87,24 @@ def test_corpus_weights_flag_reaches_the_manifest(two_corpora, tmp_path):
     assert set(manifest["corpus_weights"]["corpus_rows"]) == {"librispeech", "musopen"}
 
 
+def test_tempered_weights_and_like_overrides(two_corpora, tmp_path, capsys):
+    out = tmp_path / "space"
+    base = ["space", "fit", "--features", *map(str, two_corpora), "--key", "stimulus_id,time",
+            "--window", "0.5", "--groups-from-label", "-o", str(out)]
+    assert main([*base, "--corpus-weights", "tempered", "--corpus-weight-exponent", "0.4",
+                 "--stem", "T_tw", *FIT_ARGS]) == 0
+    cw = json.loads((out / "T_tw.json").read_text())["corpus_weights"]
+    assert cw["scheme"] == "tempered" and cw["exponent"] == 0.4
+    assert abs(sum(cw["corpus_shares"].values()) - 1) < 1e-5
+    like = ["space", "fit", "--like", str(out / "T_tw.json"), "-o", str(out), "--no-criterion"]
+    assert main([*like, "--stem", "T_tw_same"]) == 0  # the source's scheme and exponent
+    assert json.loads((out / "T_tw_same.json").read_text())["corpus_weights"]["exponent"] == 0.4
+    assert main([*like, "--corpus-weights", "natural", "--stem", "T_nat"]) == 0  # a diagnostic arm
+    assert json.loads((out / "T_nat.json").read_text())["corpus_weights"] is None
+    assert main([*base, "--corpus-weight-exponent", "0.4", "--stem", "T_bad", *FIT_ARGS]) == 1
+    assert "add --corpus-weights tempered" in capsys.readouterr().err
+
+
 def test_single_table_output_is_unchanged(two_corpora, tmp_path, capsys):
     out = tmp_path / "space"
     argv = ["space", "fit", "--features", str(two_corpora[0]), "--key", "stimulus_id,time",
@@ -252,7 +270,7 @@ def test_manifest_reports_walk_top_and_captured_share(faces_table, tmp_path):
     manifest = json.loads((out / "V_split.json").read_text())
     # concat_rank is the fold maps' full rank, not the chosen k (bug before 1.5)
     assert manifest["concat_rank"] == max(manifest["k_schedule"])
-    assert manifest["space_schema_version"] == "1.20"
+    assert manifest["space_schema_version"] == "1.21"
     for m, pm in manifest["per_member"].items():
         assert len(pm["block_captured_at_k_max"]) == 3
         assert all(0.0 <= c <= 1.0 + 1e-9 for c in pm["block_captured_at_k_max"])

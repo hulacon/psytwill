@@ -58,9 +58,14 @@ from psytwill.compare import (
 from psytwill.exceptions import SpaceError
 from psytwill.labels import (BOOKKEEPING, WINDOW_TOKENS, admits, circular_with, needs_windows, parse_select,
                              resolve, select_text)
+from psytwill.linalg import thin_svd
 from psytwill.store import SpaceMatrix, align_spaces
 
 DEFAULT_K_SCHEDULE: tuple[int, ...] = (8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256)
+#: Cross-validation folds, an inherited 0.1.0 default carried and declared by
+#: psytwill-space 0.3.0 rule 10.4 (DECIDED 2026-11-26): not tuned.
+DEFAULT_N_SPLITS = 5
+FOLD_DEFAULTS_RULE = "psytwill-space 0.3.0 rule 10.4: 5 folds, grouped where the rows carry groups"
 #: Members whitened below this rank are scored with Euclidean neighbours
 #: instead of cosine. Cosine similarity in one dimension takes only the
 #: values +/-1, so every pair ties and `argsort(kind="stable")` returns the
@@ -266,7 +271,11 @@ def split_members(models: Sequence[str]) -> list[str]:
 # 1.20: `declarations` (list of strings, `space fit --declare`): statements about
 # the block's inputs or domain recorded verbatim (a fit-vs-projection mismatch, a
 # register out of the block's domain). Empty when none; older manifests lack it.
-SPACE_SCHEMA_VERSION = "1.20"
+# 1.21: `corpus_weights` adds `exponent` (0 for "equal") and `corpus_shares`
+# (each corpus's share of the total row weight); scheme "tempered" (n_c ** 0.3,
+# psytwill-space 0.3.0 rule 2.6). `fold_defaults` declares the inherited fold
+# defaults and whether the fit kept them (rule 10.4).
+SPACE_SCHEMA_VERSION = "1.21"
 TARGET_ROW_MODES = ("narrow", "block")
 WINDOW_SOURCES = ("sidecar", "battery", "undeclared")
 
@@ -397,14 +406,14 @@ def fit_whitener(space: SpaceMatrix, X: np.ndarray, *, rank: int | None = None,
         Z = (X - mean) / std
         pr = float(participation_ratio(Z))
         # eigendecomposition of the covariance via SVD of Z
-        _, s, vt = np.linalg.svd(Z, full_matrices=False)
+        _, s, vt = thin_svd(Z)
     else:
         w = _normalized_weights(weights, X.shape[0])
         mean = (w[:, None] * X).sum(axis=0) / w.sum()
         std = np.sqrt((w[:, None] * (X - mean) ** 2).sum(axis=0) / w.sum())
         std = np.where(std > 0, std, 1.0)
         Z = (X - mean) / std
-        _, s, vt = np.linalg.svd(Z * np.sqrt(w)[:, None], full_matrices=False)
+        _, s, vt = thin_svd(Z * np.sqrt(w)[:, None])
         lam = s ** 2
         pr = float(lam.sum() ** 2 / (lam ** 2).sum()) if lam.sum() > 0 else 0.0
     eig = (s ** 2) / max(Z.shape[0] - 1, 1)
@@ -445,24 +454,59 @@ def _normalized_weights(weights, n: int) -> np.ndarray:
     return w * (n / w.sum())
 
 
-CORPUS_WEIGHTINGS = ("equal",)
+CORPUS_WEIGHTINGS = ("equal", "tempered")
+#: psytwill-space 0.3.0 rule 2.6 (DECIDED 2026-11-25): corpus c's total weight
+#: is n_c ** 0.3 / sum(n ** 0.3) in every block.
+TEMPERED_EXPONENT = 0.3
 
 
-def corpus_row_weights(corpora: Sequence, scheme: str = "equal") -> np.ndarray:
-    """Row weights that give every corpus the same total weight.
+def resolve_weight_exponent(scheme: str, exponent: float | None = None) -> float:
+    """The exponent p a scheme gives each corpus's total weight, n_c ** p.
 
-    ``"equal"`` weights a row by 1 / (its corpus's row count), so each corpus
-    contributes equally to the whiteners and the block covariance whatever
-    its size. MEASURED 2026-09-28 on L: with captions 46 % of the pooled
-    rows, each embedding member's whitener kept the caption-heavy directions,
-    and within speech `ebind_text` reached only R^2 0.52 even at full rank.
-    Equal weights lifted it to 0.61 for 20 % more whitened directions.
+    ``"equal"`` is p = 0 (every corpus the same total) and takes no exponent;
+    ``"tempered"`` is :data:`TEMPERED_EXPONENT` unless one is given, strictly
+    between 0 (equal) and 1 (natural: every row once, i.e. no weighting).
     """
     if scheme not in CORPUS_WEIGHTINGS:
         raise SpaceError(f"unknown corpus weighting {scheme!r}; have {CORPUS_WEIGHTINGS}")
+    if scheme == "equal":
+        if exponent not in (None, 0, 0.0):
+            raise SpaceError("corpus weighting 'equal' is exponent 0; an exponent needs 'tempered'")
+        return 0.0
+    p = TEMPERED_EXPONENT if exponent is None else float(exponent)
+    if not 0.0 < p < 1.0:
+        raise SpaceError(f"a tempered exponent must lie strictly between 0 (equal) and 1 (natural); got {p}")
+    return p
+
+
+def corpus_row_weights(corpora: Sequence, scheme: str = "equal", exponent: float | None = None) -> np.ndarray:
+    """Row weights giving corpus c a total weight proportional to n_c ** p.
+
+    A row of corpus c weighs n_c ** (p - 1); see :func:`resolve_weight_exponent`
+    for p. ``"equal"`` (p = 0) weights a row by 1 / (its corpus's row count),
+    so each corpus contributes equally to the whiteners and the block
+    covariance whatever its size. MEASURED 2026-09-28 on L: with captions 46 %
+    of the pooled rows, each embedding member's whitener kept the caption-heavy
+    directions, and within speech `ebind_text` reached only R^2 0.52 even at
+    full rank. Equal weights lifted it to 0.61 for 20 % more whitened
+    directions. ``"tempered"`` (p = 0.3) sits between equal and natural, so a
+    small corpus is lifted without matching a large one (psytwill-space 0.3.0
+    rule 2.6).
+    """
+    p = resolve_weight_exponent(scheme, exponent)
     c = np.asarray(corpora)
     _, inv, counts = np.unique(c, return_inverse=True, return_counts=True)
-    return 1.0 / counts[np.asarray(inv).ravel()]
+    n = counts.astype(float)[np.asarray(inv).ravel()]
+    return 1.0 / n if p == 0.0 else n ** (p - 1.0)  # equal: bit-identical to before tempered existed
+
+
+def corpus_weight_shares(corpora: Sequence, scheme: str = "equal",
+                         exponent: float | None = None) -> dict[str, float]:
+    """Each corpus's share of the total row weight (sums to 1)."""
+    p = resolve_weight_exponent(scheme, exponent)
+    names, counts = np.unique(np.asarray(corpora), return_counts=True)
+    tot = counts.astype(float) ** p
+    return {str(c): float(v) for c, v in zip(names, tot / tot.sum())}
 
 
 # --------------------------------------------------------------------------
@@ -595,10 +639,10 @@ def fit_block_map(spaces: dict[str, SpaceMatrix], members: Sequence[str], rows: 
     if not np.isnan(W).any():
         if w is None:
             mean = W.mean(axis=0)
-            _, s, vt = np.linalg.svd(W - mean, full_matrices=False)
+            _, s, vt = thin_svd(W - mean)
         else:
             mean = (w[:, None] * W).sum(axis=0) / w.sum()
-            _, s, vt = np.linalg.svd((W - mean) * np.sqrt(w)[:, None], full_matrices=False)
+            _, s, vt = thin_svd((W - mean) * np.sqrt(w)[:, None])
         eig = (s ** 2) / max(W.shape[0] - 1, 1)
         cov, n_neg = "complete", 0
     else:
@@ -1382,7 +1426,7 @@ def fit_block(
     *,
     block: str = "block",
     k_schedule: Sequence[int] = DEFAULT_K_SCHEDULE,
-    n_splits: int = 5,
+    n_splits: int = DEFAULT_N_SPLITS,
     groups: Sequence | None = None,
     r2_min: float = 0.5,
     alpha: float = 0.01,
@@ -1399,6 +1443,7 @@ def fit_block(
     defer: Sequence[str] = (),
     per_corpus: bool = False,
     corpus_weights: str | None = None,
+    corpus_weight_exponent: float | None = None,
     min_rows_per_k: int = MIN_ROWS_PER_K,
     min_spread: float = MIN_SPREAD,
     min_support: int = MIN_SUPPORT,
@@ -1466,8 +1511,10 @@ def fit_block(
     MEASURED 2026-09-28, L_v0.4's narratives share of one fold (226 rows) read
     R^2 ~ 0 for members at 0.9+ on the whole corpus.
 
-    ``corpus_weights`` ("equal") weights every row by 1 / (its corpus's row
-    count) in the member whiteners and the block covariance -- within each
+    ``corpus_weights`` ("equal" | "tempered", see :func:`corpus_row_weights`;
+    ``corpus_weight_exponent`` overrides tempered's 0.3) weights every row of
+    corpus c by n_c ** (p - 1) in the member whiteners and the block
+    covariance -- within each
     fold's training rows, and over all rows for the saved map -- so each
     corpus shapes the space equally whatever its size (DECIDED 2026-09-28,
     Ben, for L's caption-heavy mix). The criterion is not weighted: with
@@ -1564,10 +1611,13 @@ def fit_block(
         raise SpaceError("groups must have one entry per aligned row")
     if per_corpus and corpora is None:
         raise SpaceError("per_corpus needs one corpus label per row (`--corpora-from-label`)")
+    corpus_weight_exponent_ = None
     if corpus_weights is not None:
         if corpora is None:
             raise SpaceError("corpus_weights needs one corpus label per row (`--corpora-from-label`)")
-        corpus_row_weights(corpora[:1], corpus_weights)  # refuse an unknown scheme up front
+        corpus_weight_exponent_ = resolve_weight_exponent(corpus_weights, corpus_weight_exponent)  # refuse up front
+    elif corpus_weight_exponent is not None:
+        raise SpaceError("corpus_weight_exponent needs corpus_weights='tempered'")
     # 2. drop rows any member declares undefinable (block mode: a target's
     #    undefinable rows make the target absent there, the block keeps them)
     undef_rows = undefinable_rows({m: aligned[m] for m in every if m not in own}, kinds)
@@ -1705,7 +1755,8 @@ def fit_block(
     corp_all = np.asarray(corpora) if corpus_weights is not None else None
 
     def _weights(rows):
-        return None if corp_all is None else corpus_row_weights(corp_all[rows], corpus_weights)
+        return None if corp_all is None else corpus_row_weights(corp_all[rows], corpus_weights,
+                                                                 corpus_weight_exponent_)
 
     fold_maps = ([fit_block_map(aligned, members, train, weights=_weights(train), member_scaling=member_scaling)
                   for train, _ in folds] if score else [])
@@ -1974,10 +2025,21 @@ def fit_block(
         # (None = every row counts once); the criterion is never weighted
         "corpus_weights": None if corpus_weights is None else {
             "scheme": corpus_weights,
+            "exponent": corpus_weight_exponent_,
             "corpus_rows": {str(c): int(v) for c, v in
-                            zip(*np.unique(corp_all, return_counts=True))}},
+                            zip(*np.unique(corp_all, return_counts=True))},
+            "corpus_shares": {c: round(v, 6) for c, v in
+                              corpus_weight_shares(corp_all, corpus_weights, corpus_weight_exponent_).items()}},
         "n_splits": n_splits,
         "grouped": g is not None,
+        # psytwill-space 0.3.0 rule 10.4: the inherited fold defaults, declared
+        # (not implicit), with whether this fit kept them
+        "fold_defaults": {"rule": FOLD_DEFAULTS_RULE,
+                          "n_splits": {"default": DEFAULT_N_SPLITS, "value": n_splits,
+                                       "kept": n_splits == DEFAULT_N_SPLITS},
+                          "grouped": {"default": "grouped where the rows carry groups (the first key "
+                                                 "column, --groups-from-label)",
+                                      "value": g is not None}},
         "criterion": {"r2_min": r2_min, "alpha": alpha, "k_nn": k_nn, "n_perm": n_perm,
                       "eval_n": eval_n, "block_size": block_size, "random_state": random_state,
                       "eval_sampling": _eval_sampling(eval_n, block_size),
