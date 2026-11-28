@@ -29,6 +29,7 @@ Usage
     extract.py qc [--corpus C]             # transcript QC flags, <corpus>/qc/transcript_flags.parquet
     extract.py exclusions --base-rows R --base-reason WHY --out space/exclusions/<name>_exclude_rows.parquet
     extract.py centre-rule --corpus C [--table T] --out space/exclusions/<name>_exclude_rows.parquet   # rows outside every item
+    extract.py carry --corpus C [--dry-run] [--unkeyed link]   # after `stage.py C --restage-from OLD`
 
 Short-file corpora (speech, music, words) are first packed into units by
 `stage.py`; their manifest `<corpus>/inputs/units.csv` is what this driver
@@ -39,6 +40,13 @@ Per-recording corpora (`stage.py`'s layout since 0.3.0, rule C; the 0.2.x
 short units, one recording each. Their aud2psy cells run
 batched: one `aud2psy --inputs-from` call per model per `--batch-items` units,
 each model loaded once, every unit still writing its own family and sidecar.
+A root re-staged from a packed one (`stage.py --restage-from`) takes the
+packed extraction's tables through `carry`: the diarize / transcribe tables
+and the word2psy transcript families are sliced onto each recording by its
+`recording_map.csv` row (`psytwill.carry`; rule C, tables only), and
+sidecars gain a `carried_from` block. Every other aud2psy member is left for
+`run` to extract per recording, reading the carried tables.
+
 Producers run first; a consumer's manifest row names its unit's stored
 diarize turns / transcribe words (aud2psy >= 0.24.0). `--unit-slice A:B`
 takes units [A, B) of a corpus, for array tasks over items:
@@ -1588,6 +1596,181 @@ def cmd_centre_rule(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# carry (psytwill-space 0.3.0 rule C: packed families onto per-recording units)
+# ---------------------------------------------------------------------------
+
+#: Old-root entries that are not keyed by a packed unit and are valid as they are
+#: (clip-keyed captions, frame units, video sets): `carry --unkeyed link` hard-links them.
+_UNKEYED_DIRS = ("features", "inputs")
+
+
+def _csv_rows(path: Path) -> tuple[list[str], list[dict]]:
+    with open(path, newline="") as f:
+        r = csv.DictReader(f)
+        return list(r.fieldnames or []), list(r)
+
+
+def _write_rows(path: Path, fields: list[str], rows: list[dict]) -> None:
+    tmp = path.with_name(path.name + ".part")
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
+        w.writeheader()
+        w.writerows(rows)
+    tmp.rename(path)
+
+
+def _carry_unit(m: dict, *, old: Path, new_in: Path, new_wav: str, force: bool,
+                dry_run: bool, tally: dict) -> None:
+    """Carry one recording-map row's families (see psytwill.carry)."""
+    from psytwill import carry as cr
+
+    piece = cr.Piece(m["old_stimulus_id"], m["new_stimulus_id"], float(m["shift_sec"]),
+                     float(m["duration_sec"]))
+    unchanged = m["unchanged"] == "true"
+    old_dir = old / "features" / m["old_unit"]
+    new_dir = new_in.parent / "features" / m["new_unit"]
+    metas = sorted(old_dir.glob("*.meta.json"))
+    if not metas:
+        tally["units without features"] += 1
+        return
+    for meta in metas:
+        raw = meta.read_bytes()
+        sc = json.loads(raw)
+        model = ",".join(sc.get("models") or {}) or meta.name
+        ok, why = (True, "unchanged unit") if unchanged else cr.verdict(sc)
+        if not ok:
+            tally[f"not carried: {model} ({why})"] += 1
+            continue
+        target = new_dir / meta.name
+        if target.exists() and not force:
+            tally["already carried"] += 1
+            continue
+        outputs = sc.get("output") or {}
+        recorded = {k: Path(o["path"]) for k, o in outputs.items()}
+        paths = {str(p.parent): str(new_dir) for p in recorded.values()}
+        inp = (sc.get("input") or {}).get("path")
+        if inp and sc.get("extractor") == "aud2psy":
+            paths[inp] = new_wav
+        elif inp and sc.get("extractor") == "word2psy":
+            paths[inp] = str(new_in / f"{m['new_unit']}_transcript.csv")
+        tables: dict[str, list[dict]] = {}
+        fields: dict[str, list[str]] = {}
+        notes: dict = {}
+        if not unchanged:
+            read = {k: _csv_rows(old_dir / p.name) for k, p in recorded.items()}
+            fields = {k: f for k, (f, _) in read.items()}
+            try:
+                tables, notes = cr.slice_family(sc, {k: r for k, (_, r) in read.items()}, piece)
+            except ValueError as exc:
+                sys.exit(f"ERROR: {meta}: {exc}")
+            for k, v in notes.items():
+                tally[k.replace("_", " ")] += v
+            if sc.get("extractor") == "word2psy":
+                tr = new_in / f"{m['new_unit']}_transcript.csv"
+                want = _csv_rows(tr)[1] if tr.exists() else []
+                if [round(float(r["onset"]), 3) for r in want] != \
+                        [round(float(c["onset"]), 3) for c in tables["chunks"]]:
+                    sys.exit(f"ERROR: {meta}: carried chunks do not match {tr} row for row")
+        new = cr.carried_sidecar(sc, piece=piece, paths=paths, tables=tables, old_unit=m["old_unit"],
+                                 old_root=str(old), old_sha256=hashlib.sha256(raw).hexdigest(),
+                                 unchanged=unchanged, notes=notes)
+        problems = check_sidecar(new, source=str(target))
+        if problems:
+            sys.exit("ERROR: carried sidecar fails the battery check:\n  " + "\n  ".join(problems))
+        tally[f"carried: {model}"] += 1
+        if dry_run:
+            continue
+        new_dir.mkdir(parents=True, exist_ok=True)
+        for k, p in recorded.items():
+            dst = new_dir / p.name
+            if unchanged:
+                tmp = dst.with_name(dst.name + ".part")
+                tmp.write_bytes((old_dir / p.name).read_bytes())
+                tmp.rename(dst)
+            else:
+                _write_rows(dst, fields[k], tables[k])
+        tmp = target.with_name(target.name + ".part")
+        tmp.write_text(json.dumps(new, indent=2) + "\n")
+        tmp.rename(target)  # the sidecar last: it is the done-marker
+
+
+def _unkeyed(old: Path, new: Path, old_units: set[str]) -> list[tuple[Path, Path]]:
+    """(old, new) entries of the old corpus dir that no packed unit owns and
+    the new root lacks: clip-keyed captions, frame units, video sets."""
+    out = []
+    for sub in _UNKEYED_DIRS:
+        for p in sorted((old / sub).iterdir()) if (old / sub).is_dir() else []:
+            if sub == "features" and p.name in old_units:
+                continue
+            if sub == "inputs" and (p.name == "units.csv" or p.name.endswith(("_segments.csv", "_transcript.csv"))):
+                continue
+            if not (new / sub / p.name).exists():
+                out.append((p, new / sub / p.name))
+    return out
+
+
+def _link_tree(src: Path, dst: Path) -> int:
+    if src.is_file():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.link(src, dst)
+        return 1
+    n = 0
+    for p in sorted(src.rglob("*")):
+        if p.is_file():
+            q = dst / p.relative_to(src)
+            q.parent.mkdir(parents=True, exist_ok=True)
+            os.link(p, q)
+            n += 1
+    return n
+
+
+def cmd_carry(args: argparse.Namespace) -> int:
+    """Carry a re-staged corpus's packed feature families onto its per-recording units."""
+    from collections import Counter
+
+    corpus = args.corpus
+    new = ROOTS.durable / corpus
+    layout_file = new / "inputs" / "layout.json"
+    layout = json.loads(layout_file.read_text()) if layout_file.exists() else {}
+    if "restaged_from" not in layout:
+        sys.exit(f"ERROR: {layout_file} records no restaged_from; carry follows `stage.py --restage-from`")
+    old = Path(layout["restaged_from"])
+    if not (old / "features").is_dir():
+        sys.exit(f"ERROR: the packed root {old} has no features/")
+    if old.resolve() == new.resolve():
+        sys.exit(f"ERROR: {old} is the re-staged root itself")
+    mrows = _csv_rows(new / "inputs" / layout.get("recording_map", "recording_map.csv"))[1]
+    wavs = {u.id: u.inputs[0] for u in _staged_units(corpus)}
+    if args.unit_slice:
+        a, b = (int(x) if x else None for x in args.unit_slice.split(":"))
+        mrows = mrows[a:b]
+    tally: Counter = Counter()
+    for m in mrows:
+        if m["new_unit"] not in wavs:
+            sys.exit(f"ERROR: {m['new_unit']} is in the recording map but not in {new / 'inputs' / 'units.csv'}")
+        _carry_unit(m, old=old, new_in=new / "inputs", new_wav=wavs[m["new_unit"]],
+                    force=args.force, dry_run=args.dry_run, tally=tally)
+    print(f"{corpus}: {len(mrows)} recording(s) from {old}" + (" (dry run: nothing written)" if args.dry_run else ""))
+    for k in sorted(tally):
+        print(f"  {k}: {tally[k]}")
+    old_units = {u["unit"] for u in _csv_rows(old / "inputs" / "units.csv")[1]}
+    loose = _unkeyed(old, new, old_units)
+    if loose:
+        if args.unkeyed == "link" and not args.dry_run:
+            n = sum(_link_tree(s, d) for s, d in loose)
+            print(f"  hard-linked {n} file(s) under {len(loose)} unkeyed entr(ies): "
+                  + ", ".join(f"{s.parent.name}/{s.name}" for s, _ in loose))
+        else:
+            print(f"  {len(loose)} unkeyed entr(ies) not carried (valid as they are; --unkeyed link "
+                  "hard-links them): " + ", ".join(f"{s.parent.name}/{s.name}" for s, _ in loose))
+    stale = sorted(p.name for p in old.iterdir() if p.is_dir() and p.name not in _UNKEYED_DIRS)
+    if stale:
+        print(f"  not carried, rebuild from the carried units: {', '.join(stale)} "
+              "(e.g. groups/ by `extract.py aggregate`)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--durable-root")
@@ -1651,6 +1834,16 @@ def main() -> int:
     p.add_argument("--out", required=True, help="the list to write (immutable once written)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_centre_rule)
+    p = sub.add_parser("carry", help="re-staged corpus: slice its packed families onto the per-recording "
+                                     "units (rule C, psytwill.carry)")
+    p.add_argument("--corpus", required=True, choices=sorted(CORPORA))
+    p.add_argument("--unit-slice", metavar="START:END", help="recording-map rows [START, END) (array tasks)")
+    p.add_argument("--force", action="store_true", help="rewrite families already carried")
+    p.add_argument("--dry-run", action="store_true", help="slice and check every family; write nothing")
+    p.add_argument("--unkeyed", choices=("report", "link"), default="report",
+                   help="old-root entries no packed unit owns (clip captions, frame units, video sets): "
+                        "report them, or hard-link them into the new root")
+    p.set_defaults(func=cmd_carry)
 
     args = ap.parse_args()
     global ROOTS

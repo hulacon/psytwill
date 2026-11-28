@@ -3,6 +3,39 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.75.0 — 2026-11-27
+
+Minor: carry a re-staged corpus's packed tables onto its recordings
+(rule C, tables only).
+
+### Added
+- **`psytwill.carry`** slices one packed unit's tables onto one of its
+  recordings, re-timed by the recording map's `shift_sec`. Tables are read
+  and written as strings, so values come back byte for byte.
+  - Carried: the diarize and transcribe producer tables and the word2psy
+    transcript families. Every other aud2psy member is re-extracted per
+    recording, whatever its window label: a frame member's grid value
+    depends on its recording's offset in the packed file (native frame
+    phase), and some members read the whole file (a recurrent VAD, a dB
+    floor set by the file's maximum, whole-file pitch decoding).
+  - Diarize turns are clipped to the recording and renumbered. Whisper
+    chunks go by onset and take their words. Transcript families' chunk,
+    word and sentence indices restart at 0.
+  - The carried sidecar's paths and per-unit counts (rows, words, chunks,
+    diarization) are rewritten for the new unit. It gains `carried_from`
+    (old unit and stimulus id, root, shift, old sidecar sha256). Counts it
+    cannot recompute are listed under `packed_summaries` and keep the
+    packed values.
+- **`extract.py carry --corpus C`**, run after `stage.py C --restage-from`:
+  - reads `restaged_from` and `recording_map.csv` from the re-staged root;
+  - copies a one-recording unit's families as they are;
+  - checks each carried transcript family against the re-staged
+    transcript row by row, and each sidecar against the battery;
+  - writes the sidecar last, as the done-marker;
+  - `--dry-run` slices and checks everything and writes nothing.
+  - It reports what was not carried, and why. `--unkeyed link` hard-links
+    the old root's clip-keyed entries (captions, frame units, video sets).
+
 ## 0.74.0 — 2026-11-27
 
 Minor: one extraction file per recording (rule C). Packing retires.

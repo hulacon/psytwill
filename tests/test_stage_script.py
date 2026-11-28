@@ -4,6 +4,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -426,3 +427,141 @@ class TestRestage:
         assert stage.restage("fma", args) == []
         assert not (tmp_path / "new").exists()
         assert "2 packed units -> 3 per-recording units (1 split, 1 unchanged)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- carry --
+
+if "fitcorpus_extract" in sys.modules:  # test_extract_script loaded it
+    extract = sys.modules["fitcorpus_extract"]
+else:
+    _XSPEC = importlib.util.spec_from_file_location(
+        "fitcorpus_extract", Path(__file__).parents[1] / "scripts" / "fitcorpus" / "extract.py")
+    extract = importlib.util.module_from_spec(_XSPEC)
+    sys.modules[_XSPEC.name] = extract  # dataclasses resolve annotations through it
+    _XSPEC.loader.exec_module(extract)
+
+_PYANNOTE = "pyannote/speaker-diarization-community-1"
+
+
+def _family(d: Path, stem: str, tables: dict, models: dict, extractor="aud2psy", inp=None, **top):
+    """Write one family (tables + sidecar) the way an extractor would."""
+    out = {}
+    for key, rows in tables.items():
+        p = d / f"{stem}_{key}.csv"
+        _write_csv(p, rows) if rows else p.write_text("stimulus_id,time\n")
+        out[key] = {"path": str(p), "rows": len(rows)}
+    sc = {"schema_version": "1.4", "extractor": extractor, "input": inp or {}, "output": out,
+          "models": models, **top}
+    (d / f"{stem}.meta.json").write_text(json.dumps(sc, indent=2))
+
+
+def _packed_features(old: Path):
+    """Families for the packed fma root: x-000 (a, b) and the lone x-001 (c)."""
+    durable = old / "durable" / "fma"
+    units = {u["unit"]: u for u in csv.DictReader(open(durable / "inputs" / "units.csv"))}
+    for name, u in units.items():
+        d = durable / "features" / name
+        d.mkdir(parents=True)
+        sid, n = u["stimulus_id"], int(np.ceil(float(u["duration_sec"]) / 0.5))
+        inp = {"type": "audio", "path": u["path"], "duration_sec": float(u["duration_sec"])}
+        frames = lambda col: [{"stimulus_id": sid, "time": repr((k + 0.5) * 0.5), col: f"{name}:{k}"}
+                              for k in range(n)]
+        _family(d, "loudness", {"frames": frames("loudness_rms")}, inp=inp,
+                models={"loudness": {"checkpoint": None, "labels": {"default": {"window_sec": "grid"}}}},
+                frames={"hop_sec": 0.5, "n_frames": n, "time": "window center"})
+        _family(d, "clap", {"frames": frames("clap_000")}, inp=inp,
+                models={"clap": {"checkpoint": "laion/larger_clap_music_and_speech",
+                                 "labels": {"default": {"window_sec": 10.0}}}})
+        segs = list(csv.DictReader(open(durable / "inputs" / f"{name}_segments.csv")))
+        turns = [{"stimulus_id": sid, "turn_idx": str(i), "speaker": f"SPEAKER_0{i}",
+                  "onset": s["onset"], "offset": s["offset"]} for i, s in enumerate(segs)]
+        _family(d, "diarize", {"speakers": turns}, inp=inp, models={"diarize": {"checkpoint": _PYANNOTE}},
+                diarization={"n_speakers": len(turns), "n_turns": len(turns), "speaker_time_sec": {}})
+        _family(d, "conversation", {"frames": frames("conversation_n_speakers")}, inp=inp,
+                models={"conversation": {"checkpoint": None, "derived_from": "diarize", "n_turns": len(turns),
+                                         "turns_source": str(d / "diarize_speakers.csv"),
+                                         "labels": {"default": {"window_sec": "grid"}}}},
+                frames={"hop_sec": 0.5, "n_frames": n, "time": "window center"})
+        tr = durable / "inputs" / f"{name}_transcript.csv"
+        if tr.exists():
+            rows = list(csv.DictReader(open(tr)))
+            chunks = [{"chunk_idx": str(i), "chunk_label": sid, "n_words": "2", "stimulus_id": sid,
+                       "onset": r["onset"], "offset": r["offset"], "minilm_000": f"e{i}"} for i, r in enumerate(rows)]
+            words = [{"stimulus_id": sid, "word_idx": str(2 * i + j), "word": w, "sentence_idx": str(i),
+                      "chunk_idx": str(i), "chunk_label": sid, "onset": "", "offset": ""}
+                     for i, r in enumerate(rows) for j, w in enumerate(r["text"].split())]
+            _family(d, "transcript_minilm", {"words": words, "chunks": chunks}, extractor="word2psy",
+                    inp={"type": "text", "n_words": len(words), "n_chunks": len(chunks),
+                         "n_sentences": len(chunks), "path": str(tr)},
+                    models={"minilm": {"checkpoint": "sentence-transformers/all-MiniLM-L6-v2"}})
+    caps = durable / "features" / "captions" / "audio-000"
+    caps.mkdir(parents=True)
+    (caps / "minilm.csv").write_text("stimulus_id\next-fma-a\n")  # clip-keyed: no packed unit owns it
+
+
+class TestCarry:
+    ITEMS = TestRestage.ITEMS
+
+    def _setup(self, tmp_path, monkeypatch):
+        old = _packed_root(tmp_path, monkeypatch, self.ITEMS)
+        _packed_features(old)
+        args = _restage_args(tmp_path, old)
+        stage.write_manifest("fma", stage.restage("fma", args), args)
+        new = tmp_path / "new" / "durable"
+        monkeypatch.setattr(extract, "ROOTS", argparse.Namespace(durable=new), raising=False)
+        return old / "durable" / "fma", new / "fma"
+
+    @staticmethod
+    def _carry(**kw):
+        return extract.cmd_carry(argparse.Namespace(**{"corpus": "fma", "unit_slice": None, "force": False,
+                                                       "dry_run": False, "unkeyed": "report", **kw}))
+
+    def test_tables_are_carried_and_members_are_left(self, tmp_path, monkeypatch, capsys):
+        old, new = self._setup(tmp_path, monkeypatch)
+        assert self._carry(unkeyed="link") == 0
+        for unit in ("x-a", "x-b"):
+            for member in ("loudness", "clap", "conversation"):  # aud2psy members: re-extract per recording
+                assert not (new / "features" / unit / f"{member}.meta.json").exists()
+            sc = json.loads((new / "features" / unit / "diarize.meta.json").read_text())
+            assert sc["carried_from"]["unit"] == "x-000" and sc["carried_from"]["unchanged"] is False
+            assert sc["input"]["path"] == next(r["path"] for r in csv.DictReader(open(new / "inputs" / "units.csv"))
+                                               if r["unit"] == unit)
+            turns = list(csv.DictReader(open(new / "features" / unit / "diarize_speakers.csv")))
+            assert [(t["turn_idx"], t["onset"]) for t in turns] == [("0", "0.0")]
+            words = list(csv.DictReader(open(new / "features" / unit / "transcript_minilm_words.csv")))
+            assert [w["word_idx"] for w in words] == ["0", "1"] and words[1]["word"] == unit[-1]
+            for meta in (new / "features" / unit).glob("*.meta.json"):
+                assert extract.is_done(meta.with_suffix("").with_suffix(".csv"))
+        lone_old, lone_new = old / "features" / "x-001", new / "features" / "x-001"
+        assert sorted(p.name for p in lone_new.iterdir()) == sorted(p.name for p in lone_old.iterdir())
+        assert (lone_new / "clap_frames.csv").read_bytes() == (lone_old / "clap_frames.csv").read_bytes()
+        assert json.loads((lone_new / "clap.meta.json").read_text())["carried_from"]["unchanged"] is True
+        assert (new / "features" / "captions" / "audio-000" / "minilm.csv").stat().st_ino == \
+            (old / "features" / "captions" / "audio-000" / "minilm.csv").stat().st_ino  # hard link
+        out = capsys.readouterr().out
+        assert "not carried: clap (aud2psy member: re-extract per recording): 2" in out
+        assert "not carried: loudness (aud2psy member: re-extract per recording): 2" in out
+        assert "carried: diarize: 3" in out and "hard-linked 1 file(s)" in out
+
+    def test_a_rerun_carries_nothing_twice_and_dry_run_writes_nothing(self, tmp_path, monkeypatch, capsys):
+        old, new = self._setup(tmp_path, monkeypatch)
+        self._carry(dry_run=True)
+        assert not (new / "features").exists()
+        assert "3 recording(s) from" in capsys.readouterr().out
+        self._carry()
+        self._carry()
+        assert "already carried: 8" in capsys.readouterr().out
+
+    def test_refuses_a_root_that_was_not_restaged(self, tmp_path, monkeypatch):
+        old, new = self._setup(tmp_path, monkeypatch)
+        rec = json.loads((new / "inputs" / stage.LAYOUT_FILE).read_text())
+        del rec["restaged_from"]
+        (new / "inputs" / stage.LAYOUT_FILE).write_text(json.dumps(rec))
+        with pytest.raises(SystemExit, match="restaged_from"):
+            self._carry()
+
+    def test_carried_text_must_match_the_restaged_transcript(self, tmp_path, monkeypatch):
+        old, new = self._setup(tmp_path, monkeypatch)
+        (new / "inputs" / "x-b_transcript.csv").write_text("stimulus_id,text,onset,offset\n")
+        with pytest.raises(SystemExit, match="row for row"):
+            self._carry()
