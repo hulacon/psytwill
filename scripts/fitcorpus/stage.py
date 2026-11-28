@@ -74,8 +74,14 @@ written into a fresh durable / scratch root:
 - `<durable>/<corpus>/inputs/recording_map.csv` records, per new unit, the
   old unit and stimulus id, the group and the `shift_sec` (old time = new
   time + shift) and whether it was `unchanged`. Unwindowed features of the
-  packed extraction carry onto the new units through it; only windowed
-  members need extracting again.
+  packed extraction carry onto the new units through it (`extract.py carry
+  --corpus C`, `psytwill.carry`); only windowed members need extracting
+  again.
+
+The 0.2.x precedent (E5's per-item re-stage) moves the packed corpus aside
+first, so the new staging takes its place:
+`mv <durable>/C <durable>/_packed-<tag>/C`, then `stage.py C --restage-from
+<durable>/_packed-<tag>`, then `extract.py carry --corpus C`.
 
 Held-out LibriSpeech (`--split test-clean` / `test-other`): staged exactly as
 the fit split, but only into a durable root that holds a `HELDOUT` marker file,
