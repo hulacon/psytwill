@@ -3,6 +3,34 @@
 Releases before 0.47.0 are recorded in the commit history (`git log`), one
 commit per version.
 
+## 0.76.0 — 2026-11-28
+
+Minor: tempered corpus weights, a gesvd fallback for whitener SVDs, and the
+fold defaults declared in the manifest (psytwill-space 0.3.0 rules 2.6 and
+10.4). Space schema 1.20 → 1.21.
+
+### Added
+- **`--corpus-weights tempered`** (`space.corpus_row_weights(..., "tempered")`):
+  corpus c's total weight is n_c ** 0.3 / Σ n ** 0.3, so a row weighs
+  n_c ** −0.7. `--corpus-weight-exponent p` sets another exponent strictly
+  between 0 (`equal`) and 1 (`natural`). `--corpus-weights natural` (every row
+  once) names the unweighted fit, so a natural or equal diagnostic arm can be
+  fitted `--like` a tempered one. With `--like`, the source's scheme and
+  exponent are kept unless one is given.
+- **Manifest `corpus_weights`** gains `exponent` (0 for `equal`) and
+  `corpus_shares` (each corpus's share of the total row weight).
+- **Manifest `fold_defaults`** declares the inherited fold defaults (5 folds;
+  grouped where the rows carry groups, `--groups-from-label`) and whether the
+  fit kept them. The registry declares no fold groups per corpus; grouping
+  stays the caller's flag, now recorded against the default.
+- **`psytwill.linalg.thin_svd`**: the economy SVD, retried with LAPACK `gesvd`
+  (with a `RuntimeWarning`) when `gesdd` does not converge, as it can on
+  exactly rank-deficient input. Used by `decompose._fit_whitener`, the CCA
+  cross-covariance, and `space`'s member whiteners and block PCA.
+
+### Unchanged
+- `equal` weights are bit-identical to 0.75.0 (1 / n_c).
+
 ## 0.75.0 — 2026-11-27
 
 Minor: carry a re-staged corpus's packed tables onto its recordings

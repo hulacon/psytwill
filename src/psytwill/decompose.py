@@ -50,6 +50,7 @@ from sklearn.model_selection import GroupKFold, KFold
 from psytwill import __version__
 from psytwill.compare import _align, block_permutation
 from psytwill.exceptions import SpaceError
+from psytwill.linalg import thin_svd
 from psytwill.store import SpaceMatrix
 
 DECOMP_SCHEMA_VERSION = "1.0"
@@ -105,7 +106,7 @@ class _Whitener:
 def _fit_whitener(X: np.ndarray, rank_cap: int, rel_tol: float = 1e-8) -> _Whitener:
     mean = X.mean(axis=0, keepdims=True)
     # economy SVD of the centered matrix; PC score sd_j = s_j / sqrt(n - 1)
-    _, s, Vt = np.linalg.svd(X - mean, full_matrices=False)
+    _, s, Vt = thin_svd(X - mean)
     if s[0] == 0:
         raise SpaceError(
             "Space is constant on a training fold, so it has no directions to "
@@ -147,7 +148,7 @@ def fit_cca(A: np.ndarray, B: np.ndarray, rank_cap: int) -> CcaMap:
     wa = _fit_whitener(A, rank_cap)
     wb = _fit_whitener(B, rank_cap)
     Za, Zb = wa.transform(A), wb.transform(B)
-    U, s, Vt = np.linalg.svd(Za.T @ Zb / len(A), full_matrices=False)
+    U, s, Vt = thin_svd(Za.T @ Zb / len(A))
     return CcaMap(wa=wa, wb=wb, U=U, Vt=Vt, r=s)
 
 

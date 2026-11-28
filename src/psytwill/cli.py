@@ -838,8 +838,14 @@ def _apply_like(args: argparse.Namespace) -> dict:
         raise SpaceError("--per-corpus on a pooled --like source scores beside the source's criterion; "
                          "it cannot choose k, so drop --k-schedule")
     args.per_corpus = crit.get("scope") == "per_corpus" or added_per_corpus
-    args.corpus_weights = (m.get("corpus_weights") or {}).get("scheme")
-    args.corpora_from_label = bool(args.per_corpus or args.corpus_weights)
+    # the source's weighting unless the caller names one (a diagnostic arm: natural / equal
+    # beside a tempered fit, psytwill-space 0.3.0 rule 2.6)
+    if args.corpus_weights is None:
+        cw = m.get("corpus_weights") or {}
+        args.corpus_weights = cw.get("scheme") or "natural"
+        if args.corpus_weights == "tempered" and getattr(args, "corpus_weight_exponent", None) is None:
+            args.corpus_weight_exponent = cw.get("exponent")
+    args.corpora_from_label = bool(args.per_corpus or args.corpus_weights not in (None, "natural"))
     for a, c in (("r2_min", "r2_min"), ("alpha", "alpha"), ("k_nn", "k_nn"), ("n_perm", "n_perm"),
                  ("eval_n", "eval_n"), ("block_size", "block_size"), ("seed", "random_state")):
         setattr(args, a, crit[c])
@@ -875,6 +881,10 @@ def _space_fit_setup(args: argparse.Namespace, *, curve_to_disk: bool = True) ->
     from psytwill.space import DEFAULT_K_SCHEDULE, SPACE_SCHEMA_VERSION
 
     like = _apply_like(args) if args.like else None
+    if getattr(args, "corpus_weights", None) == "natural":  # every row once: no weights
+        args.corpus_weights = None
+    if getattr(args, "corpus_weight_exponent", None) is not None and args.corpus_weights != "tempered":
+        raise SpaceError("--corpus-weight-exponent sets the tempered scheme's exponent: add --corpus-weights tempered")
     if not args.features or not args.block:
         raise SpaceError("space fit needs --features and --block (or --like MANIFEST)")
     if args.no_criterion and args.fixed_k is None:
@@ -953,6 +963,7 @@ def _space_fit_setup(args: argparse.Namespace, *, curve_to_disk: bool = True) ->
               n_perm=args.n_perm, eval_n=args.eval_n or None, block_size=args.block_size,
               random_state=args.seed, progress=progress if curve_to_disk else None, per_corpus=args.per_corpus,
               corpus_weights=args.corpus_weights,
+              corpus_weight_exponent=getattr(args, "corpus_weight_exponent", None),
               on_row=on_row if curve_to_disk else None,
               defer=[m.strip() for m in (args.defer_members or "").split(",") if m.strip()],
               member_scaling=args.member_scaling, fixed_k=args.fixed_k, score=not args.no_criterion,
@@ -2172,10 +2183,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "every corpus passes; the pooled folds are still reported. For a "
                         "multi-register mix, where pooled R^2 counts between-corpus differences "
                         "as explained")
-    f.add_argument("--corpus-weights", choices=["equal"],
-                   help="weight rows so every corpus (read as --corpora-from-label does) counts "
-                        "equally in the member whiteners and the block covariance; the criterion "
-                        "is not weighted. For a mix whose corpora differ in size")
+    f.add_argument("--corpus-weights", choices=["natural", "equal", "tempered"],
+                   help="weight rows by corpus (read as --corpora-from-label does) in the member whiteners "
+                        "and the block covariance; the criterion is not weighted. Corpus c's total weight is "
+                        "n_c ** p: natural p = 1 (every row once, the default), equal p = 0, tempered p = "
+                        "0.3 (psytwill-space 0.3.0 rule 2.6). With --like, the source's scheme unless given")
+    f.add_argument("--corpus-weight-exponent", type=float,
+                   help="the tempered scheme's exponent p, strictly between 0 and 1 (default 0.3)")
     _space_criterion(f)
     f.add_argument("--member-scaling", choices=["pr", "pcs", "zscore"], default="pr",
                    help="pr: whiten each member to its participation ratio (psytwill-space); pcs: the "
