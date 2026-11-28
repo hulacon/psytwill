@@ -7,8 +7,8 @@ recording** (rule C, psytwill-space 0.3.0, DECIDED 2026-11-25): a clip, a
 chapter, a podcast episode, a track, a movement, a word. A recording's files
 are laid end to end with a silence gap, each starting on the 0.5 s frame grid,
 and a segments table says where every original file sits. Packing several
-recordings into one unit is no longer staged: windowed members must clamp at
-the recording's own edges, never read the next one.
+recordings into one unit is no longer staged: a member must read only its own
+recording, never the next one.
 
 Unit ids: `<prefix><group>` (e.g. `spk103-1240`, a LibriSpeech speaker's
 chapter). The clip corpora (clotho, avcaps) use the clip's own native id, so
@@ -73,10 +73,10 @@ written into a fresh durable / scratch root:
   unit's time and keyed by the new `stimulus_id`;
 - `<durable>/<corpus>/inputs/recording_map.csv` records, per new unit, the
   old unit and stimulus id, the group and the `shift_sec` (old time = new
-  time + shift) and whether it was `unchanged`. Unwindowed features of the
-  packed extraction carry onto the new units through it (`extract.py carry
-  --corpus C`, `psytwill.carry`); only windowed members need extracting
-  again.
+  time + shift) and whether it was `unchanged`. The packed extraction's
+  tables (diarize turns, transcribe words, word2psy transcript families)
+  carry onto the new units through it (`extract.py carry --corpus C`,
+  `psytwill.carry`); every other aud2psy member is extracted again.
 
 The 0.2.x precedent (E5's per-item re-stage) moves the packed corpus aside
 first, so the new staging takes its place:

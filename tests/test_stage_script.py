@@ -516,22 +516,14 @@ class TestCarry:
         return extract.cmd_carry(argparse.Namespace(**{"corpus": "fma", "unit_slice": None, "force": False,
                                                        "dry_run": False, "unkeyed": "report", **kw}))
 
-    def test_grid_families_are_exact_slices_and_windowed_ones_are_left(self, tmp_path, monkeypatch, capsys):
+    def test_tables_are_carried_and_members_are_left(self, tmp_path, monkeypatch, capsys):
         old, new = self._setup(tmp_path, monkeypatch)
         assert self._carry(unkeyed="link") == 0
-        m = {r["new_unit"]: r for r in csv.DictReader(open(new / "inputs" / stage.RECORDING_MAP))}
-        packed = list(csv.DictReader(open(old / "features" / "x-000" / "loudness_frames.csv")))
         for unit in ("x-a", "x-b"):
-            k0 = round(float(m[unit]["shift_sec"]) / 0.5)
-            got = list(csv.DictReader(open(new / "features" / unit / "loudness_frames.csv")))
-            assert len(got) == round(float(m[unit]["duration_sec"]) / 0.5)
-            assert [r["loudness_rms"] for r in got] == [r["loudness_rms"] for r in packed[k0:k0 + len(got)]]
-            assert got[0]["time"] == "0.25" and {r["stimulus_id"] for r in got} == {f"ext-fma-{unit}"}
-            assert not (new / "features" / unit / "clap.meta.json").exists()  # windowed: re-extract
-            sc = json.loads((new / "features" / unit / "conversation.meta.json").read_text())
+            for member in ("loudness", "clap", "conversation"):  # aud2psy members: re-extract per recording
+                assert not (new / "features" / unit / f"{member}.meta.json").exists()
+            sc = json.loads((new / "features" / unit / "diarize.meta.json").read_text())
             assert sc["carried_from"]["unit"] == "x-000" and sc["carried_from"]["unchanged"] is False
-            assert sc["models"]["conversation"]["n_turns"] == 1
-            assert sc["models"]["conversation"]["turns_source"] == str(new / "features" / unit / "diarize_speakers.csv")
             assert sc["input"]["path"] == next(r["path"] for r in csv.DictReader(open(new / "inputs" / "units.csv"))
                                                if r["unit"] == unit)
             turns = list(csv.DictReader(open(new / "features" / unit / "diarize_speakers.csv")))
@@ -547,8 +539,9 @@ class TestCarry:
         assert (new / "features" / "captions" / "audio-000" / "minilm.csv").stat().st_ino == \
             (old / "features" / "captions" / "audio-000" / "minilm.csv").stat().st_ino  # hard link
         out = capsys.readouterr().out
-        assert "not carried: clap (windowed (10.0 s): re-extract per recording): 2" in out
-        assert "carried: loudness: 3" in out and "hard-linked 1 file(s)" in out
+        assert "not carried: clap (aud2psy member: re-extract per recording): 2" in out
+        assert "not carried: loudness (aud2psy member: re-extract per recording): 2" in out
+        assert "carried: diarize: 3" in out and "hard-linked 1 file(s)" in out
 
     def test_a_rerun_carries_nothing_twice_and_dry_run_writes_nothing(self, tmp_path, monkeypatch, capsys):
         old, new = self._setup(tmp_path, monkeypatch)
@@ -557,7 +550,7 @@ class TestCarry:
         assert "3 recording(s) from" in capsys.readouterr().out
         self._carry()
         self._carry()
-        assert "already carried: 12" in capsys.readouterr().out
+        assert "already carried: 8" in capsys.readouterr().out
 
     def test_refuses_a_root_that_was_not_restaged(self, tmp_path, monkeypatch):
         old, new = self._setup(tmp_path, monkeypatch)

@@ -41,12 +41,11 @@ short units, one recording each. Their aud2psy cells run
 batched: one `aud2psy --inputs-from` call per model per `--batch-items` units,
 each model loaded once, every unit still writing its own family and sidecar.
 A root re-staged from a packed one (`stage.py --restage-from`) takes the
-packed extraction's unwindowed families through `carry`: grid-local aud2psy
-members, the diarize / transcribe tables and the word2psy transcript
-families are sliced onto each recording by its `recording_map.csv` row
-(`psytwill.carry`; rule C, "carry by exact remap"), and sidecars gain a
-`carried_from` block. Members whose window is longer than the hop are left
-for `run` to extract per recording, gated by the carried turns.
+packed extraction's tables through `carry`: the diarize / transcribe tables
+and the word2psy transcript families are sliced onto each recording by its
+`recording_map.csv` row (`psytwill.carry`; rule C, tables only), and
+sidecars gain a `carried_from` block. Every other aud2psy member is left for
+`run` to extract per recording, reading the carried tables.
 
 Producers run first; a consumer's manifest row names its unit's stored
 diarize turns / transcribe words (aud2psy >= 0.24.0). `--unit-slice A:B`
@@ -1621,35 +1620,30 @@ def _write_rows(path: Path, fields: list[str], rows: list[dict]) -> None:
     tmp.rename(path)
 
 
-def _carry_unit(m: dict, *, old: Path, new_in: Path, new_wav: str, hop: float, force: bool,
+def _carry_unit(m: dict, *, old: Path, new_in: Path, new_wav: str, force: bool,
                 dry_run: bool, tally: dict) -> None:
     """Carry one recording-map row's families (see psytwill.carry)."""
     from psytwill import carry as cr
 
     piece = cr.Piece(m["old_stimulus_id"], m["new_stimulus_id"], float(m["shift_sec"]),
-                     float(m["duration_sec"]), hop)
+                     float(m["duration_sec"]))
     unchanged = m["unchanged"] == "true"
     old_dir = old / "features" / m["old_unit"]
     new_dir = new_in.parent / "features" / m["new_unit"]
-    metas = sorted(old_dir.glob("*.meta.json"), key=lambda p: (p.name.split(".")[0] not in cr.PRODUCERS, p.name))
+    metas = sorted(old_dir.glob("*.meta.json"))
     if not metas:
         tally["units without features"] += 1
         return
-    producer_rows: dict[str, int] = {}
     for meta in metas:
         raw = meta.read_bytes()
         sc = json.loads(raw)
         model = ",".join(sc.get("models") or {}) or meta.name
-        ok, why = (True, "unchanged unit") if unchanged else cr.verdict(sc, hop)
+        ok, why = (True, "unchanged unit") if unchanged else cr.verdict(sc)
         if not ok:
             tally[f"not carried: {model} ({why})"] += 1
             continue
         target = new_dir / meta.name
         if target.exists() and not force:
-            done = json.loads(target.read_text()).get("output") or {}
-            for key, producer in (("speakers", "diarize"), ("transcript_words", "transcribe")):
-                if key in done:  # a consumer carried later still counts what it reads
-                    producer_rows[producer] = done[key]["rows"]
             tally["already carried"] += 1
             continue
         outputs = sc.get("output") or {}
@@ -1670,7 +1664,6 @@ def _carry_unit(m: dict, *, old: Path, new_in: Path, new_wav: str, hop: float, f
                 tables, notes = cr.slice_family(sc, {k: r for k, (_, r) in read.items()}, piece)
             except ValueError as exc:
                 sys.exit(f"ERROR: {meta}: {exc}")
-            producer_rows.update(cr.producer_rows(tables))
             for k, v in notes.items():
                 tally[k.replace("_", " ")] += v
             if sc.get("extractor") == "word2psy":
@@ -1681,7 +1674,7 @@ def _carry_unit(m: dict, *, old: Path, new_in: Path, new_wav: str, hop: float, f
                     sys.exit(f"ERROR: {meta}: carried chunks do not match {tr} row for row")
         new = cr.carried_sidecar(sc, piece=piece, paths=paths, tables=tables, old_unit=m["old_unit"],
                                  old_root=str(old), old_sha256=hashlib.sha256(raw).hexdigest(),
-                                 unchanged=unchanged, producer_rows=producer_rows, notes=notes)
+                                 unchanged=unchanged, notes=notes)
         problems = check_sidecar(new, source=str(target))
         if problems:
             sys.exit("ERROR: carried sidecar fails the battery check:\n  " + "\n  ".join(problems))
@@ -1747,7 +1740,6 @@ def cmd_carry(args: argparse.Namespace) -> int:
         sys.exit(f"ERROR: the packed root {old} has no features/")
     if old.resolve() == new.resolve():
         sys.exit(f"ERROR: {old} is the re-staged root itself")
-    hop = float(layout.get("hop", GRID_HOP))
     mrows = _csv_rows(new / "inputs" / layout.get("recording_map", "recording_map.csv"))[1]
     wavs = {u.id: u.inputs[0] for u in _staged_units(corpus)}
     if args.unit_slice:
@@ -1757,7 +1749,7 @@ def cmd_carry(args: argparse.Namespace) -> int:
     for m in mrows:
         if m["new_unit"] not in wavs:
             sys.exit(f"ERROR: {m['new_unit']} is in the recording map but not in {new / 'inputs' / 'units.csv'}")
-        _carry_unit(m, old=old, new_in=new / "inputs", new_wav=wavs[m["new_unit"]], hop=hop,
+        _carry_unit(m, old=old, new_in=new / "inputs", new_wav=wavs[m["new_unit"]],
                     force=args.force, dry_run=args.dry_run, tally=tally)
     print(f"{corpus}: {len(mrows)} recording(s) from {old}" + (" (dry run: nothing written)" if args.dry_run else ""))
     for k in sorted(tally):

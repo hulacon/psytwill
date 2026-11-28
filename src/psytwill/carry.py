@@ -1,29 +1,28 @@
-"""Carry a packed unit's feature families onto its per-recording units
-(psytwill-space 0.3.0, rule C; DECIDED 2026-11-27, "carry by exact remap").
+"""Carry a packed unit's tables onto its per-recording units (psytwill-space
+0.3.0, rule C; DECIDED 2026-11-27, revised the same day: tables only).
 
 Re-staging a packed root one unit per recording (``stage.py --restage-from``,
 :func:`psytwill.staging.split_recordings`) cuts each recording out of its old
-unit at a grid point ``shift``: old time ``t`` is new time ``t - shift``, and
-the new unit ends on a grid point, so every frame window of the new unit is
-the same audio as one frame window of the old unit. A family whose rows
-depend only on their own window, or on a table that is itself carried, is
-therefore *carried*: its rows are sliced out of the packed table and
-re-timed, and nothing is re-extracted.
+unit at a grid point ``shift``: old time ``t`` is new time ``t - shift``.
+Only families whose rows are *tables of events or text* are carried, sliced
+out of the packed table and re-timed:
 
-Which families carry is read from each sidecar, not from a list:
+- the **producers** ``diarize`` (turns) and ``transcribe`` (chunks + words):
+  they are pinned 0.2.x outputs, and every aud2psy member re-extracted on the
+  new units reads (or is gated by) the sliced tables. A carried producer
+  table equals the packed run's output, not a fresh per-recording run of the
+  producer (pyannote clusters speakers over the whole packed file; Whisper
+  chunks can run past a recording's end, counted as ``chunks_past_end``).
+- **word2psy** transcript families: every row is a word or a chunk, and a
+  chunk is one transcript row of one recording.
 
-- **word2psy** transcript families carry: every row is a word or a chunk,
-  and a chunk is one transcript row (one segment) of one recording.
-- the **producers** ``diarize`` (turns) and ``transcribe`` (chunks + words)
-  carry: they are the 0.2.x tables the carried consumers were computed from,
-  and the windowed members re-extracted on the new units are gated by the
-  sliced turns.
-- an **aud2psy** member carries when every column's ``window_sec`` label is
-  ``grid``, ``event`` or a number no larger than the grid hop.
-- every other aud2psy member is **not carried**: a window longer than the
-  hop reads across the old unit's recordings (re-extract it per recording),
-  and a member with no window label (an event tracker) says nothing about
-  what it read.
+Every other **aud2psy** member is re-extracted per recording, whatever its
+``window_sec`` label says. A grid-labelled member is not local to its window:
+frame features average a native frame lattice whose phase moves with the
+recording's offset in the packed file (22050 Hz, hop 512), Silero VAD is
+recurrent over the whole file, MFCCs floor at ``top_db`` below the file's
+maximum, and pyin decodes pitch over the whole file. Measured on a sample
+(2026-11-27), carried frame values did not equal a per-recording extraction.
 
 A unit that already held one recording (``unchanged`` in the recording map)
 is the same wav, so all of its families carry as they are.
@@ -41,15 +40,13 @@ not re-time is written back byte for byte.
 from __future__ import annotations
 
 import copy
-import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 #: Recorded in every carried sidecar.
-CARRY_RULE = "psytwill-space 0.3.0 rule C: carry by exact remap (DECIDED 2026-11-27)"
-#: Window labels that read only the row's own grid window (or its events).
-WINDOW_FREE = ("grid", "event")
-#: aud2psy producers whose tables are carried (consumers read them).
+CARRY_RULE = ("psytwill-space 0.3.0 rule C: carry tables by exact remap; re-extract aud2psy members "
+              "per recording (DECIDED 2026-11-27, revised 2026-11-27)")
+#: aud2psy producers whose tables are carried (the re-extracted members read them).
 PRODUCERS = ("diarize", "transcribe")
 #: Onset tolerance when assigning a row to a recording (matches stage.py).
 EPS = 1e-6
@@ -65,7 +62,6 @@ class Piece:
     new_stimulus_id: str
     shift: float
     duration: float
-    hop: float = 0.5
 
     @property
     def hi(self) -> float:
@@ -96,76 +92,23 @@ def _ids(row: Row, piece: Piece) -> Row:
 
 # ---------------------------------------------------------------- verdicts --
 
-def window_labels(model_meta: Mapping[str, Any]) -> list:
-    """Every ``window_sec`` a model's labels declare (default and per column)."""
-    labels = model_meta.get("labels") or {}
-    out = []
-    if "window_sec" in (labels.get("default") or {}):
-        out.append(labels["default"]["window_sec"])
-    for col in (labels.get("columns") or {}).values():
-        if isinstance(col, Mapping) and "window_sec" in col:
-            out.append(col["window_sec"])
-    if not out and "window_sec" in model_meta:
-        out.append(model_meta["window_sec"])
-    return out
-
-
-def verdict(sidecar: Mapping[str, Any], hop: float = 0.5) -> tuple[bool, str]:
-    """(carried?, why) for one family's sidecar."""
+def verdict(sidecar: Mapping[str, Any]) -> tuple[bool, str]:
+    """(carried?, why) for one family's sidecar on a split unit."""
     extractor = sidecar.get("extractor")
     models = sidecar.get("models") or {}
     if extractor == "word2psy":
-        return True, "text rows (words, chunks): chunk-local"
+        return True, "text rows (words, chunks)"
     if extractor != "aud2psy":
         return False, f"{extractor} family: not an audio-unit family"
     if len(models) != 1:
         return False, f"{len(models)} models in one sidecar"
-    (model, meta), = models.items()
+    (model,) = models
     if model in PRODUCERS:
         return True, "producer table"
-    windows = window_labels(meta)
-    if not windows:
-        return False, "no window label: re-extract per recording"
-    long = [w for w in windows if w not in WINDOW_FREE
-            and not (isinstance(w, (int, float)) and float(w) <= hop + EPS)]
-    if long:
-        return False, f"windowed ({', '.join(sorted({str(w) for w in long}))} s): re-extract per recording"
-    return True, "grid-local"
+    return False, "aud2psy member: re-extract per recording"
 
 
 # ----------------------------------------------------------------- slicing --
-
-def slice_frames(rows: Sequence[Row], piece: Piece) -> tuple[list[Row], int]:
-    """The recording's grid windows, re-timed; and how many end past it.
-
-    Window ``k`` covers ``[k*hop, (k+1)*hop)`` with ``time`` its centre. The
-    new unit has ``ceil(duration / hop)`` windows starting at old window
-    ``shift / hop``; each must occur exactly once in the packed table.
-    """
-    hop = piece.hop
-    k0 = round(piece.shift / hop)
-    if abs(k0 * hop - piece.shift) > EPS:
-        raise ValueError(f"shift {piece.shift} is not on the {hop} s grid")
-    n = max(1, math.ceil(round(piece.duration / hop, 9)))
-    got: dict[int, Row] = {}
-    for r in rows:
-        k = round(float(r["time"]) / hop - 0.5)
-        if k0 <= k < k0 + n:
-            if k in got:
-                raise ValueError(f"window {k} occurs twice")
-            got[k] = r
-    missing = [k for k in range(k0, k0 + n) if k not in got]
-    if missing:
-        raise ValueError(f"{len(missing)} of {n} windows missing from the packed table "
-                         f"(first at {(missing[0] + 0.5) * hop} s)")
-    out = []
-    for k in range(k0, k0 + n):
-        r = _ids(got[k], piece)
-        r["time"] = fmt_time((k - k0 + 0.5) * hop)
-        out.append(r)
-    tail = int(n * hop - piece.duration > EPS)
-    return out, tail
-
 
 def slice_turns(rows: Sequence[Row], piece: Piece) -> tuple[list[Row], int]:
     """Diarize turns overlapping the recording, clipped to it and re-timed;
@@ -260,15 +203,11 @@ def slice_family(sidecar: Mapping[str, Any], rows: Mapping[str, Sequence[Row]], 
     """Slice one family's tables (``rows`` keyed as the sidecar's ``output``).
 
     Returns the new tables and notes on what the slice changed
-    (``partial_tail_windows``, ``clipped_turns``, ``chunks_past_end``).
+    (``clipped_turns``, ``chunks_past_end``).
     """
     kind = (sidecar.get("extractor"), tuple(sorted(rows)))
     notes: dict[str, int] = {}
-    if kind == ("aud2psy", ("frames",)):
-        frames, tail = slice_frames(rows["frames"], piece)
-        notes["partial_tail_windows"] = tail
-        out = {"frames": frames}
-    elif kind == ("aud2psy", ("speakers",)):
+    if kind == ("aud2psy", ("speakers",)):
         turns, clipped = slice_turns(rows["speakers"], piece)
         notes["clipped_turns"] = clipped
         out = {"speakers": turns}
@@ -282,16 +221,6 @@ def slice_family(sidecar: Mapping[str, Any], rows: Mapping[str, Sequence[Row]], 
     else:
         raise ValueError(f"no carry rule for {kind[0]} tables {list(kind[1])}")
     return out, {k: v for k, v in notes.items() if v}
-
-
-def producer_rows(tables: Mapping[str, Sequence[Row]]) -> dict[str, int]:
-    """The carried producer table sizes a consumer's sidecar records."""
-    out = {}
-    if "speakers" in tables:
-        out["diarize"] = len(tables["speakers"])
-    if "transcript_words" in tables:
-        out["transcribe"] = len(tables["transcript_words"])
-    return out
 
 
 # ----------------------------------------------------------------- sidecar --
@@ -311,15 +240,12 @@ def _rewrite_strings(obj: Any, mapping: Mapping[str, str]) -> Any:
 
 def carried_sidecar(sidecar: Mapping[str, Any], *, piece: Piece, paths: Mapping[str, str],
                     tables: Mapping[str, Sequence[Row]], old_unit: str, old_root: str,
-                    old_sha256: str, unchanged: bool, producer_rows: Mapping[str, int] | None = None,
-                    notes: Mapping[str, Any] | None = None) -> dict:
+                    old_sha256: str, unchanged: bool, notes: Mapping[str, Any] | None = None) -> dict:
     """The new unit's sidecar for one carried family.
 
     ``paths`` maps old path prefixes to new ones (the old unit's feature dir,
     its wav, its transcript input); ``tables`` maps each ``output`` key to the
-    rows written for it; ``producer_rows`` gives the new unit's carried
-    producer table sizes (``diarize`` turns, ``transcribe`` words) for the
-    consumers that record how many they read.
+    rows written for it.
     """
     out = _rewrite_strings(copy.deepcopy(dict(sidecar)), paths)
     packed: list[str] = []
@@ -330,9 +256,7 @@ def carried_sidecar(sidecar: Mapping[str, Any], *, piece: Piece, paths: Mapping[
         for key, rows in tables.items():
             if key in (out.get("output") or {}):
                 out["output"][key]["rows"] = len(rows)
-        if "frames" in out and "frames" in tables:
-            out["frames"]["n_frames"] = len(tables["frames"])
-        _recount(out, tables, producer_rows or {}, packed)
+        _recount(out, tables, packed)
     block = {"rule": CARRY_RULE, "unit": old_unit, "stimulus_id": piece.old_stimulus_id,
              "root": old_root, "shift_sec": round(piece.shift, 3), "sidecar_sha256": old_sha256,
              "unchanged": unchanged}
@@ -344,23 +268,8 @@ def carried_sidecar(sidecar: Mapping[str, Any], *, piece: Piece, paths: Mapping[
     return out
 
 
-def _recount(out: dict, tables: Mapping[str, Sequence[Row]], producer_rows: Mapping[str, int],
-             packed: list[str]) -> None:
+def _recount(out: dict, tables: Mapping[str, Sequence[Row]], packed: list[str]) -> None:
     """Per-unit counts a fresh run would report, from the carried tables."""
-    models = out.get("models") or {}
-    for name, meta in models.items():
-        for key, producer in (("n_turns", "diarize"), ("n_words", "transcribe")):
-            if key in meta and meta.get("derived_from") == producer:
-                if producer in producer_rows:
-                    meta[key] = producer_rows[producer]
-                else:
-                    packed.append(f"models.{name}.{key}")
-        if "n_gated_windows" in meta and meta.get("gated_columns") and "frames" in tables:
-            gated = meta["gated_columns"]
-            meta["n_gated_windows"] = sum(all(r.get(c, "") == "" for c in gated) for r in tables["frames"])
-        for key in meta:
-            if key.startswith("n_") and key.endswith("_windows") and key != "n_gated_windows":
-                packed.append(f"models.{name}.{key}")
     if "diarization" in out and "speakers" in tables:
         turns = tables["speakers"]
         d = out["diarization"]
